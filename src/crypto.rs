@@ -69,7 +69,16 @@ pub fn derive_keys(master: &str, salt: &[u8]) -> VaultKeys {
 
 /// Generate a fresh salt, encrypt the magic verifier with the master-derived
 /// key, and persist both in `meta`.
+///
+/// Refuses to run on an already-initialized vault: rotating the salt would make
+/// every ciphertext sealed under the old key permanently undecryptable.
 pub fn setup_master(conn: &Connection, master: &str) -> Result<(), CryptoError> {
+    if meta_exists(conn, META_VERIFIER)? {
+        return Err(CryptoError::Database(
+            "vault is already initialized; refusing to rotate kdf_salt".into(),
+        ));
+    }
+
     let mut salt = [0u8; SALT_LEN];
     OsRng.fill_bytes(&mut salt);
 
@@ -100,6 +109,12 @@ pub fn setup_master(conn: &Connection, master: &str) -> Result<(), CryptoError> 
 pub fn unlock(conn: &Connection, master: &str) -> Result<VaultKeys, CryptoError> {
     let salt = get_meta(conn, META_KDF_SALT)?;
     let verifier = get_meta(conn, META_VERIFIER)?;
+    if salt.len() != SALT_LEN {
+        return Err(CryptoError::Database(format!(
+            "malformed kdf_salt: expected {SALT_LEN} bytes, found {}",
+            salt.len()
+        )));
+    }
     if verifier.len() <= NONCE_LEN {
         return Err(CryptoError::Database("malformed verifier blob".into()));
     }
@@ -150,6 +165,13 @@ fn get_meta(conn: &Connection, key: &str) -> Result<Vec<u8>, CryptoError> {
     .optional()
     .map_err(|e| CryptoError::Database(e.to_string()))?
     .ok_or_else(|| CryptoError::Database(format!("missing meta key `{key}`")))
+}
+
+fn meta_exists(conn: &Connection, key: &str) -> Result<bool, CryptoError> {
+    conn.query_row("SELECT 1 FROM meta WHERE key = ?1", params![key], |_| Ok(()))
+        .optional()
+        .map(|present| present.is_some())
+        .map_err(|e| CryptoError::Database(e.to_string()))
 }
 
 #[cfg(test)]
@@ -220,5 +242,57 @@ mod tests {
             Err(e) => e,
         };
         assert!(matches!(err, CryptoError::WrongMaster));
+    }
+
+    #[test]
+    fn tampered_salt_is_database_error() {
+        let dir = tempdir().unwrap();
+        let conn = init_db(&dir.path().join("vault.db")).unwrap();
+
+        setup_master(&conn, "correct horse").unwrap();
+        // Simulate a truncated / corrupted salt in the database.
+        conn.execute(
+            "UPDATE meta SET value = ?1 WHERE key = ?2",
+            params![&[0xABu8; 4][..], "kdf_salt"],
+        )
+        .unwrap();
+
+        // Must report a Database error instead of panicking inside derive_keys.
+        let err = match unlock(&conn, "correct horse") {
+            Ok(_) => panic!("corrupted salt must not unlock"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, CryptoError::Database(_)),
+            "expected Database error, got {err}"
+        );
+    }
+
+    #[test]
+    fn second_setup_is_rejected() {
+        let dir = tempdir().unwrap();
+        let conn = init_db(&dir.path().join("vault.db")).unwrap();
+
+        setup_master(&conn, "first master").unwrap();
+        let salt_before = get_meta(&conn, "kdf_salt").unwrap();
+        let verifier_before = get_meta(&conn, "verifier").unwrap();
+
+        let err = match setup_master(&conn, "second master") {
+            Ok(()) => panic!("re-running setup must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            matches!(err, CryptoError::Database(_)),
+            "expected Database error, got {err}"
+        );
+
+        // Existing material must be untouched and the original master still works.
+        assert_eq!(get_meta(&conn, "kdf_salt").unwrap(), salt_before);
+        assert_eq!(get_meta(&conn, "verifier").unwrap(), verifier_before);
+        unlock(&conn, "first master").unwrap();
+        assert!(matches!(
+            unlock(&conn, "second master"),
+            Err(CryptoError::WrongMaster)
+        ));
     }
 }
