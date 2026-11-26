@@ -5,7 +5,9 @@
 //! `git`) to egui widgets. Every fallible call is matched and its error is
 //! rendered as a message; nothing here unwraps or panics.
 
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 
 use eframe::egui;
 
@@ -34,6 +36,22 @@ const FIELD_WIDTH: f32 = 320.0;
 /// Maximum number of entries kept in the bottom output log.
 const LOG_MAX: usize = 200;
 
+/// Log label of the read-only `git status --porcelain=v1 -b` query.
+const LABEL_STATUS: &str = "git status --porcelain=v1 -b";
+
+/// Log label of the read-only `git branch --format=%(refname:short)` query.
+const LABEL_BRANCHES: &str = "git branch --format=%(refname:short)";
+
+/// Log label of the read-only `git tag --list` query.
+const LABEL_TAGS: &str = "git tag --list";
+
+/// Log label of `git rev-parse --abbrev-ref HEAD` (pull/push prerequisite).
+const LABEL_HEAD: &str = "git rev-parse --abbrev-ref HEAD";
+
+/// How often the UI thread wakes up to drain worker results while a git
+/// operation runs (keeps the animated progress bar and channel polling going).
+const BUSY_REPAINT_MS: u64 = 50;
+
 /// Remote name used by Push/Pull and as the default credential label. When a
 /// credential is stored under this label and the configured remote URL is
 /// https, the UI injects it into the URL for that one git call.
@@ -59,10 +77,150 @@ struct StatusSection {
 }
 
 /// Latest snapshot of the three read-only queries for the selected project.
+#[derive(Default)]
 struct StatusSnapshot {
     status: Option<StatusSection>,
     branches: Option<StatusSection>,
     tags: Option<StatusSection>,
+}
+
+/// Which third of the read-only batch a background result belongs to.
+#[derive(Clone, Copy)]
+enum StatusPart {
+    Status,
+    Branches,
+    Tags,
+}
+
+/// Cached read-only snapshot of one project, stored in
+/// `GitPmApp::status_cache` (key = `Project.id`). Lets a project switch render
+/// instantly instead of waiting for three git subprocesses.
+struct CachedStatus {
+    /// `git status --porcelain=v1 -b` output text.
+    porcelain: String,
+    /// Branch names from `git branch --format=%(refname:short)`.
+    branches: Vec<String>,
+    /// Tag names from `git tag --list`.
+    tags: Vec<String>,
+    /// When this entry was last written.
+    loaded_at: std::time::Instant,
+}
+
+impl CachedStatus {
+    fn empty() -> Self {
+        Self {
+            porcelain: String::new(),
+            branches: Vec::new(),
+            tags: Vec::new(),
+            loaded_at: std::time::Instant::now(),
+        }
+    }
+}
+
+/// A write operation (commit/pull/push/branch/tag) currently running on a
+/// worker thread. While `busy` is `Some`, the operation panel's buttons are
+/// disabled and an animated progress bar is shown.
+#[derive(Clone)]
+struct BusyOp {
+    /// Project the operation belongs to.
+    project_id: i64,
+    /// Human-readable progress text shown above the progress bar.
+    label: String,
+}
+
+/// Which git call a worker-thread result belongs to. Kinds that need a
+/// specific output-log label carry it pre-built (labels never contain
+/// credentials).
+enum ResultKind {
+    /// `git status --porcelain=v1 -b` (part of a status refresh batch).
+    Status,
+    /// `git branch --format=%(refname:short)` (part of a status refresh batch).
+    BranchList,
+    /// `git tag --list` (part of a status refresh batch).
+    TagList,
+    /// `git rev-parse --abbrev-ref HEAD` (pull/push prerequisite).
+    Head,
+    /// `git remote get-url origin` (credential injection prerequisite; only
+    /// sent on io failure, mirroring the old silent-degrade behaviour).
+    RemoteUrl,
+    /// `git add -A` + `git commit -m <msg>`; payload = output-log label.
+    Commit(String),
+    /// `git pull [...]`; payload = output-log label.
+    Pull(String),
+    /// `git push [...]`; payload = output-log label.
+    Push(String),
+    /// `git branch <name>`; payload = output-log label.
+    BranchCreate(String),
+    /// `git checkout <name>`; payload = output-log label.
+    BranchCheckout(String),
+    /// `git tag [...] <name>`; payload = output-log label.
+    Tag(String),
+}
+
+/// One finished git call from a worker thread, routed back to the UI thread
+/// over a `std::sync::mpsc` channel and drained at the top of each frame.
+struct GitResult {
+    /// Project the call belongs to (cache key + backfill check).
+    project_id: i64,
+    /// Which call this was.
+    kind: ResultKind,
+    /// The git output — already redacted inside the worker when credentials
+    /// were involved — or the io error when git could not run at all.
+    output: std::io::Result<git::GitOutput>,
+}
+
+/// Whether a background result may update the on-screen status area: only
+/// when it belongs to the project that is currently selected. Regardless of
+/// the return value the caller still updates the per-project cache, so a
+/// rapid project switch never mixes data between projects.
+fn should_apply(result_project_id: i64, selected_id: Option<i64>) -> bool {
+    selected_id == Some(result_project_id)
+}
+
+/// Scrub credential material from a git output inside the worker thread,
+/// before the result ever reaches the UI thread or the output log.
+fn redact_output(mut out: git::GitOutput, pairs: &[(String, String)]) -> git::GitOutput {
+    out.stdout = redact_text(out.stdout, pairs);
+    out.stderr = redact_text(out.stderr, pairs);
+    out
+}
+
+/// Worker helper: run a plain (no injected credentials) `git pull` and send
+/// the result back.
+fn send_plain_pull(tx: &mpsc::Sender<GitResult>, project_id: i64, path: &Path) {
+    let output = git::pull(path);
+    let _ = tx.send(GitResult {
+        project_id,
+        kind: ResultKind::Pull("git pull".to_string()),
+        output,
+    });
+}
+
+/// Worker helper: run a plain `git push origin <branch>` and send the result
+/// back.
+fn send_plain_push(tx: &mpsc::Sender<GitResult>, project_id: i64, path: &Path, branch: &str) {
+    let label = format!("git push {DEFAULT_PUSH_REMOTE} {branch}");
+    let output = git::push(path, DEFAULT_PUSH_REMOTE, branch);
+    let _ = tx.send(GitResult { project_id, kind: ResultKind::Push(label), output });
+}
+
+/// Split a successful read-only output into trimmed non-empty lines.
+fn output_lines(out: &git::GitOutput) -> Vec<String> {
+    out.stdout
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// Build a status-area snapshot from a cache entry (cached data only holds
+/// successful queries, so all sections render as ok).
+fn snapshot_from_cache(cache: &CachedStatus) -> StatusSnapshot {
+    StatusSnapshot {
+        status: Some(StatusSection { ok: true, text: cache.porcelain.clone() }),
+        branches: Some(StatusSection { ok: true, text: cache.branches.join("\n") }),
+        tags: Some(StatusSection { ok: true, text: cache.tags.join("\n") }),
+    }
 }
 
 /// Credential data prepared for exactly one in-memory authenticated git call.
@@ -237,6 +395,18 @@ pub struct GitPmApp {
     status: Option<StatusSnapshot>,
     /// Project id the snapshot belongs to; refreshed on selection change.
     status_loaded_for: Option<i64>,
+    /// Per-project read-only snapshot cache, keyed by `Project.id`; a project
+    /// switch renders from it instantly instead of re-running three git calls.
+    status_cache: HashMap<i64, CachedStatus>,
+    /// Projects whose status refresh batch is currently running on a worker
+    /// thread (duplicate-spawn guard).
+    status_inflight: HashSet<i64>,
+    /// Write operation currently running on a worker thread, if any.
+    busy: Option<BusyOp>,
+    /// Cloned into every spawned worker thread.
+    result_tx: mpsc::Sender<GitResult>,
+    /// Worker results drained at the top of each frame.
+    result_rx: mpsc::Receiver<GitResult>,
     commit_msg: String,
     new_branch: String,
     tag_name: String,
@@ -283,6 +453,7 @@ pub struct GitPmApp {
 
 impl GitPmApp {
     pub fn new() -> Self {
+        let (result_tx, result_rx) = mpsc::channel();
         let mut app = Self {
             conn: None,
             open_error: None,
@@ -298,6 +469,11 @@ impl GitPmApp {
             confirm_remove: false,
             status: None,
             status_loaded_for: None,
+            status_cache: HashMap::new(),
+            status_inflight: HashSet::new(),
+            busy: None,
+            result_tx,
+            result_rx,
             commit_msg: String::new(),
             new_branch: String::new(),
             tag_name: String::new(),
@@ -510,6 +686,13 @@ impl GitPmApp {
     }
 
     fn show_main(&mut self, ctx: &egui::Context) {
+        self.drain_results();
+        // While a git call runs on a worker thread, keep waking the UI to
+        // animate the progress bar and poll the result channel.
+        if self.busy.is_some() || self.selected.is_some_and(|id| self.status_inflight.contains(&id))
+        {
+            ctx.request_repaint_after(std::time::Duration::from_millis(BUSY_REPAINT_MS));
+        }
         self.show_top_bar(ctx);
         self.show_project_list(ctx);
         self.sync_status_for_selection();
@@ -663,25 +846,60 @@ impl GitPmApp {
 
     // ---------------------------------------------------- project operations
 
-    /// Refresh the status area when the selection changes.
+    /// Refresh the status area when the selection changes: render the cached
+    /// snapshot instantly, or show「加载中」with an animated progress bar and
+    /// spawn a background refresh when there is no cache yet.
     fn sync_status_for_selection(&mut self) {
         if self.selected == self.status_loaded_for {
             return;
         }
-        self.status_loaded_for = self.selected;
         match self.selected {
-            Some(_) => self.refresh_status(),
-            None => self.status = None,
+            Some(id) => {
+                self.status_loaded_for = Some(id);
+                match self.status_cache.get(&id) {
+                    Some(cache) => self.status = Some(snapshot_from_cache(cache)),
+                    None => {
+                        self.status = None; //「加载中…」+ progress bar
+                        if let Some(project) = self.projects.iter().find(|p| p.id == id) {
+                            let path = PathBuf::from(&project.path);
+                            self.spawn_status_refresh(id, path);
+                        }
+                    }
+                }
+            }
+            None => {
+                self.status_loaded_for = None;
+                self.status = None;
+            }
         }
     }
 
     fn show_operations_panel(&mut self, ctx: &egui::Context) {
+        let busy = self.busy.clone();
         egui::SidePanel::right("operations_panel")
             .default_width(380.0)
             .resizable(true)
             .show(ctx, |ui| {
                 ui.heading("操作");
                 ui.separator();
+                if let Some(op) = &busy {
+                    // Indeterminate animated progress bar while the write
+                    // operation runs on its worker thread.
+                    ui.add(egui::ProgressBar::new(0.0).animate(true));
+                    let project_name = self
+                        .projects
+                        .iter()
+                        .find(|p| p.id == op.project_id)
+                        .map(|p| p.name.clone())
+                        .unwrap_or_default();
+                    if project_name.is_empty() {
+                        ui.label(&op.label);
+                    } else {
+                        ui.label(format!("{}（{}）", op.label, project_name));
+                    }
+                    ui.add_space(4.0);
+                    ui.separator();
+                }
                 if self.selected_project().is_none() {
                     ui.label("从左侧选择一个项目，即可查看其 git 状态并执行操作。");
                     return;
@@ -689,41 +907,52 @@ impl GitPmApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        self.show_status_area(ui);
+                        self.show_status_area(ui, busy.is_some());
                         ui.add_space(8.0);
                         ui.separator();
-                        self.show_commit_area(ui);
+                        self.show_commit_area(ui, busy.is_some());
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
-                            if ui.button("拉取（pull）").clicked() {
+                            if ui
+                                .add_enabled(!busy.is_some(), egui::Button::new("拉取（pull）"))
+                                .clicked()
+                            {
                                 self.do_pull();
                             }
-                            if ui.button("推送（push）").clicked() {
+                            if ui
+                                .add_enabled(!busy.is_some(), egui::Button::new("推送（push）"))
+                                .clicked()
+                            {
                                 self.do_push();
                             }
-                            if ui.button("凭据…").clicked() {
+                            if ui
+                                .add_enabled(!busy.is_some(), egui::Button::new("凭据…"))
+                                .clicked()
+                            {
                                 self.open_cred_dialog();
                             }
                         });
                         ui.add_space(8.0);
                         ui.separator();
-                        self.show_branch_area(ui);
+                        self.show_branch_area(ui, busy.is_some());
                         ui.add_space(8.0);
-                        self.show_tag_area(ui);
+                        self.show_tag_area(ui, busy.is_some());
                     });
             });
     }
 
-    /// 状态区：status --porcelain 输出 + 分支列表 + 标签列表。
-    fn show_status_area(&mut self, ui: &mut egui::Ui) {
+    /// 状态区：status --porcelain 输出 + 分支列表 + 标签列表。无快照且选中了
+    /// 项目时显示「加载中…」+ 动态进度条（后台线程正在取数）。
+    fn show_status_area(&mut self, ui: &mut egui::Ui, busy: bool) {
         ui.horizontal(|ui| {
             ui.strong("状态");
-            if ui.button("刷新").clicked() {
-                self.refresh_status();
+            if ui.add_enabled(!busy, egui::Button::new("刷新")).clicked() {
+                self.manual_refresh_status();
             }
         });
         let Some(snapshot) = self.status.as_ref() else {
-            ui.label("（尚未加载）");
+            ui.label("加载中…");
+            ui.add(egui::ProgressBar::new(0.0).animate(true));
             return;
         };
         show_section(ui, "工作区（status）", snapshot.status.as_ref());
@@ -731,14 +960,14 @@ impl GitPmApp {
         show_section(ui, "标签（tag）", snapshot.tags.as_ref());
     }
 
-    /// Commit 消息输入框 + Commit 按钮（空消息禁用）。
-    fn show_commit_area(&mut self, ui: &mut egui::Ui) {
+    /// Commit 消息输入框 + Commit 按钮（空消息禁用；busy 期间禁用）。
+    fn show_commit_area(&mut self, ui: &mut egui::Ui, busy: bool) {
         ui.strong("提交（commit）");
         ui.add_sized(
             [ui.available_width(), 22.0],
             egui::TextEdit::singleline(&mut self.commit_msg).hint_text("提交信息（必填）"),
         );
-        let can_commit = !self.commit_msg.trim().is_empty();
+        let can_commit = !self.commit_msg.trim().is_empty() && !busy;
         if ui
             .add_enabled(can_commit, egui::Button::new("提交"))
             .clicked()
@@ -748,13 +977,13 @@ impl GitPmApp {
     }
 
     /// “新建分支”：名称输入 → create_branch + checkout。
-    fn show_branch_area(&mut self, ui: &mut egui::Ui) {
+    fn show_branch_area(&mut self, ui: &mut egui::Ui, busy: bool) {
         ui.strong("新建分支");
         ui.add_sized(
             [ui.available_width(), 22.0],
             egui::TextEdit::singleline(&mut self.new_branch).hint_text("分支名称（必填）"),
         );
-        let can_create = !self.new_branch.trim().is_empty();
+        let can_create = !self.new_branch.trim().is_empty() && !busy;
         if ui
             .add_enabled(can_create, egui::Button::new("创建并切换"))
             .clicked()
@@ -764,7 +993,7 @@ impl GitPmApp {
     }
 
     /// “打 tag”：名称 + 可选 message → create_tag。
-    fn show_tag_area(&mut self, ui: &mut egui::Ui) {
+    fn show_tag_area(&mut self, ui: &mut egui::Ui, busy: bool) {
         ui.strong("打标签（tag）");
         ui.add_sized(
             [ui.available_width(), 22.0],
@@ -775,8 +1004,11 @@ impl GitPmApp {
             egui::TextEdit::singleline(&mut self.tag_msg)
                 .hint_text("标签说明（可选；填写则创建附注标签）"),
         );
-        let can_tag = !self.tag_name.trim().is_empty();
-        if ui.add_enabled(can_tag, egui::Button::new("打标签")).clicked() {
+        let can_tag = !self.tag_name.trim().is_empty() && !busy;
+        if ui
+            .add_enabled(can_tag, egui::Button::new("打标签"))
+            .clicked()
+        {
             self.do_tag();
         }
     }
@@ -1004,31 +1236,198 @@ impl GitPmApp {
         }
     }
 
-    /// Log a git call whose output may contain injected credentials: the text
-    /// is scrubbed with `pairs` before it is stored.
-    fn log_git_output_redacted(
-        &mut self,
-        label: &str,
-        out: &git::GitOutput,
-        pairs: &[(String, String)],
-    ) {
-        let text = redact_text(git_output_text(out), pairs);
-        self.log.push(LogEntry {
-            ok: out.ok(),
-            title: format!("{label}（退出码 {}）", out.code),
-            text,
-        });
-        self.trim_log();
+    /// Drain every result the worker threads have delivered so far, in send
+    /// order. All UI-state mutation (output log, status snapshot, busy flag)
+    /// happens here on the UI thread only.
+    fn drain_results(&mut self) {
+        while let Ok(result) = self.result_rx.try_recv() {
+            self.apply_result(result);
+        }
     }
 
-    /// Prepare credential injection for one push/pull of the selected project.
-    ///
-    /// Returns `Some` only when a credential is stored under
-    /// [`DEFAULT_PUSH_REMOTE`] and the configured remote URL is a plain https
-    /// URL. Every failure degrades to `None` (the git call then runs without
-    /// credentials); credential load failures are reported in the output log.
-    /// Neither the secret nor the injected URL is ever logged or rendered.
-    fn injected_auth(&mut self, project_id: i64, path: &Path) -> Option<InjectedAuth> {
+    /// Route one worker result: update the per-project cache unconditionally,
+    /// but only touch the on-screen display when the result belongs to the
+    /// currently selected project (`should_apply`).
+    fn apply_result(&mut self, result: GitResult) {
+        let project_id = result.project_id;
+        match result.kind {
+            ResultKind::Status => self.apply_status_part(result, StatusPart::Status),
+            ResultKind::BranchList => self.apply_status_part(result, StatusPart::Branches),
+            ResultKind::TagList => self.apply_status_part(result, StatusPart::Tags),
+            ResultKind::Head => match &result.output {
+                Ok(out) => {
+                    self.log_git_output(LABEL_HEAD, out);
+                    // A failed rev-parse aborts the pull/push early: the
+                    // terminal Pull/Push message never comes, so clear busy
+                    // here. An empty-branch abort arrives as a synthesized
+                    // Pull/Push message instead.
+                    if !out.ok() {
+                        self.clear_busy_if(project_id);
+                    }
+                }
+                Err(e) => {
+                    self.log_git_error(LABEL_HEAD, e);
+                    self.clear_busy_if(project_id);
+                }
+            },
+            ResultKind::RemoteUrl => {
+                // Only io failures are sent (and logged); successful and
+                // git-failed get-url results degrade to a plain pull/push
+                // silently, like the old synchronous flow.
+                if let Err(e) = &result.output {
+                    let label = format!("git remote get-url {DEFAULT_PUSH_REMOTE}");
+                    self.log_git_error(&label, e);
+                }
+            }
+            ResultKind::Commit(label) => {
+                self.log_write_result(&label, &result.output);
+                if let Ok(out) = &result.output {
+                    if out.ok() && should_apply(project_id, self.selected) {
+                        self.commit_msg.clear();
+                    }
+                }
+                self.clear_busy_if(project_id);
+                self.trigger_status_refresh(project_id);
+            }
+            ResultKind::Pull(label) | ResultKind::Push(label) => {
+                self.log_write_result(&label, &result.output);
+                self.clear_busy_if(project_id);
+                self.trigger_status_refresh(project_id);
+            }
+            ResultKind::BranchCreate(label) => {
+                self.log_write_result(&label, &result.output);
+                // On failure the worker stops after this call; on success the
+                // following checkout message ends the operation.
+                match &result.output {
+                    Ok(out) if out.ok() => {}
+                    _ => self.clear_busy_if(project_id),
+                }
+            }
+            ResultKind::BranchCheckout(label) => {
+                self.log_write_result(&label, &result.output);
+                if let Ok(out) = &result.output {
+                    if out.ok() && should_apply(project_id, self.selected) {
+                        self.new_branch.clear();
+                    }
+                }
+                self.clear_busy_if(project_id);
+                self.trigger_status_refresh(project_id);
+            }
+            ResultKind::Tag(label) => {
+                self.log_write_result(&label, &result.output);
+                if let Ok(out) = &result.output {
+                    if out.ok() && should_apply(project_id, self.selected) {
+                        self.tag_name.clear();
+                        self.tag_msg.clear();
+                    }
+                }
+                self.clear_busy_if(project_id);
+                self.trigger_status_refresh(project_id);
+            }
+        }
+    }
+
+    /// Apply one part (status/branches/tags) of a read-only refresh batch:
+    /// cache successful output, log + display it when the project is selected.
+    fn apply_status_part(&mut self, result: GitResult, part: StatusPart) {
+        let project_id = result.project_id;
+        self.status_inflight.remove(&project_id);
+        let label = match part {
+            StatusPart::Status => LABEL_STATUS,
+            StatusPart::Branches => LABEL_BRANCHES,
+            StatusPart::Tags => LABEL_TAGS,
+        };
+        let applies = should_apply(project_id, self.selected);
+        if applies {
+            match &result.output {
+                Ok(out) => self.log_git_output(label, out),
+                Err(e) => self.log_git_error(label, e),
+            }
+        }
+        if let Ok(out) = &result.output {
+            if out.ok() {
+                let entry = self.status_cache.entry(project_id).or_insert_with(CachedStatus::empty);
+                match part {
+                    StatusPart::Status => entry.porcelain = git_output_text(out),
+                    StatusPart::Branches => entry.branches = output_lines(out),
+                    StatusPart::Tags => entry.tags = output_lines(out),
+                }
+                entry.loaded_at = std::time::Instant::now();
+            }
+        }
+        if applies {
+            let section = match &result.output {
+                Ok(out) => Some(status_section(out)),
+                Err(e) => Some(StatusSection { ok: false, text: format!("无法运行 git：{e}") }),
+            };
+            let snapshot = self.status.get_or_insert_with(StatusSnapshot::default);
+            match part {
+                StatusPart::Status => snapshot.status = section,
+                StatusPart::Branches => snapshot.branches = section,
+                StatusPart::Tags => snapshot.tags = section,
+            }
+            self.status_loaded_for = Some(project_id);
+        }
+    }
+
+    /// Spawn one worker thread that runs all three read-only queries for a
+    /// project and sends each result back tagged with the project id.
+    fn spawn_status_refresh(&mut self, project_id: i64, path: PathBuf) {
+        if !self.status_inflight.insert(project_id) {
+            return; // a batch for this project is already running
+        }
+        let tx = self.result_tx.clone();
+        std::thread::spawn(move || {
+            let send = |kind: ResultKind, output: std::io::Result<git::GitOutput>| {
+                let _ = tx.send(GitResult { project_id, kind, output });
+            };
+            send(ResultKind::Status, git::status_porcelain(&path));
+            send(ResultKind::BranchList, git::branch_list(&path));
+            send(ResultKind::TagList, git::tag_list(&path));
+        });
+    }
+
+    /// Re-run the read-only batch for a project (after a write operation or
+    /// via the「刷新」button); skipped when a batch is already in flight.
+    fn trigger_status_refresh(&mut self, project_id: i64) {
+        if let Some(project) = self.projects.iter().find(|p| p.id == project_id) {
+            let path = PathBuf::from(&project.path);
+            self.spawn_status_refresh(project_id, path);
+        }
+    }
+
+    /// 「刷新」button: force a background refresh of the selected project.
+    fn manual_refresh_status(&mut self) {
+        let Some(project) = self.selected_project().cloned() else {
+            return;
+        };
+        let path = PathBuf::from(&project.path);
+        self.spawn_status_refresh(project.id, path);
+    }
+
+    /// End the busy indicator when a terminal message of the running write
+    /// operation arrives (project id must match so a stale message cannot
+    /// cut short a newer operation).
+    fn clear_busy_if(&mut self, project_id: i64) {
+        if self.busy.as_ref().is_some_and(|op| op.project_id == project_id) {
+            self.busy = None;
+        }
+    }
+
+    /// Log a write-operation result (output, or the io error when git could
+    /// not run at all).
+    fn log_write_result(&mut self, label: &str, output: &std::io::Result<git::GitOutput>) {
+        match output {
+            Ok(out) => self.log_git_output(label, out),
+            Err(e) => self.log_git_error(label, e),
+        }
+    }
+
+    /// Decrypt the stored credential (`origin`) for a project on the UI
+    /// thread. The secret only moves into the worker thread, where the URL is
+    /// built and scrubbed; it is never logged, rendered, or stored anywhere.
+    /// Returns `None` when absent or on failure (the failure is logged here).
+    fn load_credential_parts(&mut self, project_id: i64) -> Option<(String, String)> {
         let secret = {
             let keys = self.keys.as_ref()?;
             let conn = self.conn.as_ref()?;
@@ -1047,69 +1446,15 @@ impl GitPmApp {
                 }
             }
         };
-        let remote_url = match git::run(path, &["remote", "get-url", DEFAULT_PUSH_REMOTE]) {
-            Ok(out) if out.ok() => out.stdout.trim().to_string(),
-            // git's own failure surfaces on the subsequent push/pull call.
-            Ok(_) => return None,
-            Err(e) => {
-                self.log_git_error(&format!("git remote get-url {DEFAULT_PUSH_REMOTE}"), &e);
-                return None;
-            }
-        };
-        let (user, pass) = split_credential_secret(&secret);
-        let encoded_password = percent_encode_userinfo(&pass);
-        let url = inject_https_userinfo(&remote_url, &user, &pass)?;
-        Some(InjectedAuth {
-            url,
-            plain_url: remote_url,
-            password: pass,
-            encoded_password,
-        })
+        Some(split_credential_secret(&secret))
     }
 
-    /// Run one read-only query, log its result, and return the section to show.
-    fn run_readonly(
-        &mut self,
-        label: &str,
-        result: std::io::Result<git::GitOutput>,
-    ) -> StatusSection {
-        match result {
-            Ok(out) => {
-                self.log_git_output(label, &out);
-                status_section(&out)
-            }
-            Err(e) => {
-                self.log_git_error(label, &e);
-                StatusSection {
-                    ok: false,
-                    text: format!("无法运行 git：{e}"),
-                }
-            }
-        }
-    }
-
-    /// Re-run the three read-only queries for the selected project.
-    fn refresh_status(&mut self) {
-        let Some(project) = self.selected_project().cloned() else {
-            return;
-        };
-        let path = Path::new(&project.path);
-        let snapshot = StatusSnapshot {
-            status: Some(self.run_readonly(
-                "git status --porcelain=v1 -b",
-                git::status_porcelain(path),
-            )),
-            branches: Some(self.run_readonly(
-                "git branch --format=%(refname:short)",
-                git::branch_list(path),
-            )),
-            tags: Some(self.run_readonly("git tag --list", git::tag_list(path))),
-        };
-        self.status = Some(snapshot);
-    }
-
-    /// Commit 按钮：`commit_all`，成功后清空输入并刷新状态区。
+    /// Commit 按钮：`commit_all` 在后台线程执行；完成后由结果回填清 busy、
+    /// 记日志并刷新状态区。
     fn do_commit(&mut self) {
+        if self.busy.is_some() {
+            return;
+        }
         let Some(project) = self.selected_project().cloned() else {
             return;
         };
@@ -1117,119 +1462,180 @@ impl GitPmApp {
         if message.is_empty() {
             return; // the button is disabled; defensive only
         }
+        self.busy = Some(BusyOp {
+            project_id: project.id,
+            label: "正在提交（commit）…".to_string(),
+        });
+        let tx = self.result_tx.clone();
+        let path = PathBuf::from(&project.path);
+        let project_id = project.id;
         let label = format!("git add -A + git commit -m {message}");
-        match git::commit_all(Path::new(&project.path), &message) {
-            Ok(out) => {
-                self.log_git_output(&label, &out);
-                if out.ok() {
-                    self.commit_msg.clear();
-                }
-            }
-            Err(e) => self.log_git_error(&label, &e),
-        }
-        self.refresh_status();
+        std::thread::spawn(move || {
+            let output = git::commit_all(&path, &message);
+            let _ = tx.send(GitResult { project_id, kind: ResultKind::Commit(label), output });
+        });
     }
 
-    /// Pull 按钮：凭据存在且 origin 为 https 时注入凭据拉取，随后刷新状态区。
+    /// Pull 按钮：凭据存在且 origin 为 https 时在后台线程注入凭据拉取（URL
+    /// 拼接与输出脱敏都在线程内完成，明文不回流 UI 线程）。
     fn do_pull(&mut self) {
+        if self.busy.is_some() {
+            return;
+        }
         let Some(project) = self.selected_project().cloned() else {
             return;
         };
-        let path = Path::new(&project.path);
-        match self.injected_auth(project.id, path) {
-            Some(auth) => {
-                // `git pull <url>` without a refspec would merge the remote's
-                // HEAD; passing the current branch keeps the default `git pull`
-                // behaviour of merging the same-named upstream branch.
-                const BRANCH_LABEL: &str = "git rev-parse --abbrev-ref HEAD";
-                let branch = match git::run(path, &["rev-parse", "--abbrev-ref", "HEAD"]) {
-                    Ok(out) => {
-                        self.log_git_output(BRANCH_LABEL, &out);
-                        if !out.ok() {
-                            return; // e.g. detached HEAD; stderr is already logged
-                        }
-                        out.stdout.trim().to_string()
-                    }
-                    Err(e) => {
-                        self.log_git_error(BRANCH_LABEL, &e);
-                        return;
-                    }
-                };
-                if branch.is_empty() {
-                    self.log.push(LogEntry {
-                        ok: false,
-                        title: "git pull".to_string(),
-                        text: "无法确定当前分支：rev-parse 输出为空".to_string(),
-                    });
-                    self.trim_log();
+        let auth_parts = self.load_credential_parts(project.id);
+        self.busy = Some(BusyOp {
+            project_id: project.id,
+            label: "正在拉取（pull）…".to_string(),
+        });
+        let tx = self.result_tx.clone();
+        let path = PathBuf::from(&project.path);
+        let project_id = project.id;
+        std::thread::spawn(move || {
+            let head = git::run(&path, &["rev-parse", "--abbrev-ref", "HEAD"]);
+            let branch = match &head {
+                Ok(out) if out.ok() => out.stdout.trim().to_string(),
+                _ => String::new(),
+            };
+            let _ = tx.send(GitResult { project_id, kind: ResultKind::Head, output: head });
+            if branch.is_empty() {
+                // Detached HEAD or git failure: abort like the old synchronous
+                // flow, with the same message carried as a synthesized output.
+                let output = Ok(git::GitOutput {
+                    code: 1,
+                    stdout: String::new(),
+                    stderr: "无法确定当前分支：rev-parse 输出为空".to_string(),
+                });
+                let _ = tx.send(GitResult {
+                    project_id,
+                    kind: ResultKind::Pull("git pull".to_string()),
+                    output,
+                });
+                return;
+            }
+            let Some((user, pass)) = auth_parts else {
+                send_plain_pull(&tx, project_id, &path);
+                return;
+            };
+            let plain_url = match git::run(&path, &["remote", "get-url", DEFAULT_PUSH_REMOTE]) {
+                Ok(out) if out.ok() => out.stdout.trim().to_string(),
+                // git's own failure surfaces on the subsequent pull call.
+                Ok(_) => {
+                    send_plain_pull(&tx, project_id, &path);
                     return;
                 }
-                let label = format!("git pull {DEFAULT_PUSH_REMOTE} {branch}（凭据已注入）");
-                match git::run(path, &["pull", &auth.url, &branch]) {
-                    Ok(out) => {
-                        self.log_git_output_redacted(&label, &out, &auth.redact_pairs());
-                    }
-                    Err(e) => self.log_git_error(&label, &e),
+                Err(e) => {
+                    let _ = tx.send(GitResult {
+                        project_id,
+                        kind: ResultKind::RemoteUrl,
+                        output: Err(e),
+                    });
+                    send_plain_pull(&tx, project_id, &path);
+                    return;
                 }
-            }
-            None => match git::pull(path) {
-                Ok(out) => self.log_git_output("git pull", &out),
-                Err(e) => self.log_git_error("git pull", &e),
-            },
-        }
-        self.refresh_status();
+            };
+            let Some(url) = inject_https_userinfo(&plain_url, &user, &pass) else {
+                send_plain_pull(&tx, project_id, &path);
+                return;
+            };
+            let auth = InjectedAuth {
+                url,
+                plain_url,
+                password: pass.clone(),
+                encoded_password: percent_encode_userinfo(&pass),
+            };
+            // `git pull <url>` without a refspec would merge the remote's
+            // HEAD; passing the current branch keeps the default `git pull`
+            // behaviour of merging the same-named upstream branch.
+            let label = format!("git pull {DEFAULT_PUSH_REMOTE} {branch}（凭据已注入）");
+            let output = git::run(&path, &["pull", &auth.url, &branch])
+                .map(|out| redact_output(out, &auth.redact_pairs()));
+            let _ = tx.send(GitResult { project_id, kind: ResultKind::Pull(label), output });
+        });
     }
 
     /// Push 按钮：先取当前分支，再推送到 origin（凭据存在且 remote 为 https
-    /// 时注入凭据）。
+    /// 时在后台线程注入凭据，输出在线程内脱敏后回流）。
     fn do_push(&mut self) {
+        if self.busy.is_some() {
+            return;
+        }
         let Some(project) = self.selected_project().cloned() else {
             return;
         };
-        let path = Path::new(&project.path);
-        const HEAD_LABEL: &str = "git rev-parse --abbrev-ref HEAD";
-        let branch = match git::run(path, &["rev-parse", "--abbrev-ref", "HEAD"]) {
-            Ok(out) => {
-                self.log_git_output(HEAD_LABEL, &out);
-                if !out.ok() {
-                    return; // e.g. unborn branch; the stderr is already logged
-                }
-                out.stdout.trim().to_string()
-            }
-            Err(e) => {
-                self.log_git_error(HEAD_LABEL, &e);
+        let auth_parts = self.load_credential_parts(project.id);
+        self.busy = Some(BusyOp {
+            project_id: project.id,
+            label: "正在推送（push）…".to_string(),
+        });
+        let tx = self.result_tx.clone();
+        let path = PathBuf::from(&project.path);
+        let project_id = project.id;
+        std::thread::spawn(move || {
+            let head = git::run(&path, &["rev-parse", "--abbrev-ref", "HEAD"]);
+            let branch = match &head {
+                Ok(out) if out.ok() => out.stdout.trim().to_string(),
+                _ => String::new(),
+            };
+            let _ = tx.send(GitResult { project_id, kind: ResultKind::Head, output: head });
+            if branch.is_empty() {
+                let output = Ok(git::GitOutput {
+                    code: 1,
+                    stdout: String::new(),
+                    stderr: "无法确定当前分支：rev-parse 输出为空".to_string(),
+                });
+                let _ = tx.send(GitResult {
+                    project_id,
+                    kind: ResultKind::Push("git push".to_string()),
+                    output,
+                });
                 return;
             }
-        };
-        if branch.is_empty() {
-            self.log.push(LogEntry {
-                ok: false,
-                title: "git push".to_string(),
-                text: "无法确定当前分支：rev-parse 输出为空".to_string(),
-            });
-            self.trim_log();
-            return;
-        }
-        let label = format!("git push {DEFAULT_PUSH_REMOTE} {branch}");
-        match self.injected_auth(project.id, path) {
-            Some(auth) => {
-                let label = format!("{label}（凭据已注入）");
-                match git::push(path, &auth.url, &branch) {
-                    Ok(out) => {
-                        self.log_git_output_redacted(&label, &out, &auth.redact_pairs());
-                    }
-                    Err(e) => self.log_git_error(&label, &e),
+            let Some((user, pass)) = auth_parts else {
+                send_plain_push(&tx, project_id, &path, &branch);
+                return;
+            };
+            let plain_url = match git::run(&path, &["remote", "get-url", DEFAULT_PUSH_REMOTE]) {
+                Ok(out) if out.ok() => out.stdout.trim().to_string(),
+                Ok(_) => {
+                    send_plain_push(&tx, project_id, &path, &branch);
+                    return;
                 }
-            }
-            None => match git::push(path, DEFAULT_PUSH_REMOTE, &branch) {
-                Ok(out) => self.log_git_output(&label, &out),
-                Err(e) => self.log_git_error(&label, &e),
-            },
-        }
+                Err(e) => {
+                    let _ = tx.send(GitResult {
+                        project_id,
+                        kind: ResultKind::RemoteUrl,
+                        output: Err(e),
+                    });
+                    send_plain_push(&tx, project_id, &path, &branch);
+                    return;
+                }
+            };
+            let Some(url) = inject_https_userinfo(&plain_url, &user, &pass) else {
+                send_plain_push(&tx, project_id, &path, &branch);
+                return;
+            };
+            let auth = InjectedAuth {
+                url,
+                plain_url,
+                password: pass.clone(),
+                encoded_password: percent_encode_userinfo(&pass),
+            };
+            let label = format!("git push {DEFAULT_PUSH_REMOTE} {branch}（凭据已注入）");
+            let output = git::push(&path, &auth.url, &branch)
+                .map(|out| redact_output(out, &auth.redact_pairs()));
+            let _ = tx.send(GitResult { project_id, kind: ResultKind::Push(label), output });
+        });
     }
 
-    /// “新建分支”：`create_branch` 成功后 `checkout`，随后刷新状态区。
+    /// “新建分支”：后台线程先 `create_branch` 成功后 `checkout`，结果回填
+    /// 清 busy 并刷新状态区。
     fn do_new_branch(&mut self) {
+        if self.busy.is_some() {
+            return;
+        }
         let Some(project) = self.selected_project().cloned() else {
             return;
         };
@@ -1237,36 +1643,41 @@ impl GitPmApp {
         if name.is_empty() {
             return; // the button is disabled; defensive only
         }
-        let path = Path::new(&project.path);
-        let create_label = format!("git branch {name}");
-        let created = match git::create_branch(path, &name) {
-            Ok(out) => {
-                self.log_git_output(&create_label, &out);
-                out.ok()
+        self.busy = Some(BusyOp {
+            project_id: project.id,
+            label: format!("正在新建分支「{name}」…"),
+        });
+        let tx = self.result_tx.clone();
+        let path = PathBuf::from(&project.path);
+        let project_id = project.id;
+        std::thread::spawn(move || {
+            let create_label = format!("git branch {name}");
+            let created = git::create_branch(&path, &name);
+            let created_ok = created.as_ref().map(git::GitOutput::ok).unwrap_or(false);
+            let _ = tx.send(GitResult {
+                project_id,
+                kind: ResultKind::BranchCreate(create_label),
+                output: created,
+            });
+            if !created_ok {
+                return;
             }
-            Err(e) => {
-                self.log_git_error(&create_label, &e);
-                false
-            }
-        };
-        if !created {
-            return;
-        }
-        let checkout_label = format!("git checkout {name}");
-        match git::checkout(path, &name) {
-            Ok(out) => {
-                self.log_git_output(&checkout_label, &out);
-                if out.ok() {
-                    self.new_branch.clear();
-                }
-            }
-            Err(e) => self.log_git_error(&checkout_label, &e),
-        }
-        self.refresh_status();
+            let checkout_label = format!("git checkout {name}");
+            let output = git::checkout(&path, &name);
+            let _ = tx.send(GitResult {
+                project_id,
+                kind: ResultKind::BranchCheckout(checkout_label),
+                output,
+            });
+        });
     }
 
-    /// “打 tag”：有 message 则附注标签，否则轻量标签，随后刷新状态区。
+    /// “打 tag”：有 message 则附注标签，否则轻量标签，结果回填清 busy 并
+    /// 刷新状态区。
     fn do_tag(&mut self) {
+        if self.busy.is_some() {
+            return;
+        }
         let Some(project) = self.selected_project().cloned() else {
             return;
         };
@@ -1285,17 +1696,17 @@ impl GitPmApp {
         } else {
             format!("git tag {name}")
         };
-        match git::create_tag(Path::new(&project.path), &name, message.as_deref()) {
-            Ok(out) => {
-                self.log_git_output(&label, &out);
-                if out.ok() {
-                    self.tag_name.clear();
-                    self.tag_msg.clear();
-                }
-            }
-            Err(e) => self.log_git_error(&label, &e),
-        }
-        self.refresh_status();
+        self.busy = Some(BusyOp {
+            project_id: project.id,
+            label: format!("正在打标签「{name}」…"),
+        });
+        let tx = self.result_tx.clone();
+        let path = PathBuf::from(&project.path);
+        let project_id = project.id;
+        std::thread::spawn(move || {
+            let output = git::create_tag(&path, &name, message.as_deref());
+            let _ = tx.send(GitResult { project_id, kind: ResultKind::Tag(label), output });
+        });
     }
 
     fn show_remove_confirm(&mut self, ctx: &egui::Context) {
@@ -1867,6 +2278,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn should_apply_matches_selected_project() {
+        // Result belongs to the currently selected project: apply it.
+        assert!(should_apply(7, Some(7)));
+    }
+
+    #[test]
+    fn should_apply_rejects_other_project() {
+        // A stale result from a previously selected project must not touch
+        // the on-screen status area (the cache is still updated by the caller).
+        assert!(!should_apply(7, Some(8)));
+        // No project selected at all: nothing may be applied to the display.
+        assert!(!should_apply(7, None));
+    }
+
+    #[test]
     fn percent_encode_userinfo_escapes_specials() {
         assert_eq!(percent_encode_userinfo(""), "");
         assert_eq!(percent_encode_userinfo("safe-_X9~"), "safe-_X9~");
@@ -1926,5 +2352,30 @@ mod tests {
         assert_eq!(pairs.len(), 3);
         let out = redact_text("fatal: unable to access 'https://u:p%40ss@host/repo.git'".into(), &pairs);
         assert_eq!(out, "fatal: unable to access 'https://host/repo.git'");
+    }
+
+    #[test]
+    fn redact_output_scrubs_stdout_and_stderr() {
+        // The worker thread must scrub stdout/stderr before sending results
+        // back: no credential material may cross to the UI thread.
+        let auth = InjectedAuth {
+            url: "https://u:s3cret@host/repo.git".to_string(),
+            plain_url: "https://host/repo.git".to_string(),
+            password: "s3cret".to_string(),
+            encoded_password: "s3cret".to_string(),
+        };
+        let out = git::GitOutput {
+            code: 128,
+            stdout: "From https://u:s3cret@host/repo.git".to_string(),
+            stderr: "fatal: authentication failed for 'https://u:s3cret@host/repo.git'".to_string(),
+        };
+        let scrubbed = redact_output(out, &auth.redact_pairs());
+        assert_eq!(scrubbed.stdout, "From https://host/repo.git");
+        assert_eq!(
+            scrubbed.stderr,
+            "fatal: authentication failed for 'https://host/repo.git'"
+        );
+        assert!(!scrubbed.stdout.contains("s3cret"));
+        assert!(!scrubbed.stderr.contains("s3cret"));
     }
 }
