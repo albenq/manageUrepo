@@ -91,6 +91,10 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("heading-projects", "项目", "Projects"),
     ("empty-project-list", "（暂无项目，点击上方「添加项目…」）", "(No projects yet; click \"Add project…\" above)"),
     ("group-ungrouped", "(未分组)", "(Ungrouped)"),
+    ("tree-search-hint", "搜索项目或目录…", "Search projects or folders…"),
+    ("tree-search-clear", "清除搜索", "Clear search"),
+    ("tree-search-count", "命中 {n} 个项目", "{n} matching projects"),
+    ("tree-search-empty", "没有匹配的项目或目录", "No matching projects or folders"),
     // ------------------------------------------------ 操作面板（右侧）
     ("heading-operations", "操作", "Operations"),
     ("busy-op-project", "{label}（{project}）", "{label} ({project})"),

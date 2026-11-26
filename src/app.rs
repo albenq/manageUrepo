@@ -58,6 +58,8 @@ mod icons {
     pub const ICON_TAG: &str = "🏷";
     /// 提交历史
     pub const ICON_HISTORY: &str = "🕘";
+    /// 搜索项目 / 目录
+    pub const ICON_SEARCH: &str = "🔍";
 }
 
 /// `meta` key that marks an initialized vault (written by `crypto::setup_master`).
@@ -921,6 +923,7 @@ fn status_legend_text(lang: Lang, status: FileStatus) -> &'static str {
 // 每层缩进 2 个字符宽由 UI 层负责。单元测试见文件末尾 tests 模块。
 
 /// 项目树的一个目录节点（多层结构，递归嵌套）。
+#[derive(Clone)]
 struct DirNode {
     /// 该层的展示名：盘符（如 `E:`）、POSIX 根（`/`）或目录名；
     /// 无法推导父目录的项目归入 [`GROUP_UNGROUPED_KEY`] 节点（展示时
@@ -1057,6 +1060,74 @@ fn build_project_tree(paths: &[String], case_insensitive: bool) -> Vec<DirNode> 
     roots
 }
 
+/// 按搜索词过滤项目树。
+///
+/// 匹配规则（英文按字母逐字、子串、不区分大小写）：
+/// - 空查询（`trim` 后）→ 原样返回整棵树；
+/// - 目录名命中 → 保留该节点及其整棵子树（搜到目录即看其全部内容）；
+/// - 项目名命中 → 只保留该项目；
+/// - 命中项的祖先目录一律保留，以维持树形层级；
+/// - 「未分组」节点（`key` 为空）的 label 是内部稳定 key，不参与目录
+///   名匹配，只按项目名命中。
+fn filter_project_tree(
+    nodes: &[DirNode],
+    project_names: &[String],
+    query: &str,
+) -> Vec<DirNode> {
+    let needle = query.trim().to_lowercase();
+    if needle.is_empty() {
+        return nodes.to_vec();
+    }
+    nodes
+        .iter()
+        .filter_map(|node| filter_tree_node(node, project_names, &needle))
+        .collect()
+}
+
+/// 单个节点的递归过滤（[`filter_project_tree`] 的实现细节）。
+fn filter_tree_node(
+    node: &DirNode,
+    project_names: &[String],
+    needle: &str,
+) -> Option<DirNode> {
+    if !node.key.is_empty() && node.label.to_lowercase().contains(needle) {
+        return Some(node.clone());
+    }
+    let dirs: Vec<DirNode> = node
+        .dirs
+        .iter()
+        .filter_map(|child| filter_tree_node(child, project_names, needle))
+        .collect();
+    let projects: Vec<usize> = node
+        .projects
+        .iter()
+        .copied()
+        .filter(|&idx| {
+            project_names
+                .get(idx)
+                .is_some_and(|name| name.to_lowercase().contains(needle))
+        })
+        .collect();
+    if dirs.is_empty() && projects.is_empty() {
+        None
+    } else {
+        Some(DirNode {
+            label: node.label.clone(),
+            key: node.key.clone(),
+            dirs,
+            projects,
+        })
+    }
+}
+
+/// 统计一棵（过滤后的）项目树中的项目数。
+fn count_tree_projects(nodes: &[DirNode]) -> usize {
+    nodes
+        .iter()
+        .map(|node| node.projects.len() + count_tree_projects(&node.dirs))
+        .sum()
+}
+
 /// 目录行折叠箭头：展开时向下三角，折叠时向右三角（画在箭头槽内，
 /// 使目录名与子层对齐于缩进线）。
 fn paint_tree_arrow(ui: &egui::Ui, rect: egui::Rect, open: bool) {
@@ -1132,6 +1203,9 @@ pub struct GitPmApp {
     projects: Vec<Project>,
     /// 项目树中处于折叠态的目录节点 key（缺省全部展开，仅会话内记忆）。
     collapsed_tree_dirs: HashSet<String>,
+    /// 项目树工具栏的搜索词：非空时按字母逐字（子串、忽略大小写）
+    /// 过滤目录与项目，并临时展开全部命中路径。
+    tree_search: String,
     selected: Option<i64>,
     confirm_remove: bool,
 
@@ -1246,6 +1320,7 @@ impl GitPmApp {
             keys: None,
             projects: Vec::new(),
             collapsed_tree_dirs: HashSet::new(),
+            tree_search: String::new(),
             selected: None,
             confirm_remove: false,
             status: None,
@@ -1736,6 +1811,31 @@ impl GitPmApp {
         let lang = self.lang;
         egui::SidePanel::left("project_list").show(ctx, |ui| {
             ui.heading(i18n::t(lang, "heading-projects"));
+            // 工具栏：搜索框 + 清除按钮。输入即过滤（英文目录按字母逐字、
+            // 子串、忽略大小写），过滤期间自动展开命中路径。
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new(icons::ICON_SEARCH).weak());
+                let field_w = (ui.available_width() - 34.0).max(80.0);
+                let search_resp = ui.add(
+                    egui::TextEdit::singleline(&mut self.tree_search)
+                        .hint_text(i18n::t(lang, "tree-search-hint"))
+                        .desired_width(field_w),
+                );
+                if !self.tree_search.is_empty()
+                    && ui
+                        .button("✕")
+                        .on_hover_text(i18n::t(lang, "tree-search-clear"))
+                        .clicked()
+                {
+                    self.tree_search.clear();
+                }
+                // Esc 快速清空搜索（焦点在输入框内时）。
+                if search_resp.has_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Escape))
+                {
+                    self.tree_search.clear();
+                }
+            });
             ui.separator();
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
@@ -1756,7 +1856,30 @@ impl GitPmApp {
                     // 节点的 label 是稳定 key，展示时经 t() 翻译。
                     let paths: Vec<String> =
                         rows.iter().map(|(_, _, path)| path.clone()).collect();
-                    let tree = build_project_tree(&paths, cfg!(windows));
+                    let names: Vec<String> =
+                        rows.iter().map(|(_, name, _)| name.clone()).collect();
+                    let searching = !self.tree_search.trim().is_empty();
+                    let full_tree = build_project_tree(&paths, cfg!(windows));
+                    let tree = if searching {
+                        filter_project_tree(&full_tree, &names, &self.tree_search)
+                    } else {
+                        full_tree
+                    };
+                    if searching {
+                        let count = count_tree_projects(&tree).to_string();
+                        ui.label(
+                            egui::RichText::new(tf(
+                                lang,
+                                "tree-search-count",
+                                &[("n", count.as_str())],
+                            ))
+                            .weak(),
+                        );
+                    }
+                    if tree.is_empty() {
+                        ui.label(i18n::t(lang, "tree-search-empty"));
+                        return;
+                    }
                     let char_w = ui.fonts(|fonts| {
                         fonts.glyph_width(&egui::TextStyle::Body.resolve(ui.style()), 'M')
                     });
@@ -1780,7 +1903,9 @@ impl GitPmApp {
         char_w: f32,
     ) {
         let indent = depth as f32 * 2.0 * char_w;
-        let open = !self.collapsed_tree_dirs.contains(&node.key);
+        // 搜索期间强制展开全部命中路径；折叠记忆保留，清空搜索后恢复。
+        let searching = !self.tree_search.trim().is_empty();
+        let open = searching || !self.collapsed_tree_dirs.contains(&node.key);
         let title = if node.key.is_empty() {
             i18n::t(lang, GROUP_UNGROUPED_KEY)
         } else {
@@ -1793,26 +1918,41 @@ impl GitPmApp {
             // 宽（箭头槽），与子层项目名的起点一致。
             ui.spacing_mut().item_spacing.x = 0.0;
             ui.add_space(indent);
+            // 搜索态下不显示折叠箭头（全部展开），保留箭头槽以维持对齐。
+            let arrow_sense = if searching {
+                egui::Sense::hover()
+            } else {
+                egui::Sense::click()
+            };
             let (rect, arrow_resp) =
-                ui.allocate_exact_size(egui::vec2(2.0 * char_w, row_h), egui::Sense::click());
-            paint_tree_arrow(ui, rect, open);
+                ui.allocate_exact_size(egui::vec2(2.0 * char_w, row_h), arrow_sense);
+            if !searching {
+                paint_tree_arrow(ui, rect, open);
+            }
+            let name_sense = if searching {
+                egui::Sense::hover()
+            } else {
+                egui::Sense::click()
+            };
             let name_resp = ui.add(
                 egui::Label::new(
                     egui::RichText::new(title)
                         .strong()
                         .color(ui.visuals().hyperlink_color),
                 )
-                .sense(egui::Sense::click())
+                .sense(name_sense)
                 .truncate(),
             );
-            if arrow_resp.clicked() || name_resp.clicked() {
+            if !searching && (arrow_resp.clicked() || name_resp.clicked()) {
                 toggle = true;
             }
             let mut resp = arrow_resp.union(name_resp);
             if !node.key.is_empty() {
                 resp = resp.on_hover_text(&node.key);
             }
-            resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+            if !searching {
+                resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+            }
         });
         if toggle {
             if self.collapsed_tree_dirs.contains(&node.key) {
@@ -4421,6 +4561,104 @@ mod tests {
         all_projects(&tree, &mut seen);
         seen.sort();
         assert_eq!(seen, vec![0, 1, 2, 3, 4]);
+    }
+
+    // ------------------------------------------------ project tree search
+
+    #[test]
+    fn tree_search_matches_directory_names_case_insensitively() {
+        // 英文目录按字母逐字（子串）匹配且不区分大小写：查询 "PEN" 命中
+        // opencode 目录，保留其整棵子树，兄弟目录 rust 被过滤掉。
+        let tree = build_project_tree(
+            &paths(&[
+                "E:\\Workspace\\opencode\\git-gui",
+                "E:\\Workspace\\rust\\cargo-scan",
+                "E:\\Workspace\\opencode\\tools\\deploy",
+            ]),
+            true,
+        );
+        let names = paths(&["git-gui", "cargo-scan", "deploy"]);
+        let filtered = filter_project_tree(&tree, &names, "PEN");
+        let ws = node_at(&filtered, &["E:", "Workspace"]);
+        let dirs: Vec<&str> = ws.dirs.iter().map(|d| d.label.as_str()).collect();
+        assert_eq!(dirs, vec!["opencode"]);
+        assert_eq!(
+            node_at(&filtered, &["E:", "Workspace", "opencode"]).projects,
+            vec![0]
+        );
+        assert_eq!(
+            node_at(&filtered, &["E:", "Workspace", "opencode", "tools"]).projects,
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn tree_search_matches_project_names_and_keeps_ancestors() {
+        // 项目名命中时只保留该项目，同时保留完整祖先链以便展示层级。
+        let tree = build_project_tree(
+            &paths(&["E:\\ws\\alpha\\r1", "E:\\ws\\beta\\r2"]),
+            true,
+        );
+        let names = paths(&["r1", "r2"]);
+        let filtered = filter_project_tree(&tree, &names, "r2");
+        assert_eq!(filtered.len(), 1);
+        let ws = node_at(&filtered, &["E:", "ws"]);
+        assert!(ws.projects.is_empty());
+        assert_eq!(ws.dirs.len(), 1);
+        assert_eq!(node_at(&filtered, &["E:", "ws", "beta"]).projects, vec![1]);
+    }
+
+    #[test]
+    fn tree_search_returns_empty_when_nothing_matches() {
+        let tree = build_project_tree(&paths(&["E:\\ws\\alpha\\r1"]), true);
+        let names = paths(&["r1"]);
+        assert!(filter_project_tree(&tree, &names, "zzz").is_empty());
+    }
+
+    #[test]
+    fn tree_search_with_blank_query_keeps_every_project() {
+        let tree = build_project_tree(
+            &paths(&["E:\\ws\\alpha\\r1", "E:\\ws\\beta\\r2"]),
+            true,
+        );
+        let names = paths(&["r1", "r2"]);
+        let filtered = filter_project_tree(&tree, &names, "   ");
+        let mut seen: Vec<usize> = Vec::new();
+        all_projects(&filtered, &mut seen);
+        seen.sort();
+        assert_eq!(seen, vec![0, 1]);
+    }
+
+    #[test]
+    fn tree_search_does_not_match_the_ungrouped_internal_key() {
+        // 「未分组」节点的 label 是内部稳定 key（展示文案随语言变化）；
+        // 搜索只按项目名命中它，不能匹配这个内部 key。
+        let tree = build_project_tree(&paths(&["relative-repo", "E:\\ws\\alpha\\r1"]), true);
+        let names = paths(&["relative-repo", "r1"]);
+        assert!(filter_project_tree(&tree, &names, "ungrouped").is_empty());
+        let filtered = filter_project_tree(&tree, &names, "relative");
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].label, GROUP_UNGROUPED_KEY);
+        assert_eq!(filtered[0].projects, vec![0]);
+    }
+
+    #[test]
+    fn tree_search_counts_visible_projects() {
+        // 工具栏展示的命中项目数：目录命中时统计整棵子树，项目命中时计 1。
+        let tree = build_project_tree(
+            &paths(&[
+                "E:\\Workspace\\opencode\\git-gui",
+                "E:\\Workspace\\opencode\\tools\\deploy",
+                "E:\\Workspace\\rust\\cargo-scan",
+            ]),
+            true,
+        );
+        let names = paths(&["git-gui", "deploy", "cargo-scan"]);
+        let by_dir = filter_project_tree(&tree, &names, "opencode");
+        assert_eq!(count_tree_projects(&by_dir), 2);
+        let by_project = filter_project_tree(&tree, &names, "cargo");
+        assert_eq!(count_tree_projects(&by_project), 1);
+        assert_eq!(count_tree_projects(&tree), 3);
     }
 
     // ------------------------------------------------ porcelain parsing
