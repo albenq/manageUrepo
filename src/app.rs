@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use eframe::egui;
+use egui_extras::{Column, TableBuilder};
 
 use crate::browser;
 use crate::crypto::{self, CryptoError, VaultKeys};
@@ -66,6 +67,9 @@ const FIELD_WIDTH: f32 = 320.0;
 
 /// Maximum number of entries kept in the bottom output log.
 const LOG_MAX: usize = 200;
+
+/// Row height of the central file browser table (single-line labels).
+const BROWSER_ROW_HEIGHT: f32 = 18.0;
 
 /// Log label of the read-only `git status --porcelain=v1 -b` query.
 const LABEL_STATUS: &str = "git status --porcelain=v1 -b";
@@ -1812,119 +1816,146 @@ impl GitPmApp {
             })
             .collect();
 
-        egui::ScrollArea::vertical()
+        // 中央浏览器主体：egui_extras::TableBuilder。
+        // 四列均可拖拽调宽（列宽由 egui memory 在会话内记忆，不落盘），
+        // 表头常驻，纵向滚动 + 行虚拟化（rows() 只绘制视口内的行）。
+        TableBuilder::new(ui)
+            .striped(true)
+            // 调用点处于自上而下布局，单元格内必须显式恢复水平布局，
+            // 否则同一格内的状态标记与名称会纵向堆叠。
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            // 与旧 ScrollArea 的 auto_shrink([false, false]) 行为一致：
+            // 填满中央面板剩余高度，且不限制最大滚动高度。
             .auto_shrink([false, false])
-            .show(ui, |ui| {
-                if rows.is_empty() && self.browser_err.is_none() {
-                    ui.label("（空目录）");
-                }
-                egui::Grid::new("file_browser_grid")
-                    .striped(true)
-                    .num_columns(4)
-                    .spacing(egui::vec2(16.0, 6.0))
-                    .max_col_width(320.0)
-                    .show(ui, |ui| {
-                        ui.strong("名称");
-                        ui.strong("类型");
-                        ui.strong("大小");
-                        ui.strong("修改时间");
-                        ui.end_row();
+            .max_scroll_height(f32::INFINITY)
+            .resizable(true)
+            // 名称列占大头并裁剪过长文件名；其余列窄一些。
+            .column(Column::initial(240.0).resizable(true).clip(true).at_least(80.0))
+            .column(Column::initial(90.0).resizable(true).at_least(40.0))
+            .column(Column::initial(90.0).resizable(true).at_least(40.0))
+            .column(Column::initial(130.0).resizable(true).at_least(60.0))
+            .header(20.0, |mut header| {
+                header.col(|ui| {
+                    ui.strong("名称");
+                });
+                header.col(|ui| {
+                    ui.strong("类型");
+                });
+                header.col(|ui| {
+                    ui.strong("大小");
+                });
+                header.col(|ui| {
+                    ui.strong("修改时间");
+                });
+            })
+            .body(|body| {
+                body.rows(BROWSER_ROW_HEIGHT, rows.len(), |mut row| {
+                    let i = row.index();
+                    let (name, is_dir, size, modified, is_hidden) = &rows[i];
+                    let entry_status = row_status[i];
 
-                        for ((name, is_dir, size, modified, is_hidden), entry_status) in
-                            rows.into_iter().zip(row_status)
+                    // 隐藏项（.git 等）正常显示但整行视觉弱化，仍可进入。
+                    let dim = |rt: egui::RichText| {
+                        if *is_hidden {
+                            rt.weak()
+                        } else {
+                            rt
+                        }
+                    };
+                    // 目录行：四格均可点击（点击行内任意位置进入）；
+                    // 文件行：无动作（仅 hover 感应）。
+                    let sense = if *is_dir {
+                        egui::Sense::click()
+                    } else {
+                        egui::Sense::hover()
+                    };
+                    // 名称格：git 状态标记（着色）在前，名称随后；
+                    // 两者感应一致，目录行点标记也能进入。
+                    let mut name_resp: Option<egui::Response> = None;
+                    row.col(|ui| {
+                        let marker = entry_status.map(|st| {
+                            ui.add(egui::Label::new(status_marker_rich(st)).sense(sense))
+                        });
+                        let name_label = ui.add(
+                            egui::Label::new(dim(egui::RichText::new(name)))
+                                .wrap_mode(egui::TextWrapMode::Truncate)
+                                .sense(sense),
+                        );
+                        name_resp = Some(match marker {
+                            Some(marker_resp) => name_label.union(marker_resp),
+                            None => name_label,
+                        });
+                    });
+                    let (_, type_resp) = row.col(|ui| {
+                        ui.add(
+                            egui::Label::new(dim(egui::RichText::new(if *is_dir {
+                                "目录"
+                            } else {
+                                "文件"
+                            })))
+                            .sense(sense),
+                        );
+                    });
+                    let (_, size_resp) = row.col(|ui| {
+                        let size_text = if *is_dir {
+                            "—".to_string()
+                        } else {
+                            browser::fmt_size(*size)
+                        };
+                        ui.add(egui::Label::new(dim(egui::RichText::new(size_text))).sense(sense));
+                    });
+                    let (_, time_resp) = row.col(|ui| {
+                        ui.add(
+                            egui::Label::new(dim(egui::RichText::new(
+                                modified.as_deref().unwrap_or("—"),
+                            )))
+                            .sense(sense),
+                        );
+                    });
+
+                    if *is_dir {
+                        // 表格整格响应默认只有 hover 感应，因此沿用各格内
+                        // Label 的响应并集来判定「点击行内任意位置进入」。
+                        let cells =
+                            [name_resp, Some(type_resp), Some(size_resp), Some(time_resp)];
+                        if let Some(row_resp) =
+                            cells.into_iter().flatten().reduce(|acc, r| acc.union(r))
                         {
-                            // 隐藏项（.git 等）正常显示但整行视觉弱化，仍可进入。
-                            let dim = |rt: egui::RichText| {
-                                if is_hidden {
-                                    rt.weak()
-                                } else {
-                                    rt
+                            if row_resp.clicked() {
+                                if let Some(target) =
+                                    self.browser_path.as_ref().map(|p| p.join(name))
+                                {
+                                    self.load_browser_dir(target);
                                 }
-                            };
-                            // 目录行：四格均可点击（点击行内任意位置进入）；
-                            // 文件行：无动作（仅 hover 感应）。
-                            let sense = if is_dir {
-                                egui::Sense::click()
-                            } else {
-                                egui::Sense::hover()
-                            };
-                            // 名称格：git 状态标记（着色）在前，名称随后；
-                            // 两者感应一致，目录行点标记也能进入。
-                            let (name_resp, marker_resp) = ui
-                                .horizontal(|ui| {
-                                    let marker = entry_status.map(|st| {
-                                        ui.add(egui::Label::new(status_marker_rich(st)).sense(sense))
-                                    });
-                                    let name = ui.add(
-                                        egui::Label::new(dim(egui::RichText::new(&name)))
-                                            .wrap_mode(egui::TextWrapMode::Truncate)
-                                            .sense(sense),
-                                    );
-                                    (name, marker)
-                                })
-                                .inner;
-                            let mut name_resp = name_resp;
-                            if let Some(marker) = marker_resp {
-                                name_resp = name_resp.union(marker);
                             }
-                            let type_resp = ui.add(
-                                egui::Label::new(dim(egui::RichText::new(if is_dir {
-                                    "目录"
-                                } else {
-                                    "文件"
-                                })))
-                                .sense(sense),
-                            );
-                            let size_text = if is_dir {
-                                "—".to_string()
-                            } else {
-                                browser::fmt_size(size)
-                            };
-                            let size_resp = ui
-                                .add(egui::Label::new(dim(egui::RichText::new(size_text))).sense(sense));
-                            let time_resp = ui.add(
-                                egui::Label::new(dim(egui::RichText::new(
-                                    modified.unwrap_or_else(|| "—".to_string()),
-                                )))
-                                .sense(sense),
-                            );
-                            ui.end_row();
-                            if is_dir {
-                                let row = name_resp
-                                    .union(type_resp)
-                                    .union(size_resp)
-                                    .union(time_resp);
-                                if row.clicked() {
-                                    if let Some(target) =
-                                        self.browser_path.as_ref().map(|p| p.join(&name))
-                                    {
-                                        self.load_browser_dir(target);
-                                    }
-                                }
-                                row.on_hover_cursor(egui::CursorIcon::PointingHand);
-                            }
+                            row_resp.on_hover_cursor(egui::CursorIcon::PointingHand);
                         }
-                    });
+                    }
+                });
+            });
 
-                // 行尾图例：porcelain 有数据（存在状态标记）时显示一次。
-                if !status_map.is_empty() {
+        if rows.is_empty() && self.browser_err.is_none() {
+            ui.label("（空目录）");
+        }
+
+        // 行尾图例：porcelain 有数据（存在状态标记）时显示一次。
+        if !status_map.is_empty() {
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("图例：").weak());
+                for st in [
+                    FileStatus::Conflict,
+                    FileStatus::Deleted,
+                    FileStatus::Modified,
+                    FileStatus::Renamed,
+                    FileStatus::Added,
+                ] {
+                    ui.label(status_marker_rich(st));
+                    ui.label(egui::RichText::new(status_legend_text(st)).weak());
                     ui.add_space(6.0);
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(egui::RichText::new("图例：").weak());
-                        for st in [
-                            FileStatus::Conflict,
-                            FileStatus::Deleted,
-                            FileStatus::Modified,
-                            FileStatus::Renamed,
-                            FileStatus::Added,
-                        ] {
-                            ui.label(status_marker_rich(st));
-                            ui.label(egui::RichText::new(status_legend_text(st)).weak());
-                            ui.add_space(6.0);
-                        }
-                    });
                 }
             });
+        }
     }
 
     // -------------------------------------------------- git operation handlers

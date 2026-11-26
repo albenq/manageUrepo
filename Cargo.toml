@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 eframe = "0.28"
+egui_extras = "0.28"
 rusqlite = { version = "0.32", features = ["bundled"] }
 argon2 = "0.5"
 aes-gcm = "0.10"
