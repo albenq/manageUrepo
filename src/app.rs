@@ -767,115 +767,172 @@ fn status_legend_text(lang: Lang, status: FileStatus) -> &'static str {
 
 // ------------------------------------------------- project tree grouping
 //
-// 左侧项目树的纯分组逻辑（只依赖 std，不依赖 egui）：项目按父目录归组，
-// 互为祖先链的父目录合并为同一节点；不同盘符等无公共层级的各自成节点。
-// 单元测试见文件末尾 tests 模块。
+// 左侧项目树的纯分组逻辑（只依赖 std，不依赖 egui）：项目路径逐段展开
+// 为目录树（盘符 / 每级目录名各成一层），项目挂在直接父目录节点下。
+// 每层缩进 2 个字符宽由 UI 层负责。单元测试见文件末尾 tests 模块。
 
-/// 项目树的一个分组节点：共享同一（合并后）父目录的项目集合。
-struct ProjectGroup {
-    /// 节点标题：根父目录的原始拼写（该 key 首次出现时的写法）；
-    /// 无法推导父目录的项目共用 [`GROUP_UNGROUPED_KEY`] 节点（展示时
+/// 项目树的一个目录节点（多层结构，递归嵌套）。
+struct DirNode {
+    /// 该层的展示名：盘符（如 `E:`）、POSIX 根（`/`）或目录名；
+    /// 无法推导父目录的项目归入 [`GROUP_UNGROUPED_KEY`] 节点（展示时
     /// 由 UI 层按当前语言翻译）。
     label: String,
-    /// 排序与折叠态记忆键：规范化后的父目录（Windows 模式下小写并把
-    /// `/` 统一为 `\`）。
+    /// 规范化完整路径 key（折叠态记忆与测试断言用；比较时大小写
+    /// 归一化，Windows 模式分隔符统一为 `\`）。
     key: String,
-    /// 成员项目在调用方列表中的下标，保持输入顺序。
-    members: Vec<usize>,
+    /// 子目录节点（按展示名排序）。
+    dirs: Vec<DirNode>,
+    /// 直接挂在该目录下的项目下标，保持输入顺序。
+    projects: Vec<usize>,
 }
 
-/// 项目路径 → 父目录分组 key；返回 None 表示无法归组（空路径、纯根路径、
-/// 单段相对路径等推导不出父目录的情形）。
-///
-/// `case_insensitive`（调用方传 `cfg!(windows)`）：Windows 路径大小写
-/// 不敏感，且 `/` 与 `\` 视为同一分隔符；POSIX 路径保持原样比较。
-fn parent_group_key(path: &str, case_insensitive: bool) -> Option<String> {
+/// 项目路径 → 父目录的路径组件（原样拼写；空路径 / 纯根路径 /
+/// 单段相对路径等推导不出父目录时返回 None）。
+fn parent_dir_components(path: &str) -> Option<Vec<String>> {
     let parent = Path::new(path).parent()?;
-    let text = parent.to_string_lossy();
-    if text.is_empty() {
-        return None;
+    let mut comps: Vec<String> = Vec::new();
+    let mut saw_prefix = false;
+    for comp in parent.components() {
+        match comp {
+            std::path::Component::Prefix(prefix) => {
+                saw_prefix = true;
+                comps.push(prefix.as_os_str().to_string_lossy().into_owned());
+            }
+            std::path::Component::RootDir => {
+                // Windows 的 `E:\` 根分隔已由盘符前缀表达，不再单列一层；
+                // POSIX 的 `/` 作为顶层节点保留。
+                if !saw_prefix && comps.is_empty() {
+                    comps.push("/".to_string());
+                }
+            }
+            std::path::Component::Normal(seg) => {
+                comps.push(seg.to_string_lossy().into_owned());
+            }
+            std::path::Component::CurDir | std::path::Component::ParentDir => {}
+        }
     }
-    Some(if case_insensitive {
-        text.to_lowercase().replace('/', "\\")
+    if comps.is_empty() {
+        None
     } else {
-        text.to_string()
-    })
+        Some(comps)
+    }
 }
 
-/// 路径的组件数（祖先链合并时用于选取最短前缀）。
-fn path_depth(path: &str) -> usize {
-    Path::new(path).components().count()
+/// 按组件链把项目插入目录树；`parent_key` 为父节点 key（根为空串）。
+/// 同名（`case_insensitive` 时忽略大小写）目录复用同一节点，节点 key
+/// 由组件链拼接、大小写归一化。
+fn insert_into_tree(
+    nodes: &mut Vec<DirNode>,
+    comps: &[String],
+    idx: usize,
+    case_insensitive: bool,
+    parent_key: &str,
+) {
+    let head = &comps[0];
+    let norm = if case_insensitive {
+        head.to_lowercase()
+    } else {
+        head.clone()
+    };
+    let pos = nodes.iter().position(|node| {
+        if case_insensitive {
+            node.label.to_lowercase() == norm
+        } else {
+            node.label == *head
+        }
+    });
+    let pos = match pos {
+        Some(pos) => pos,
+        None => {
+            let key = if parent_key.is_empty() {
+                norm.clone()
+            } else if case_insensitive {
+                format!("{parent_key}\\{norm}")
+            } else {
+                format!("{parent_key}/{norm}")
+            };
+            nodes.push(DirNode {
+                label: head.clone(),
+                key,
+                dirs: Vec::new(),
+                projects: Vec::new(),
+            });
+            nodes.len() - 1
+        }
+    };
+    let node = &mut nodes[pos];
+    if comps.len() == 1 {
+        node.projects.push(idx);
+    } else {
+        let key = node.key.clone();
+        insert_into_tree(&mut node.dirs, &comps[1..], idx, case_insensitive, &key);
+    }
 }
 
-/// 项目树分组：key 相同的父目录合并；某父目录是另一父目录的路径前缀
-/// （组件级比较）时合并到最短的祖先节点，标题取祖先目录拼写；无前缀
-/// 关系的（如不同盘符）各自成节点。组按 key 字典序排序，无法归组的
-/// 项目归入单一的未分组节点（label 为 [`GROUP_UNGROUPED_KEY`] 稳定
-/// key，排在最后）；每个输入下标恰好出现在一个组的 `members` 中
-/// （顺序与输入一致）。
-fn group_projects_by_parent(paths: &[String], case_insensitive: bool) -> Vec<ProjectGroup> {
-    // 1) 逐项目推导父目录 key；无法推导的进入未分组桶。
-    let mut key_labels: HashMap<String, String> = HashMap::new(); // key → 首现拼写
-    let mut keys: Vec<String> = Vec::new(); // 去重 key，首现顺序
-    let mut member_keys: Vec<Option<String>> = vec![None; paths.len()];
+/// 递归按展示名排序目录节点（`case_insensitive` 时忽略大小写）。
+fn sort_tree(nodes: &mut [DirNode], case_insensitive: bool) {
+    nodes.sort_by(|a, b| {
+        if case_insensitive {
+            a.label.to_lowercase().cmp(&b.label.to_lowercase())
+        } else {
+            a.label.cmp(&b.label)
+        }
+    });
+    for node in nodes.iter_mut() {
+        sort_tree(&mut node.dirs, case_insensitive);
+    }
+}
+
+/// 项目树构建：每个项目路径逐段展开为目录层级，项目挂在直接父目录下；
+/// 无法推导父目录的项目归入末尾的未分组节点（label 为
+/// [`GROUP_UNGROUPED_KEY`] 稳定 key）；每个输入下标恰好出现一次
+/// （同目录内保持输入顺序）。
+fn build_project_tree(paths: &[String], case_insensitive: bool) -> Vec<DirNode> {
+    let mut roots: Vec<DirNode> = Vec::new();
     let mut ungrouped: Vec<usize> = Vec::new();
     for (idx, path) in paths.iter().enumerate() {
-        let Some(key) = parent_group_key(path, case_insensitive) else {
-            ungrouped.push(idx);
-            continue;
-        };
-        if !key_labels.contains_key(&key) {
-            let label = Path::new(path)
-                .parent()
-                .unwrap_or(Path::new(""))
-                .to_string_lossy()
-                .into_owned();
-            key_labels.insert(key.clone(), label);
-            keys.push(key.clone());
+        match parent_dir_components(path) {
+            Some(comps) => insert_into_tree(&mut roots, &comps, idx, case_insensitive, ""),
+            None => ungrouped.push(idx),
         }
-        member_keys[idx] = Some(key);
     }
-
-    // 2) 祖先链合并：每个 key 归入 key 集内最短的前缀（含自身；过滤结果
-    //    必含自身，unwrap_or 仅防御）。
-    let root_of = |key: &str| -> String {
-        let kpath = Path::new(key);
-        keys.iter()
-            .filter(|other| kpath.starts_with(Path::new(other.as_str())))
-            .min_by_key(|other| path_depth(other.as_str()))
-            .map(String::as_str)
-            .unwrap_or(key)
-            .to_string()
-    };
-
-    // 3) 以根 key 聚合成员（保持输入顺序），组按 key 排序输出。
-    let mut roots: HashMap<String, Vec<usize>> = HashMap::new();
-    for (idx, key) in member_keys.iter().enumerate() {
-        let Some(key) = key else { continue };
-        roots.entry(root_of(key)).or_default().push(idx);
-    }
-    let mut group_keys: Vec<String> = roots.keys().cloned().collect();
-    group_keys.sort();
-    let mut groups: Vec<ProjectGroup> = group_keys
-        .into_iter()
-        .map(|key| {
-            let members = roots.remove(&key).unwrap_or_default();
-            let label = key_labels
-                .get(&key)
-                .cloned()
-                .unwrap_or_else(|| key.clone());
-            ProjectGroup { label, key, members }
-        })
-        .collect();
+    sort_tree(&mut roots, case_insensitive);
     if !ungrouped.is_empty() {
-        groups.push(ProjectGroup {
+        roots.push(DirNode {
             label: GROUP_UNGROUPED_KEY.to_string(),
             key: String::new(),
-            members: ungrouped,
+            dirs: Vec::new(),
+            projects: ungrouped,
         });
     }
-    groups
+    roots
 }
+
+/// 目录行折叠箭头：展开时向下三角，折叠时向右三角（画在箭头槽内，
+/// 使目录名与子层对齐于缩进线）。
+fn paint_tree_arrow(ui: &egui::Ui, rect: egui::Rect, open: bool) {
+    let center = rect.left_center() + egui::vec2(rect.width() * 0.35, 0.0);
+    let r = 4.5;
+    let points = if open {
+        vec![
+            center + egui::vec2(-r, -r * 0.6),
+            center + egui::vec2(r, -r * 0.6),
+            center + egui::vec2(0.0, r * 0.7),
+        ]
+    } else {
+        vec![
+            center + egui::vec2(-r * 0.6, -r),
+            center + egui::vec2(-r * 0.6, r),
+            center + egui::vec2(r * 0.7, 0.0),
+        ]
+    };
+    ui.painter().add(egui::Shape::convex_polygon(
+        points,
+        ui.visuals().weak_text_color(),
+        egui::Stroke::NONE,
+    ));
+}
+
 
 /// Which screen the main window currently shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -924,6 +981,8 @@ pub struct GitPmApp {
     // Session keys from the master password, used to read/write credentials.
     keys: Option<VaultKeys>,
     projects: Vec<Project>,
+    /// 项目树中处于折叠态的目录节点 key（缺省全部展开，仅会话内记忆）。
+    collapsed_tree_dirs: HashSet<String>,
     selected: Option<i64>,
     confirm_remove: bool,
 
@@ -1037,6 +1096,7 @@ impl GitPmApp {
             unlock_pw: String::new(),
             keys: None,
             projects: Vec::new(),
+            collapsed_tree_dirs: HashSet::new(),
             selected: None,
             confirm_remove: false,
             status: None,
@@ -1541,46 +1601,100 @@ impl GitPmApp {
                         ui.label(i18n::t(lang, "empty-project-list"));
                         return;
                     }
-                    // 树状分组：按父目录归组（祖先链合并），组节点默认展开，
-                    // 折叠态用 egui::Id（按规范化路径 key）在会话内记忆。
-                    // 「未分组」节点的 label 是稳定 key，展示时经 t() 翻译。
+                    // 树状结构：路径逐段成层，每层缩进 2 个字符宽（按当前
+                    // 字体实测 'M' 宽），目录名与项目名按层左对齐；目录节点
+                    // 缺省展开，折叠态在会话内按节点 key 记忆。「未分组」
+                    // 节点的 label 是稳定 key，展示时经 t() 翻译。
                     let paths: Vec<String> =
                         rows.iter().map(|(_, _, path)| path.clone()).collect();
-                    let groups = group_projects_by_parent(&paths, cfg!(windows));
-                    for group in groups {
-                        let member_rows: Vec<(i64, String, String)> = group
-                            .members
-                            .iter()
-                            .map(|&idx| rows[idx].clone())
-                            .collect();
-                        let group_title: &str = if group.key.is_empty() {
-                            i18n::t(lang, GROUP_UNGROUPED_KEY)
-                        } else {
-                            group.label.as_str()
-                        };
-                        egui::CollapsingHeader::new(group_title)
-                            .id_source(egui::Id::new(("project_tree_group", group.key)))
-                            .default_open(true)
-                            .show(ui, |ui| {
-                                for (id, name, path) in member_rows {
-                                    let selected = self.selected == Some(id);
-                                    let resp = ui.add_sized(
-                                        [ui.available_width(), 22.0],
-                                        egui::SelectableLabel::new(selected, name),
-                                    );
-                                    if resp.clicked() && self.selected != Some(id) {
-                                        // 选中项目变化：浏览器重置为新项目的根目录。
-                                        self.selected = Some(id);
-                                        self.reset_browser_to(Path::new(&path));
-                                    }
-                                    if !path.is_empty() {
-                                        resp.on_hover_text(path);
-                                    }
-                                }
-                            });
+                    let tree = build_project_tree(&paths, cfg!(windows));
+                    let char_w = ui.fonts(|fonts| {
+                        fonts.glyph_width(&egui::TextStyle::Body.resolve(ui.style()), 'M')
+                    });
+                    for node in &tree {
+                        self.show_tree_node(ui, node, 0, &rows, lang, char_w);
                     }
                 });
         });
+    }
+
+    /// 递归渲染项目树的一层：目录行（箭头 + 目录名）左对齐在当前层
+    /// 缩进处，子目录与直属项目各缩进 2 个字符宽。目录节点缺省展开，
+    /// 点击箭头或目录名切换折叠态（`collapsed_tree_dirs` 会话内记忆）。
+    fn show_tree_node(
+        &mut self,
+        ui: &mut egui::Ui,
+        node: &DirNode,
+        depth: usize,
+        rows: &[(i64, String, String)],
+        lang: Lang,
+        char_w: f32,
+    ) {
+        let indent = depth as f32 * 2.0 * char_w;
+        let open = !self.collapsed_tree_dirs.contains(&node.key);
+        let title = if node.key.is_empty() {
+            i18n::t(lang, GROUP_UNGROUPED_KEY)
+        } else {
+            node.label.as_str()
+        };
+        let row_h = ui.spacing().interact_size.y;
+        let mut toggle = false;
+        ui.horizontal(|ui| {
+            ui.add_space(indent);
+            let (rect, arrow_resp) =
+                ui.allocate_exact_size(egui::vec2(2.0 * char_w, row_h), egui::Sense::click());
+            paint_tree_arrow(ui, rect, open);
+            let name_resp = ui.add(
+                egui::Label::new(egui::RichText::new(title).strong())
+                    .sense(egui::Sense::click())
+                    .truncate(),
+            );
+            if arrow_resp.clicked() || name_resp.clicked() {
+                toggle = true;
+            }
+            let mut resp = arrow_resp.union(name_resp);
+            if !node.key.is_empty() {
+                resp = resp.on_hover_text(&node.key);
+            }
+            resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+        });
+        if toggle {
+            if self.collapsed_tree_dirs.contains(&node.key) {
+                self.collapsed_tree_dirs.remove(&node.key);
+            } else {
+                self.collapsed_tree_dirs.insert(node.key.clone());
+            }
+        }
+        if !open {
+            return;
+        }
+        let child_indent = (depth + 1) as f32 * 2.0 * char_w;
+        for &idx in &node.projects {
+            let (id, name, path) = &rows[idx];
+            let selected = self.selected == Some(*id);
+            let mut clicked = false;
+            ui.horizontal(|ui| {
+                ui.add_space(child_indent);
+                let resp = ui.add_sized(
+                    [ui.available_width(), 22.0],
+                    egui::SelectableLabel::new(selected, name.clone()),
+                );
+                if resp.clicked() {
+                    clicked = true;
+                }
+                if !path.is_empty() {
+                    resp.on_hover_text(path.as_str());
+                }
+            });
+            if clicked && self.selected != Some(*id) {
+                // 选中项目变化：浏览器重置为新项目的根目录。
+                self.selected = Some(*id);
+                self.reset_browser_to(Path::new(path));
+            }
+        }
+        for child in &node.dirs {
+            self.show_tree_node(ui, child, depth + 1, rows, lang, char_w);
+        }
     }
 
     // ---------------------------------------------------- project operations
@@ -3918,64 +4032,84 @@ mod tests {
         assert!(!scrubbed.stderr.contains("s3cret"));
     }
 
-    // ------------------------------------------------ project tree grouping
+    // ------------------------------------------------ project tree structure
 
     fn paths(value: &[&str]) -> Vec<String> {
         value.iter().map(|s| s.to_string()).collect()
     }
 
+    /// 沿展示名链找到节点（测试辅助）。
+    fn node_at<'a>(nodes: &'a [DirNode], segs: &[&str]) -> &'a DirNode {
+        assert!(!segs.is_empty(), "node_at needs at least one segment");
+        let mut cur: &[DirNode] = nodes;
+        for (i, seg) in segs.iter().enumerate() {
+            let node = cur
+                .iter()
+                .find(|n| n.label == *seg)
+                .unwrap_or_else(|| panic!("missing tree segment {seg:?}"));
+            if i + 1 == segs.len() {
+                return node;
+            }
+            cur = &node.dirs;
+        }
+        unreachable!()
+    }
+
+    fn all_projects(nodes: &[DirNode], out: &mut Vec<usize>) {
+        for node in nodes {
+            out.extend(node.projects.iter().copied());
+            all_projects(&node.dirs, out);
+        }
+    }
+
     #[test]
-    fn group_same_parent_into_one_node() {
-        // 分组正确：同一父目录下的项目归入同一节点，成员保持输入顺序。
-        let groups = group_projects_by_parent(
+    fn tree_expands_each_path_segment_into_a_level() {
+        // 同一父目录下的项目挂在同一条目录链末尾。
+        let tree = build_project_tree(
             &paths(&["E:\\ws\\a\\repo1", "E:\\ws\\a\\repo2", "E:\\ws\\a\\repo3"]),
             true,
         );
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].label, "E:\\ws\\a");
-        assert_eq!(groups[0].members, vec![0, 1, 2]);
+        assert_eq!(tree.len(), 1);
+        let node = node_at(&tree, &["E:", "ws", "a"]);
+        assert_eq!(node.projects, vec![0, 1, 2]);
     }
 
     #[test]
-    fn group_merges_ancestor_chain_parents() {
-        // 前缀合并：互为祖先链的父目录合并为同一节点（标题取最短祖先）。
-        let groups = group_projects_by_parent(
-            &paths(&["E:\\ws\\deep\\nest\\repo", "E:\\ws\\other\\repo2", "E:\\ws\\top"]),
-            true,
-        );
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].label, "E:\\ws");
-        assert_eq!(groups[0].members, vec![0, 1, 2]);
+    fn tree_nests_deep_paths() {
+        // 深层路径逐层展开：E: → ws → deep → nest，项目挂在 nest 下。
+        let tree = build_project_tree(&paths(&["E:\\ws\\deep\\nest\\repo"]), true);
+        let nest = node_at(&tree, &["E:", "ws", "deep", "nest"]);
+        assert_eq!(nest.projects, vec![0]);
+        // 未在路径上出现的中间层不会被凭空创建。
+        assert!(node_at(&tree, &["E:", "ws"]).projects.is_empty());
     }
 
     #[test]
-    fn group_keeps_unrelated_parents_separate() {
-        // 无前缀关系的兄弟父目录不合并，各自成节点；组按 key 排序。
-        let groups = group_projects_by_parent(
-            &paths(&["E:\\ws\\beta\\r2", "E:\\ws\\alpha\\r1"]),
-            true,
-        );
-        assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].label, "E:\\ws\\alpha");
-        assert_eq!(groups[0].members, vec![1]);
-        assert_eq!(groups[1].label, "E:\\ws\\beta");
-        assert_eq!(groups[1].members, vec![0]);
+    fn tree_keeps_sibling_directories_separate_and_sorted() {
+        // 无前缀关系的兄弟父目录各自成节点；子目录按名排序。
+        let tree =
+            build_project_tree(&paths(&["E:\\ws\\beta\\r2", "E:\\ws\\alpha\\r1"]), true);
+        let ws = node_at(&tree, &["E:", "ws"]);
+        let labels: Vec<&str> = ws.dirs.iter().map(|d| d.label.as_str()).collect();
+        assert_eq!(labels, vec!["alpha", "beta"]);
+        assert_eq!(node_at(&tree, &["E:", "ws", "alpha"]).projects, vec![1]);
+        assert_eq!(node_at(&tree, &["E:", "ws", "beta"]).projects, vec![0]);
     }
 
     #[test]
-    fn group_different_drives_form_separate_nodes() {
-        // 不同盘符无法归组：按根各成节点。
-        let groups =
-            group_projects_by_parent(&paths(&["C:\\data\\r1", "D:\\stuff\\r2"]), true);
-        assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].label, "C:\\data");
-        assert_eq!(groups[1].label, "D:\\stuff");
+    fn tree_different_drives_form_separate_roots() {
+        // 不同盘符是不同根节点，按名排序。
+        let tree = build_project_tree(&paths(&["C:\\data\\r1", "D:\\stuff\\r2"]), true);
+        let roots: Vec<&str> = tree.iter().map(|n| n.label.as_str()).collect();
+        assert_eq!(roots, vec!["C:", "D:"]);
+        assert_eq!(node_at(&tree, &["C:", "data"]).projects, vec![0]);
+        assert_eq!(node_at(&tree, &["D:", "stuff"]).projects, vec![1]);
     }
 
     #[test]
-    fn group_mixed_realistic_layout() {
-        // 真实布局：同盘不同父目录各自成节点，深层项目并入存在的祖先节点。
-        let groups = group_projects_by_parent(
+    fn tree_mixed_realistic_layout() {
+        // 真实布局：多个盘符与多层目录并存，各项目挂在对应层。
+        let tree = build_project_tree(
             &paths(&[
                 "E:\\Workspace\\opencode\\git-gui",
                 "E:\\Workspace\\opencode\\tools\\deploy",
@@ -3984,82 +4118,89 @@ mod tests {
             ]),
             true,
         );
-        assert_eq!(groups.len(), 3);
-        assert_eq!(groups[0].label, "C:\\Users\\me");
-        assert_eq!(groups[0].members, vec![3]);
-        assert_eq!(groups[1].label, "E:\\Workspace\\opencode");
-        assert_eq!(groups[1].members, vec![0, 1]);
-        assert_eq!(groups[2].label, "E:\\Workspace\\rust");
-        assert_eq!(groups[2].members, vec![2]);
+        let roots: Vec<&str> = tree.iter().map(|n| n.label.as_str()).collect();
+        assert_eq!(roots, vec!["C:", "E:"]);
+        assert_eq!(node_at(&tree, &["C:", "Users", "me"]).projects, vec![3]);
+        assert_eq!(
+            node_at(&tree, &["E:", "Workspace", "opencode"]).projects,
+            vec![0]
+        );
+        assert_eq!(
+            node_at(&tree, &["E:", "Workspace", "opencode", "tools"]).projects,
+            vec![1]
+        );
+        assert_eq!(
+            node_at(&tree, &["E:", "Workspace", "rust"]).projects,
+            vec![2]
+        );
     }
 
     #[test]
-    fn group_is_case_insensitive_in_windows_mode() {
-        // Windows 路径大小写不敏感：仅大小写不同的父目录合并为同一节点，
-        // 标题取首次出现的拼写。
-        let groups = group_projects_by_parent(
+    fn tree_is_case_insensitive_in_windows_mode() {
+        // Windows 路径大小写不敏感：仅大小写不同的目录合并到同一节点，
+        // 展示名取首次出现的拼写。
+        let tree = build_project_tree(
             &paths(&["E:\\Workspace\\opencode\\r1", "e:\\workspace\\OPENCODE\\r2"]),
             true,
         );
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].label, "E:\\Workspace\\opencode");
-        assert_eq!(groups[0].members, vec![0, 1]);
+        assert_eq!(tree.len(), 1);
+        let node = node_at(&tree, &["E:", "Workspace", "opencode"]);
+        assert_eq!(node.projects, vec![0, 1]);
     }
 
     #[test]
-    fn group_is_case_sensitive_outside_windows_mode() {
-        // POSIX 模式（case_insensitive=false）：大小写不同的父目录不合并。
-        let groups =
-            group_projects_by_parent(&paths(&["/home/u/Code/r1", "/home/u/code/r2"]), false);
-        assert_eq!(groups.len(), 2);
+    fn tree_is_case_sensitive_outside_windows_mode() {
+        // POSIX 模式（case_insensitive=false）：大小写不同的目录分开。
+        let tree =
+            build_project_tree(&paths(&["/home/u/Code/r1", "/home/u/code/r2"]), false);
+        let u = node_at(&tree, &["/", "home", "u"]);
+        let labels: Vec<&str> = u.dirs.iter().map(|d| d.label.as_str()).collect();
+        assert_eq!(labels, vec!["Code", "code"]);
+        assert_eq!(node_at(&tree, &["/", "home", "u", "Code"]).projects, vec![0]);
+        assert_eq!(node_at(&tree, &["/", "home", "u", "code"]).projects, vec![1]);
     }
 
     #[test]
-    fn group_normalizes_separators_in_windows_mode() {
+    fn tree_normalizes_separators_in_windows_mode() {
         // Windows 模式下 `/` 与 `\` 视为同一分隔符（克隆产生的路径可能是
         // 正斜杠），同一目录不因分隔符写法不同而拆成两个节点。
-        let groups = group_projects_by_parent(&paths(&["E:\\ws\\r1", "E:/ws/r2"]), true);
-        assert_eq!(groups.len(), 1);
-        assert_eq!(groups[0].label, "E:\\ws");
-        assert_eq!(groups[0].members, vec![0, 1]);
+        let tree = build_project_tree(&paths(&["E:\\ws\\r1", "E:/ws/r2"]), true);
+        let node = node_at(&tree, &["E:", "ws"]);
+        assert_eq!(node.projects, vec![0, 1]);
+        assert_eq!(tree.len(), 1);
     }
 
     #[test]
-    fn group_handles_ungroupable_paths() {
+    fn tree_handles_ungroupable_paths() {
         // 空路径 / 纯根路径 / 单段相对路径推导不出父目录：归入单一的
-        // 未分组节点（label 为稳定 key，排在最后），其余正常归组。
-        let groups = group_projects_by_parent(
+        // 未分组节点（label 为稳定 key，排在最后），其余正常成树。
+        let tree = build_project_tree(
             &paths(&["", "C:\\", "relative-repo", "E:\\ws\\normal"]),
             true,
         );
-        assert_eq!(groups.len(), 2);
-        assert_eq!(groups[0].label, "E:\\ws");
-        assert_eq!(groups[0].members, vec![3]);
-        assert_eq!(groups[1].label, GROUP_UNGROUPED_KEY);
-        assert_eq!(groups[1].members, vec![0, 1, 2]);
+        assert_eq!(tree.len(), 2);
+        assert_eq!(node_at(&tree, &["E:", "ws"]).projects, vec![3]);
+        let ungrouped = tree.last().expect("ungrouped node");
+        assert_eq!(ungrouped.label, GROUP_UNGROUPED_KEY);
+        assert_eq!(ungrouped.key, "");
+        assert_eq!(ungrouped.projects, vec![0, 1, 2]);
     }
 
     #[test]
-    fn group_member_indices_cover_every_input_exactly_once() {
-        // 契约：每个输入下标恰好出现在一个组里，且保持输入顺序。
+    fn tree_member_indices_cover_every_input_exactly_once() {
+        // 契约：每个输入下标恰好出现在一个节点里，同节点内保持输入顺序。
         let input = paths(&[
             "E:\\ws\\a\\r1",
             "D:\\r2",
             "E:\\ws\\a\\b\\r3",
-            "",
             "E:\\ws\\a\\r4",
             "D:\\deep\\r5",
         ]);
-        let groups = group_projects_by_parent(&input, true);
-        let mut seen: Vec<usize> = groups.iter().flat_map(|g| g.members.iter().copied()).collect();
+        let tree = build_project_tree(&input, true);
+        let mut seen: Vec<usize> = Vec::new();
+        all_projects(&tree, &mut seen);
         seen.sort();
-        assert_eq!(seen, vec![0, 1, 2, 3, 4, 5]);
-        // 组内顺序与输入一致。
-        for group in &groups {
-            let mut members = group.members.clone();
-            members.sort();
-            assert_eq!(group.members, members);
-        }
+        assert_eq!(seen, vec![0, 1, 2, 3, 4]);
     }
 
     // ------------------------------------------------ porcelain parsing
