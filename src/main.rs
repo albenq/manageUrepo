@@ -1,6 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // release 版隐藏控制台黑窗
 
 mod app;
+mod browser;
 mod crypto;
 mod db;
 mod git;
