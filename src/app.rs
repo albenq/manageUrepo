@@ -5,13 +5,14 @@
 //! `git`) to egui widgets. Every fallible call is matched and its error is
 //! rendered as a message; nothing here unwraps or panics.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
 use crate::crypto::{self, CryptoError, VaultKeys};
 use crate::db::{self, Project};
 use crate::git;
+use crate::password::{self, GenOptions};
 
 /// `meta` key that marks an initialized vault (written by `crypto::setup_master`).
 const VERIFIER_KEY: &str = "verifier";
@@ -25,8 +26,13 @@ const FIELD_WIDTH: f32 = 320.0;
 /// Maximum number of entries kept in the bottom output log.
 const LOG_MAX: usize = 200;
 
-/// Remote name used by the Push button (credential injection lands in Task 10).
+/// Remote name used by Push/Pull and as the default credential label. When a
+/// credential is stored under this label and the configured remote URL is
+/// https, the UI injects it into the URL for that one git call.
 const DEFAULT_PUSH_REMOTE: &str = "origin";
+
+/// Width of the single-line inputs inside the modal dialogs.
+const DIALOG_FIELD_WIDTH: f32 = 360.0;
 
 /// One rendered git invocation in the bottom read-only output area.
 struct LogEntry {
@@ -49,6 +55,80 @@ struct StatusSnapshot {
     status: Option<StatusSection>,
     branches: Option<StatusSection>,
     tags: Option<StatusSection>,
+}
+
+/// Credential data prepared for exactly one in-memory authenticated git call.
+struct InjectedAuth {
+    /// `https://user:pass@host/...`. Only ever passed to `git` as an argument;
+    /// never logged, rendered, or stored anywhere.
+    url: String,
+    /// The remote URL without credentials, used to redact git output.
+    plain_url: String,
+    /// Raw and percent-encoded passwords, both scrubbed from git output.
+    password: String,
+    encoded_password: String,
+}
+
+impl InjectedAuth {
+    /// `(from, to)` replacement pairs that scrub credentials from git output.
+    fn redact_pairs(&self) -> Vec<(String, String)> {
+        vec![
+            (self.url.clone(), self.plain_url.clone()),
+            (self.password.clone(), "******".to_string()),
+            (self.encoded_password.clone(), "******".to_string()),
+        ]
+    }
+}
+
+/// Percent-encode a username or password for the userinfo part of a URL
+/// (anything outside the RFC 3986 unreserved set becomes `%XX`).
+fn percent_encode_userinfo(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(byte as char);
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+/// Split a stored secret (`user:pass`) into its two parts.
+fn split_credential_secret(secret: &str) -> (String, String) {
+    match secret.split_once(':') {
+        Some((user, pass)) => (user.to_string(), pass.to_string()),
+        None => (String::new(), secret.to_string()),
+    }
+}
+
+/// Embed `user:pass` into an https URL (`https://user:pass@host/...`).
+///
+/// Returns `None` when the URL is not https or already carries userinfo; the
+/// git call must then run without injected credentials.
+fn inject_https_userinfo(url: &str, user: &str, pass: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://")?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.contains('@') {
+        return None;
+    }
+    Some(format!(
+        "https://{}:{}@{rest}",
+        percent_encode_userinfo(user),
+        percent_encode_userinfo(pass)
+    ))
+}
+
+/// Apply `(from, to)` replacements, skipping empty needles.
+fn redact_text(text: String, pairs: &[(String, String)]) -> String {
+    let mut text = text;
+    for (from, to) in pairs {
+        if !from.is_empty() {
+            text = text.replace(from.as_str(), to.as_str());
+        }
+    }
+    text
 }
 
 /// Combine the stdout/stderr of a git result into displayable text.
@@ -118,9 +198,7 @@ pub struct GitPmApp {
     setup_pw2: String,
     unlock_pw: String,
 
-    // Session keys from the master password. Unused until the credential
-    // panel lands (Task 9/10); kept here so unlocking hands them to Main.
-    #[allow(dead_code)]
+    // Session keys from the master password, used to read/write credentials.
     keys: Option<VaultKeys>,
     projects: Vec<Project>,
     selected: Option<i64>,
@@ -137,6 +215,31 @@ pub struct GitPmApp {
     tag_msg: String,
     /// Bottom read-only log, one entry per git invocation.
     log: Vec<LogEntry>,
+
+    // Clone dialog.
+    show_clone_dialog: bool,
+    clone_url: String,
+    /// Parent directory chosen via rfd; the repo lands in a subdirectory of it.
+    clone_parent: Option<PathBuf>,
+    clone_subdir: String,
+    /// Error shown inside the clone dialog.
+    clone_error: Option<String>,
+
+    // Credential dialog.
+    show_cred_dialog: bool,
+    cred_label: String,
+    cred_user: String,
+    cred_pass: String,
+    /// Error shown inside the credential dialog.
+    cred_error: Option<String>,
+
+    // Password generator dialog (opened from the credential dialog).
+    show_gen_dialog: bool,
+    gen_opts: GenOptions,
+    /// Last generated password, masked, until copied or filled into the
+    /// credential dialog's password field.
+    gen_result: String,
+    gen_error: Option<String>,
 }
 
 impl GitPmApp {
@@ -160,6 +263,20 @@ impl GitPmApp {
             tag_name: String::new(),
             tag_msg: String::new(),
             log: Vec::new(),
+            show_clone_dialog: false,
+            clone_url: String::new(),
+            clone_parent: None,
+            clone_subdir: String::new(),
+            clone_error: None,
+            show_cred_dialog: false,
+            cred_label: String::new(),
+            cred_user: String::new(),
+            cred_pass: String::new(),
+            cred_error: None,
+            show_gen_dialog: false,
+            gen_opts: GenOptions::default(),
+            gen_result: String::new(),
+            gen_error: None,
         };
 
         match db::init_db(Path::new(DB_PATH)) {
@@ -353,6 +470,9 @@ impl GitPmApp {
             self.show_error(ui);
         });
         self.show_remove_confirm(ctx);
+        self.show_clone_dialog(ctx);
+        self.show_cred_dialog(ctx);
+        self.show_gen_dialog(ctx);
     }
 
     fn show_top_bar(&mut self, ctx: &egui::Context) {
@@ -362,6 +482,9 @@ impl GitPmApp {
                 ui.separator();
                 if ui.button("添加项目…").clicked() {
                     self.pick_and_add_project();
+                }
+                if ui.button("克隆仓库…").clicked() {
+                    self.open_clone_dialog();
                 }
                 let has_selection = self.selected.is_some();
                 if ui
@@ -447,6 +570,9 @@ impl GitPmApp {
                             }
                             if ui.button("推送（push）").clicked() {
                                 self.do_push();
+                            }
+                            if ui.button("凭据…").clicked() {
+                                self.open_cred_dialog();
                             }
                         });
                         ui.add_space(8.0);
@@ -588,6 +714,69 @@ impl GitPmApp {
         }
     }
 
+    /// Log a git call whose output may contain injected credentials: the text
+    /// is scrubbed with `pairs` before it is stored.
+    fn log_git_output_redacted(
+        &mut self,
+        label: &str,
+        out: &git::GitOutput,
+        pairs: &[(String, String)],
+    ) {
+        let text = redact_text(git_output_text(out), pairs);
+        self.log.push(LogEntry {
+            ok: out.ok(),
+            title: format!("{label}（退出码 {}）", out.code),
+            text,
+        });
+        self.trim_log();
+    }
+
+    /// Prepare credential injection for one push/pull of the selected project.
+    ///
+    /// Returns `Some` only when a credential is stored under
+    /// [`DEFAULT_PUSH_REMOTE`] and the configured remote URL is a plain https
+    /// URL. Every failure degrades to `None` (the git call then runs without
+    /// credentials); credential load failures are reported in the output log.
+    /// Neither the secret nor the injected URL is ever logged or rendered.
+    fn injected_auth(&mut self, project_id: i64, path: &Path) -> Option<InjectedAuth> {
+        let secret = {
+            let keys = self.keys.as_ref()?;
+            let conn = self.conn.as_ref()?;
+            match db::get_credential(conn, keys, project_id, DEFAULT_PUSH_REMOTE) {
+                Ok(Some(secret)) => secret,
+                Ok(None) => return None,
+                Err(e) => {
+                    self.log.push(LogEntry {
+                        ok: false,
+                        title: format!("读取凭据（{DEFAULT_PUSH_REMOTE}）失败"),
+                        // CryptoError messages never contain the secret.
+                        text: e.to_string(),
+                    });
+                    self.trim_log();
+                    return None;
+                }
+            }
+        };
+        let remote_url = match git::run(path, &["remote", "get-url", DEFAULT_PUSH_REMOTE]) {
+            Ok(out) if out.ok() => out.stdout.trim().to_string(),
+            // git's own failure surfaces on the subsequent push/pull call.
+            Ok(_) => return None,
+            Err(e) => {
+                self.log_git_error(&format!("git remote get-url {DEFAULT_PUSH_REMOTE}"), &e);
+                return None;
+            }
+        };
+        let (user, pass) = split_credential_secret(&secret);
+        let encoded_password = percent_encode_userinfo(&pass);
+        let url = inject_https_userinfo(&remote_url, &user, &pass)?;
+        Some(InjectedAuth {
+            url,
+            plain_url: remote_url,
+            password: pass,
+            encoded_password,
+        })
+    }
+
     /// Run one read-only query, log its result, and return the section to show.
     fn run_readonly(
         &mut self,
@@ -651,19 +840,58 @@ impl GitPmApp {
         self.refresh_status();
     }
 
-    /// Pull 按钮：`git pull`，随后刷新状态区。
+    /// Pull 按钮：凭据存在且 origin 为 https 时注入凭据拉取，随后刷新状态区。
     fn do_pull(&mut self) {
         let Some(project) = self.selected_project().cloned() else {
             return;
         };
-        match git::pull(Path::new(&project.path)) {
-            Ok(out) => self.log_git_output("git pull", &out),
-            Err(e) => self.log_git_error("git pull", &e),
+        let path = Path::new(&project.path);
+        match self.injected_auth(project.id, path) {
+            Some(auth) => {
+                // `git pull <url>` without a refspec would merge the remote's
+                // HEAD; passing the current branch keeps the default `git pull`
+                // behaviour of merging the same-named upstream branch.
+                const BRANCH_LABEL: &str = "git rev-parse --abbrev-ref HEAD";
+                let branch = match git::run(path, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+                    Ok(out) => {
+                        self.log_git_output(BRANCH_LABEL, &out);
+                        if !out.ok() {
+                            return; // e.g. detached HEAD; stderr is already logged
+                        }
+                        out.stdout.trim().to_string()
+                    }
+                    Err(e) => {
+                        self.log_git_error(BRANCH_LABEL, &e);
+                        return;
+                    }
+                };
+                if branch.is_empty() {
+                    self.log.push(LogEntry {
+                        ok: false,
+                        title: "git pull".to_string(),
+                        text: "无法确定当前分支：rev-parse 输出为空".to_string(),
+                    });
+                    self.trim_log();
+                    return;
+                }
+                let label = format!("git pull {DEFAULT_PUSH_REMOTE} {branch}（凭据已注入）");
+                match git::run(path, &["pull", &auth.url, &branch]) {
+                    Ok(out) => {
+                        self.log_git_output_redacted(&label, &out, &auth.redact_pairs());
+                    }
+                    Err(e) => self.log_git_error(&label, &e),
+                }
+            }
+            None => match git::pull(path) {
+                Ok(out) => self.log_git_output("git pull", &out),
+                Err(e) => self.log_git_error("git pull", &e),
+            },
         }
         self.refresh_status();
     }
 
-    /// Push 按钮：先取当前分支，再推送到 origin（凭据注入见 Task 10）。
+    /// Push 按钮：先取当前分支，再推送到 origin（凭据存在且 remote 为 https
+    /// 时注入凭据）。
     fn do_push(&mut self) {
         let Some(project) = self.selected_project().cloned() else {
             return;
@@ -693,9 +921,20 @@ impl GitPmApp {
             return;
         }
         let label = format!("git push {DEFAULT_PUSH_REMOTE} {branch}");
-        match git::push(path, DEFAULT_PUSH_REMOTE, &branch) {
-            Ok(out) => self.log_git_output(&label, &out),
-            Err(e) => self.log_git_error(&label, &e),
+        match self.injected_auth(project.id, path) {
+            Some(auth) => {
+                let label = format!("{label}（凭据已注入）");
+                match git::push(path, &auth.url, &branch) {
+                    Ok(out) => {
+                        self.log_git_output_redacted(&label, &out, &auth.redact_pairs());
+                    }
+                    Err(e) => self.log_git_error(&label, &e),
+                }
+            }
+            None => match git::push(path, DEFAULT_PUSH_REMOTE, &branch) {
+                Ok(out) => self.log_git_output(&label, &out),
+                Err(e) => self.log_git_error(&label, &e),
+            },
         }
     }
 
@@ -880,6 +1119,376 @@ impl GitPmApp {
         }
     }
 
+    // -------------------------------------------------------------- dialogs
+
+    /// Top-bar「克隆仓库…」：打开克隆对话框（空白表单）。
+    fn open_clone_dialog(&mut self) {
+        self.error = None;
+        self.clone_url.clear();
+        self.clone_parent = None;
+        self.clone_subdir.clear();
+        self.clone_error = None;
+        self.show_clone_dialog = true;
+    }
+
+    fn close_clone_dialog(&mut self) {
+        self.show_clone_dialog = false;
+        self.clone_url.clear();
+        self.clone_parent = None;
+        self.clone_subdir.clear();
+        self.clone_error = None;
+    }
+
+    fn pick_clone_parent(&mut self) {
+        if let Some(dir) = rfd::FileDialog::new()
+            .set_title("选择克隆父目录")
+            .pick_folder()
+        {
+            self.clone_parent = Some(dir);
+        }
+    }
+
+    fn show_clone_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_clone_dialog {
+            return;
+        }
+        let mut open = self.show_clone_dialog;
+        egui::Window::new("克隆仓库")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("克隆一个 git 仓库；成功后自动加入项目列表。");
+                ui.add_space(6.0);
+                ui.add_sized(
+                    [DIALOG_FIELD_WIDTH, 22.0],
+                    egui::TextEdit::singleline(&mut self.clone_url)
+                        .hint_text("仓库 URL（https://… 或 git@…）"),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("选择父目录…").clicked() {
+                        self.pick_clone_parent();
+                    }
+                    match &self.clone_parent {
+                        Some(dir) => ui.monospace(dir.display().to_string()),
+                        None => ui.label("（未选择父目录）"),
+                    }
+                });
+                ui.add_space(6.0);
+                ui.add_sized(
+                    [DIALOG_FIELD_WIDTH, 22.0],
+                    egui::TextEdit::singleline(&mut self.clone_subdir)
+                        .hint_text("子目录名（必填，不能含路径分隔符）"),
+                );
+                if let Some(err) = &self.clone_error {
+                    ui.add_space(6.0);
+                    ui.colored_label(egui::Color32::RED, err);
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("取消").clicked() {
+                        self.close_clone_dialog();
+                    }
+                    let ready = !self.clone_url.trim().is_empty()
+                        && self.clone_parent.is_some()
+                        && !self.clone_subdir.trim().is_empty();
+                    if ui.add_enabled(ready, egui::Button::new("克隆")).clicked() {
+                        self.do_clone();
+                    }
+                });
+            });
+        // Closed via the window's X button.
+        if !open {
+            self.close_clone_dialog();
+        }
+    }
+
+    /// 克隆按钮：校验输入 → 查重 → `git::clone_repo` → 成功后自动入树。
+    fn do_clone(&mut self) {
+        self.clone_error = None;
+        let url = self.clone_url.trim().to_string();
+        let subdir = self.clone_subdir.trim().to_string();
+        if url.is_empty() || subdir.is_empty() {
+            self.clone_error = Some("请填写仓库 URL、父目录和子目录名".into());
+            return;
+        }
+        if subdir.contains('/') || subdir.contains('\\') || subdir == "." || subdir == ".." {
+            self.clone_error = Some("子目录名不能包含路径分隔符".into());
+            return;
+        }
+        let Some(parent) = self.clone_parent.clone() else {
+            self.clone_error = Some("请先选择克隆父目录".into());
+            return;
+        };
+        let target = parent.join(&subdir);
+        let target_str = target.to_string_lossy().into_owned();
+
+        // 查重：目标目录不存在，且不在项目列表中。
+        if target.exists() {
+            self.clone_error = Some(format!("目标目录已存在：{target_str}"));
+            return;
+        }
+        {
+            let Some(conn) = self.conn.as_ref() else {
+                self.clone_error = Some("数据库未打开".into());
+                return;
+            };
+            match db::list_projects(conn) {
+                Ok(projects) => {
+                    if projects.iter().any(|p| p.path == target_str) {
+                        self.clone_error = Some(format!("该项目已在列表中：{target_str}"));
+                        return;
+                    }
+                }
+                Err(e) => {
+                    self.clone_error = Some(format!("读取项目列表失败：{e}"));
+                    return;
+                }
+            }
+        }
+
+        let label = format!("git clone {url} {target_str}");
+        match git::clone_repo(&url, &target) {
+            Err(e) => {
+                self.log_git_error(&label, &e);
+                self.clone_error = Some(format!("无法运行 git：{e}"));
+            }
+            Ok(out) => {
+                self.log_git_output(&label, &out);
+                if !out.ok() {
+                    let detail = git_output_text(&out);
+                    self.clone_error = Some(format!("克隆失败（退出码 {}）：{detail}", out.code));
+                    return;
+                }
+                let name = target
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| subdir.clone());
+                let Some(conn) = self.conn.as_ref() else {
+                    self.clone_error = Some("数据库未打开".into());
+                    return;
+                };
+                match db::add_project(conn, &name, &target_str) {
+                    Ok(_) => self.close_clone_dialog(),
+                    Err(e) => self.clone_error = Some(format!("添加项目失败：{e}")),
+                }
+                self.reload_projects();
+            }
+        }
+    }
+
+    /// 操作面板「凭据…」：打开凭据对话框，默认管理 origin 标签。
+    fn open_cred_dialog(&mut self) {
+        self.error = None;
+        self.cred_label = DEFAULT_PUSH_REMOTE.to_string();
+        self.cred_user.clear();
+        self.cred_pass.clear();
+        self.cred_error = None;
+        self.show_cred_dialog = true;
+    }
+
+    fn close_cred_dialog(&mut self) {
+        self.show_cred_dialog = false;
+        self.cred_label.clear();
+        self.cred_user.clear();
+        self.cred_pass.clear();
+        self.cred_error = None;
+    }
+
+    fn show_cred_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_cred_dialog {
+            return;
+        }
+        let Some(project_name) = self.selected_project().map(|p| p.name.clone()) else {
+            self.show_cred_dialog = false;
+            return;
+        };
+        let mut open = self.show_cred_dialog;
+        egui::Window::new(format!("凭据 — {project_name}"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("凭据加密后保存在本机数据库；push/pull 到 origin 的 https 远端时自动注入。");
+                ui.add_space(6.0);
+                ui.add_sized(
+                    [DIALOG_FIELD_WIDTH, 22.0],
+                    egui::TextEdit::singleline(&mut self.cred_label).hint_text("标签（如 origin）"),
+                );
+                ui.add_space(6.0);
+                ui.add_sized(
+                    [DIALOG_FIELD_WIDTH, 22.0],
+                    egui::TextEdit::singleline(&mut self.cred_user).hint_text("用户名"),
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [DIALOG_FIELD_WIDTH - 80.0, 22.0],
+                        egui::TextEdit::singleline(&mut self.cred_pass)
+                            .password(true)
+                            .hint_text("密码（掩码显示）"),
+                    );
+                    if ui.button("生成…").clicked() {
+                        self.open_gen_dialog();
+                    }
+                });
+                if let Some(err) = &self.cred_error {
+                    ui.add_space(6.0);
+                    ui.colored_label(egui::Color32::RED, err);
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("关闭").clicked() {
+                        self.close_cred_dialog();
+                    }
+                    if ui.button("删除凭据").clicked() {
+                        self.delete_credential();
+                    }
+                    if ui.button("保存").clicked() {
+                        self.save_credential();
+                    }
+                });
+            });
+        // Closed via the window's X button.
+        if !open {
+            self.close_cred_dialog();
+        }
+    }
+
+    /// 保存按钮：校验后 `store_credential`（用户名与密码合并为一条加密记录）。
+    fn save_credential(&mut self) {
+        self.cred_error = None;
+        let label = self.cred_label.trim().to_string();
+        let user = self.cred_user.trim().to_string();
+        let pass = self.cred_pass.clone();
+        if label.is_empty() || user.is_empty() || pass.is_empty() {
+            self.cred_error = Some("请填写标签、用户名和密码".into());
+            return;
+        }
+        let Some(project_id) = self.selected_project().map(|p| p.id) else {
+            self.cred_error = Some("未选择项目".into());
+            return;
+        };
+        let Some(keys) = self.keys.as_ref() else {
+            self.cred_error = Some("保险库未解锁".into());
+            return;
+        };
+        let Some(conn) = self.conn.as_ref() else {
+            self.cred_error = Some("数据库未打开".into());
+            return;
+        };
+        let secret = format!("{user}:{pass}");
+        match db::store_credential(conn, keys, project_id, &label, &secret) {
+            Ok(()) => self.close_cred_dialog(),
+            Err(e) => self.cred_error = Some(format!("保存凭据失败：{e}")),
+        }
+    }
+
+    /// 删除按钮：`delete_credential` 删除当前标签下的凭据。
+    fn delete_credential(&mut self) {
+        self.cred_error = None;
+        let label = self.cred_label.trim().to_string();
+        if label.is_empty() {
+            self.cred_error = Some("请先填写要删除的标签".into());
+            return;
+        }
+        let Some(project_id) = self.selected_project().map(|p| p.id) else {
+            self.cred_error = Some("未选择项目".into());
+            return;
+        };
+        let Some(conn) = self.conn.as_ref() else {
+            self.cred_error = Some("数据库未打开".into());
+            return;
+        };
+        match db::delete_credential(conn, project_id, &label) {
+            Ok(_) => self.close_cred_dialog(),
+            Err(e) => self.cred_error = Some(format!("删除凭据失败：{e}")),
+        }
+    }
+
+    /// 凭据对话框「生成…」：打开密码生成器弹窗。
+    fn open_gen_dialog(&mut self) {
+        self.gen_error = None;
+        self.gen_result.clear();
+        self.show_gen_dialog = true;
+    }
+
+    fn show_gen_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_gen_dialog {
+            return;
+        }
+        let mut open = self.show_gen_dialog;
+        egui::Window::new("密码生成器")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.add(egui::Slider::new(&mut self.gen_opts.length, 8..=64).text("长度"));
+                // upper/lower/digits 固定启用（生成器要求至少一类字符）。
+                let mut fixed_upper = true;
+                ui.add_enabled(
+                    false,
+                    egui::Checkbox::new(&mut fixed_upper, "大写字母（固定启用）"),
+                );
+                let mut fixed_lower = true;
+                ui.add_enabled(
+                    false,
+                    egui::Checkbox::new(&mut fixed_lower, "小写字母（固定启用）"),
+                );
+                let mut fixed_digits = true;
+                ui.add_enabled(
+                    false,
+                    egui::Checkbox::new(&mut fixed_digits, "数字（固定启用）"),
+                );
+                ui.checkbox(&mut self.gen_opts.special, "特殊字符");
+                if ui.button("生成").clicked() {
+                    self.generate_password();
+                }
+                ui.add_sized(
+                    [DIALOG_FIELD_WIDTH, 22.0],
+                    egui::TextEdit::singleline(&mut self.gen_result)
+                        .password(true)
+                        .hint_text("（点击「生成」后显示在此，掩码显示）"),
+                );
+                if let Some(err) = &self.gen_error {
+                    ui.add_space(6.0);
+                    ui.colored_label(egui::Color32::RED, err);
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    let has_result = !self.gen_result.is_empty();
+                    if ui.add_enabled(has_result, egui::Button::new("复制")).clicked() {
+                        ui.ctx().copy_text(self.gen_result.clone());
+                    }
+                    if ui
+                        .add_enabled(has_result, egui::Button::new("填入密码框"))
+                        .clicked()
+                    {
+                        self.cred_pass = std::mem::take(&mut self.gen_result);
+                        self.show_gen_dialog = false;
+                    }
+                    if ui.button("关闭").clicked() {
+                        self.show_gen_dialog = false;
+                    }
+                });
+            });
+        // Closed via the window's X button: drop the generated password.
+        if !open {
+            self.gen_result.clear();
+            self.show_gen_dialog = false;
+        }
+    }
+
+    /// 生成按钮：`password::generate`，结果只保存在内存中。
+    fn generate_password(&mut self) {
+        self.gen_error = None;
+        match password::generate(&self.gen_opts) {
+            Ok(pw) => self.gen_result = pw,
+            Err(e) => self.gen_error = Some(format!("生成密码失败：{e}")),
+        }
+    }
+
     // --------------------------------------------------------------- shared
 
     fn show_error(&self, ui: &mut egui::Ui) {
@@ -903,5 +1512,72 @@ impl eframe::App for GitPmApp {
             Phase::Unlock => self.show_unlock(ctx),
             Phase::Main => self.show_main(ctx),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn percent_encode_userinfo_escapes_specials() {
+        assert_eq!(percent_encode_userinfo(""), "");
+        assert_eq!(percent_encode_userinfo("safe-_X9~"), "safe-_X9~");
+        assert_eq!(percent_encode_userinfo("user@example.com"), "user%40example.com");
+        assert_eq!(percent_encode_userinfo("p%ss:wo/rd?1"), "p%25ss%3Awo%2Frd%3F1");
+    }
+
+    #[test]
+    fn split_credential_secret_parts() {
+        let (user, pass) = split_credential_secret("alice:s3cret:pass");
+        assert_eq!(user, "alice");
+        assert_eq!(pass, "s3cret:pass");
+        let (user, pass) = split_credential_secret("token-only");
+        assert_eq!(user, "");
+        assert_eq!(pass, "token-only");
+    }
+
+    #[test]
+    fn inject_https_userinfo_and_guards() {
+        let url = inject_https_userinfo("https://github.com/acme/app.git", "u", "p");
+        assert_eq!(url.as_deref(), Some("https://u:p@github.com/acme/app.git"));
+
+        // Non-https URLs are never touched.
+        assert!(inject_https_userinfo("git@github.com:acme/app.git", "u", "p").is_none());
+        assert!(inject_https_userinfo("http://github.com/acme/app.git", "u", "p").is_none());
+        // URLs that already carry userinfo are left alone.
+        assert!(inject_https_userinfo("https://old@github.com/acme/app.git", "u", "p").is_none());
+    }
+
+    #[test]
+    fn redact_text_replaces_pairs_and_skips_empty() {
+        let text = "To https://u:s3cret@host/repo.git\nbad password s3cret, retry".to_string();
+        let pairs = vec![
+            (
+                "https://u:s3cret@host/repo.git".to_string(),
+                "https://host/repo.git".to_string(),
+            ),
+            ("s3cret".to_string(), "******".to_string()),
+        ];
+        let out = redact_text(text, &pairs);
+        assert_eq!(out, "To https://host/repo.git\nbad password ******, retry");
+
+        // An empty needle must never be replaced (that would insert everywhere).
+        let empty = redact_text("unchanged".to_string(), &[("".to_string(), "x".to_string())]);
+        assert_eq!(empty, "unchanged");
+    }
+
+    #[test]
+    fn injected_auth_redact_pairs_cover_url_and_passwords() {
+        let auth = InjectedAuth {
+            url: "https://u:p%40ss@host/repo.git".to_string(),
+            plain_url: "https://host/repo.git".to_string(),
+            password: "p@ss".to_string(),
+            encoded_password: "p%40ss".to_string(),
+        };
+        let pairs = auth.redact_pairs();
+        assert_eq!(pairs.len(), 3);
+        let out = redact_text("fatal: unable to access 'https://u:p%40ss@host/repo.git'".into(), &pairs);
+        assert_eq!(out, "fatal: unable to access 'https://host/repo.git'");
     }
 }
