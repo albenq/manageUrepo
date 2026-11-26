@@ -121,7 +121,7 @@ fn local_utc_offset_secs() -> i64 {
                 + local.hour as i64 * 3600
                 + local.minute as i64 * 60
                 + local.second as i64;
-        ((local_secs - utc_secs + 30) / 60) * 60
+        ((local_secs - utc_secs + 30).div_euclid(60)) * 60
     }
 }
 

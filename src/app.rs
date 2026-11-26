@@ -2140,6 +2140,7 @@ impl GitPmApp {
             GenWindow::CredDialog => self.show_gen_dialog = false,
             GenWindow::ToolWindow => self.show_tool_gen_window = false,
         }
+        self.gen_error = None;
         self.gen_result.clear();
     }
 
