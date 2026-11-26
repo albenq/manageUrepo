@@ -150,6 +150,94 @@ pub fn set_meta(conn: &Connection, key: &str, value: &[u8]) -> rusqlite::Result<
     Ok(())
 }
 
+/// Atomically rotate the master password from `old_password` to `new_password`.
+///
+/// The verifier and every stored credential are re-encrypted under a fresh
+/// random salt and committed in a single transaction. If any step fails, the
+/// transaction is rolled back and the vault is left exactly as it was: the old
+/// master still unlocks it and every credential stays readable.
+///
+/// Refuses an empty `new_password` (it would defeat the lock screen).
+// Wired into the settings UI by Task D; unused until then.
+#[allow(dead_code)]
+pub fn change_master_password(
+    conn: &Connection,
+    old_password: &str,
+    new_password: &str,
+) -> Result<(), String> {
+    if new_password.is_empty() {
+        return Err("新密码不能为空".into());
+    }
+
+    // Verify the old password; its keys are needed to decrypt the credentials.
+    let old_keys = crypto::unlock(conn, old_password).map_err(|err| match err {
+        CryptoError::WrongMaster => "旧密码不正确".to_string(),
+        other => format!("验证旧密码失败: {other}"),
+    })?;
+
+    // Derive the new keys under a fresh salt and re-seal the verifier. Nothing
+    // is written yet, so a failure up to here leaves the vault untouched.
+    let new_salt = crypto::new_salt();
+    let new_keys = crypto::derive_keys(new_password, &new_salt);
+    let new_verifier =
+        crypto::seal_verifier(&new_keys).map_err(|err| format!("生成新校验值失败: {err}"))?;
+
+    // Everything below runs in one transaction; dropping `tx` on any early
+    // return rolls back, keeping the old salt, verifier and ciphertexts.
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|err| format!("开启事务失败: {err}"))?;
+
+    let mut stmt = tx
+        .prepare("SELECT id, nonce, ciphertext FROM credentials")
+        .map_err(|err| format!("读取凭据失败: {err}"))?;
+    let rows: Vec<(i64, Vec<u8>, Vec<u8>)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, Vec<u8>>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })
+        .map_err(|err| format!("读取凭据失败: {err}"))?
+        .collect::<Result<_, _>>()
+        .map_err(|err| format!("读取凭据失败: {err}"))?;
+    drop(stmt);
+
+    // Decrypt each secret with the old key and re-seal it with the new one,
+    // always under a fresh nonce. Labels and other plaintext columns are not
+    // touched.
+    let mut reencrypted = Vec::with_capacity(rows.len());
+    for (id, nonce, ciphertext) in rows {
+        let plaintext = crypto::decrypt(&old_keys, &nonce, &ciphertext)
+            .map_err(|err| format!("解密既有凭据失败: {err}"))?;
+        let (new_nonce, new_ciphertext) = crypto::encrypt(&new_keys, &plaintext)
+            .map_err(|err| format!("重新加密凭据失败: {err}"))?;
+        reencrypted.push((id, new_nonce, new_ciphertext));
+    }
+
+    tx.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+        params![crypto::META_KDF_SALT, &new_salt[..]],
+    )
+    .map_err(|err| format!("写入新盐失败: {err}"))?;
+    tx.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+        params![crypto::META_VERIFIER, &new_verifier[..]],
+    )
+    .map_err(|err| format!("写入新校验值失败: {err}"))?;
+    for (id, nonce, ciphertext) in &reencrypted {
+        tx.execute(
+            "UPDATE credentials SET nonce = ?1, ciphertext = ?2 WHERE id = ?3",
+            params![nonce, ciphertext, id],
+        )
+        .map_err(|err| format!("写回凭据失败: {err}"))?;
+    }
+
+    tx.commit().map_err(|err| format!("提交事务失败: {err}"))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,5 +416,130 @@ mod tests {
         let blob: Vec<u8> = (0u8..=255).collect();
         set_meta(&conn, "blob", &blob).unwrap();
         assert_eq!(get_meta(&conn, "blob").unwrap().as_deref(), Some(blob.as_slice()));
+    }
+
+    #[test]
+    fn change_master_then_unlock_with_new_and_reject_old() {
+        let dir = tempdir().unwrap();
+        let conn = init_db(&dir.path().join("vault.db")).unwrap();
+        crypto::setup_master(&conn, MASTER).unwrap();
+        let old_keys = crypto::unlock(&conn, MASTER).unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        let project_id = add_project(&conn, "demo", repo.to_str().unwrap()).unwrap();
+        store_credential(&conn, &old_keys, project_id, "git_token", "s3cret!").unwrap();
+        store_credential(
+            &conn,
+            &old_keys,
+            project_id,
+            "db_url",
+            "postgres://u:p@h/db",
+        )
+        .unwrap();
+
+        let salt_before = get_meta(&conn, "kdf_salt").unwrap().unwrap();
+        let verifier_before = get_meta(&conn, "verifier").unwrap().unwrap();
+
+        change_master_password(&conn, MASTER, "brand new master").unwrap();
+
+        // A fresh salt and verifier were installed, not just a new verifier.
+        assert_ne!(
+            get_meta(&conn, "kdf_salt").unwrap().unwrap(),
+            salt_before,
+            "rotation must install a fresh kdf_salt"
+        );
+        assert_ne!(
+            get_meta(&conn, "verifier").unwrap().unwrap(),
+            verifier_before
+        );
+
+        // The old master must no longer unlock the vault.
+        assert!(matches!(
+            crypto::unlock(&conn, MASTER),
+            Err(CryptoError::WrongMaster)
+        ));
+
+        // The new master unlocks and every credential decrypts verbatim.
+        let new_keys = crypto::unlock(&conn, "brand new master").unwrap();
+        assert_eq!(
+            get_credential(&conn, &new_keys, project_id, "git_token")
+                .unwrap()
+                .as_deref(),
+            Some("s3cret!")
+        );
+        assert_eq!(
+            get_credential(&conn, &new_keys, project_id, "db_url")
+                .unwrap()
+                .as_deref(),
+            Some("postgres://u:p@h/db")
+        );
+    }
+
+    #[test]
+    fn change_master_wrong_old_leaves_vault_intact() {
+        let dir = tempdir().unwrap();
+        let conn = init_db(&dir.path().join("vault.db")).unwrap();
+        crypto::setup_master(&conn, MASTER).unwrap();
+        let keys = crypto::unlock(&conn, MASTER).unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        let project_id = add_project(&conn, "demo", repo.to_str().unwrap()).unwrap();
+        store_credential(&conn, &keys, project_id, "git_token", "s3cret!").unwrap();
+
+        let salt_before = get_meta(&conn, "kdf_salt").unwrap().unwrap();
+        let verifier_before = get_meta(&conn, "verifier").unwrap().unwrap();
+        let credential = |conn: &Connection| {
+            conn.query_row(
+                "SELECT nonce, ciphertext FROM credentials WHERE project_id = ?1 AND label = ?2",
+                params![project_id, "git_token"],
+                |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+            )
+            .unwrap()
+        };
+        let credential_before = credential(&conn);
+
+        let err =
+            change_master_password(&conn, "not the old password", "brand new master").unwrap_err();
+        assert_eq!(err, "旧密码不正确");
+
+        // Nothing changed: same salt, verifier and ciphertext blobs...
+        assert_eq!(get_meta(&conn, "kdf_salt").unwrap().unwrap(), salt_before);
+        assert_eq!(
+            get_meta(&conn, "verifier").unwrap().unwrap(),
+            verifier_before
+        );
+        assert_eq!(credential(&conn), credential_before);
+
+        // ...and the old master still unlocks and decrypts everything.
+        let keys_after = crypto::unlock(&conn, MASTER).unwrap();
+        assert_eq!(
+            get_credential(&conn, &keys_after, project_id, "git_token")
+                .unwrap()
+                .as_deref(),
+            Some("s3cret!")
+        );
+    }
+
+    #[test]
+    fn change_master_empty_new_password_is_err() {
+        let dir = tempdir().unwrap();
+        let conn = init_db(&dir.path().join("vault.db")).unwrap();
+        crypto::setup_master(&conn, MASTER).unwrap();
+        let keys = crypto::unlock(&conn, MASTER).unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        let project_id = add_project(&conn, "demo", repo.to_str().unwrap()).unwrap();
+        store_credential(&conn, &keys, project_id, "git_token", "s3cret!").unwrap();
+
+        assert!(change_master_password(&conn, MASTER, "").is_err());
+
+        // The vault is untouched: the old master still unlocks and decrypts.
+        let keys_after = crypto::unlock(&conn, MASTER).unwrap();
+        assert_eq!(
+            get_credential(&conn, &keys_after, project_id, "git_token")
+                .unwrap()
+                .as_deref(),
+            Some("s3cret!")
+        );
     }
 }

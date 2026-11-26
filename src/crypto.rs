@@ -17,8 +17,11 @@ use rand::rngs::OsRng;
 use rand::RngCore;
 use rusqlite::{params, Connection, OptionalExtension};
 
-const META_KDF_SALT: &str = "kdf_salt";
-const META_VERIFIER: &str = "verifier";
+/// `meta` keys holding the vault salt and the verifier blob. Public so the
+/// atomic master-password rotation in [`crate::db`] can rewrite both inside
+/// one transaction.
+pub const META_KDF_SALT: &str = "kdf_salt";
+pub const META_VERIFIER: &str = "verifier";
 
 const SALT_LEN: usize = 16;
 const NONCE_LEN: usize = 12;
@@ -67,6 +70,23 @@ pub fn derive_keys(master: &str, salt: &[u8]) -> VaultKeys {
     VaultKeys { enc_key }
 }
 
+/// Generate a fresh random [`SALT_LEN`]-byte salt.
+pub fn new_salt() -> [u8; SALT_LEN] {
+    let mut salt = [0u8; SALT_LEN];
+    OsRng.fill_bytes(&mut salt);
+    salt
+}
+
+/// Seal the verifier magic string with `keys`, returning the
+/// `nonce (12 bytes) || ciphertext` blob stored under [`META_VERIFIER`].
+pub fn seal_verifier(keys: &VaultKeys) -> Result<Vec<u8>, CryptoError> {
+    let (nonce, ciphertext) = encrypt(keys, MAGIC)?;
+    let mut verifier = Vec::with_capacity(NONCE_LEN + ciphertext.len());
+    verifier.extend_from_slice(&nonce);
+    verifier.extend_from_slice(&ciphertext);
+    Ok(verifier)
+}
+
 /// Generate a fresh salt, encrypt the magic verifier with the master-derived
 /// key, and persist both in `meta`.
 ///
@@ -79,14 +99,9 @@ pub fn setup_master(conn: &Connection, master: &str) -> Result<(), CryptoError> 
         ));
     }
 
-    let mut salt = [0u8; SALT_LEN];
-    OsRng.fill_bytes(&mut salt);
-
+    let salt = new_salt();
     let keys = derive_keys(master, &salt);
-    let (nonce, ciphertext) = encrypt(&keys, MAGIC)?;
-    let mut verifier = Vec::with_capacity(NONCE_LEN + ciphertext.len());
-    verifier.extend_from_slice(&nonce);
-    verifier.extend_from_slice(&ciphertext);
+    let verifier = seal_verifier(&keys)?;
 
     let tx = conn
         .unchecked_transaction()
