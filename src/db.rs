@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
+
+use crate::crypto::{self, CryptoError, VaultKeys};
 
 /// A git project registered in the local database.
 #[derive(Debug, Clone)]
@@ -51,8 +53,7 @@ pub fn add_project(conn: &Connection, name: &str, path: &str) -> rusqlite::Resul
 
 /// List all projects, oldest first.
 pub fn list_projects(conn: &Connection) -> rusqlite::Result<Vec<Project>> {
-    let mut stmt =
-        conn.prepare("SELECT id, name, path, added_at FROM projects ORDER BY id ASC")?;
+    let mut stmt = conn.prepare("SELECT id, name, path, added_at FROM projects ORDER BY id ASC")?;
     let rows = stmt.query_map([], |row| {
         Ok(Project {
             id: row.get(0)?,
@@ -69,11 +70,87 @@ pub fn remove_project(conn: &Connection, id: i64) -> rusqlite::Result<usize> {
     conn.execute("DELETE FROM projects WHERE id = ?1", params![id])
 }
 
+/// Encrypt `secret` and upsert it as the credential `label` of `project_id`.
+///
+/// Only the nonce and ciphertext are persisted; the plaintext secret is never
+/// written to the database nor included in error messages.
+pub fn store_credential(
+    conn: &Connection,
+    keys: &VaultKeys,
+    project_id: i64,
+    label: &str,
+    secret: &str,
+) -> Result<(), CryptoError> {
+    let (nonce, ciphertext) = crypto::encrypt(keys, secret.as_bytes())?;
+    conn.execute(
+        "INSERT OR REPLACE INTO credentials (project_id, label, nonce, ciphertext)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![project_id, label, nonce, ciphertext],
+    )
+    .map_err(|e| CryptoError::Database(e.to_string()))?;
+    Ok(())
+}
+
+/// Decrypt and return the credential `label` of `project_id`, or `None` when the
+/// project has no such credential.
+pub fn get_credential(
+    conn: &Connection,
+    keys: &VaultKeys,
+    project_id: i64,
+    label: &str,
+) -> Result<Option<String>, CryptoError> {
+    let stored = conn
+        .query_row(
+            "SELECT nonce, ciphertext FROM credentials WHERE project_id = ?1 AND label = ?2",
+            params![project_id, label],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()
+        .map_err(|e| CryptoError::Database(e.to_string()))?;
+
+    let Some((nonce, ciphertext)) = stored else {
+        return Ok(None);
+    };
+    let plaintext = crypto::decrypt(keys, &nonce, &ciphertext)?;
+    String::from_utf8(plaintext)
+        .map(Some)
+        .map_err(|_| CryptoError::Database("stored credential is not valid UTF-8".into()))
+}
+
+/// Delete the credential `label` of `project_id`, returning the number of rows
+/// removed (0 when it did not exist).
+pub fn delete_credential(
+    conn: &Connection,
+    project_id: i64,
+    label: &str,
+) -> rusqlite::Result<usize> {
+    conn.execute(
+        "DELETE FROM credentials WHERE project_id = ?1 AND label = ?2",
+        params![project_id, label],
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::{self, CryptoError, VaultKeys};
     use std::fs;
     use tempfile::tempdir;
+    use tempfile::TempDir;
+
+    const MASTER: &str = "correct horse battery staple";
+
+    /// Fresh vault with one stored project. Returns the connection, the unlocked
+    /// keys and the project id.
+    fn vault_with_project(dir: &TempDir) -> (Connection, VaultKeys, i64) {
+        let conn = init_db(&dir.path().join("creds.db")).unwrap();
+        crypto::setup_master(&conn, MASTER).unwrap();
+        let keys = crypto::unlock(&conn, MASTER).unwrap();
+        let repo = dir.path().join("repo");
+        fs::create_dir(&repo).unwrap();
+        let id = add_project(&conn, "demo", repo.to_str().unwrap()).unwrap();
+        (conn, keys, id)
+    }
 
     #[test]
     fn add_and_list_roundtrip() {
@@ -128,5 +205,85 @@ mod tests {
             "remove_project must not touch the filesystem"
         );
         assert!(repo.exists());
+    }
+
+    #[test]
+    fn credential_roundtrip() {
+        let dir = tempdir().unwrap();
+        let (conn, keys, project_id) = vault_with_project(&dir);
+
+        store_credential(&conn, &keys, project_id, "git_token", "s3cret!").unwrap();
+        let restored = get_credential(&conn, &keys, project_id, "git_token").unwrap();
+        assert_eq!(restored.as_deref(), Some("s3cret!"));
+
+        assert_eq!(
+            delete_credential(&conn, project_id, "git_token").unwrap(),
+            1
+        );
+        assert!(get_credential(&conn, &keys, project_id, "git_token")
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            delete_credential(&conn, project_id, "git_token").unwrap(),
+            0,
+            "deleting a missing credential removes no rows"
+        );
+    }
+
+    #[test]
+    fn credential_missing_is_none() {
+        let dir = tempdir().unwrap();
+        let (conn, keys, project_id) = vault_with_project(&dir);
+
+        let missing = get_credential(&conn, &keys, project_id, "never_stored").unwrap();
+        assert!(missing.is_none());
+
+        // A different project must not see the first project's credential.
+        store_credential(&conn, &keys, project_id, "git_token", "s3cret!").unwrap();
+        let repo = dir.path().join("other");
+        fs::create_dir(&repo).unwrap();
+        let other_id = add_project(&conn, "other", repo.to_str().unwrap()).unwrap();
+        assert!(get_credential(&conn, &keys, other_id, "git_token")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn wrong_key_credential_fails() {
+        let dir = tempdir().unwrap();
+        let (conn, keys, project_id) = vault_with_project(&dir);
+        store_credential(&conn, &keys, project_id, "git_token", "s3cret!").unwrap();
+
+        let salt: Vec<u8> = conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                params!["kdf_salt"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let wrong_keys = crypto::derive_keys("wrong master password", &salt);
+
+        let err = match get_credential(&conn, &wrong_keys, project_id, "git_token") {
+            Ok(_) => panic!("wrong keys must not decrypt a credential"),
+            Err(e) => e,
+        };
+        assert!(matches!(err, CryptoError::WrongMaster));
+    }
+
+    #[test]
+    fn delete_project_cascades_credentials() {
+        let dir = tempdir().unwrap();
+        let (conn, keys, project_id) = vault_with_project(&dir);
+        store_credential(&conn, &keys, project_id, "git_token", "s3cret!").unwrap();
+
+        remove_project(&conn, project_id).unwrap();
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM credentials", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 0,
+            "ON DELETE CASCADE must remove credentials with their project"
+        );
     }
 }
