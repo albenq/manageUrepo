@@ -35,7 +35,7 @@ cargo run --release
 
 ### 功能
 
-- **项目树**：把本机已有的 git 仓库加入左侧项目列表，点击切换；移除只删列表记录，不动磁盘文件。
+- **项目树**：把本机已有的 git 仓库加入左侧项目列表，点击切换；移除只删列表记录，不动磁盘文件。项目按父目录层级分组为可折叠树，名称左对齐。
 - **状态总览**：选中项目后显示 `git status`、分支列表、标签列表，可手动刷新。
 - **提交（commit）**：填写提交信息后一键 `git add -A` + `git commit`。
 - **拉取 / 推送（pull / push）**：对当前分支执行 `git pull` / `git push origin`。
@@ -46,7 +46,7 @@ cargo run --release
 - **密码生成器**：凭据对话框内一键生成强密码，长度 8–64 可调，大小写字母与数字固定包含，特殊字符可选；结果仅保存在内存中，可复制或直接填入密码框。
 - **独立密码生成器**：菜单「工具 → 密码生成器」打开独立窗口，生成规则与凭据对话框内的生成器一致；结果仅保存在内存中，可复制，关闭窗口即丢弃。
 - **主题切换**：菜单栏「主题」可在暗黑 / 明亮之间切换，立即生效；偏好写入本地数据库，重启后保持上次选择。
-- **中央文件浏览器**：选中项目后，中央面板以多列列表展示工作区文件（名称 / 类型 / 大小 / 修改时间）；目录整行可点击进入，「上一级」返回上级目录；`.git` 等隐藏项整行置灰但仍可进入；文件仅只读展示，不会修改任何内容。
+- **中央文件浏览器**：选中项目后，中央面板以多列列表展示工作区文件（名称 / 类型 / 大小 / 修改时间，列宽可拖拽调整）；目录整行可点击进入，「上一级」返回上级目录；`.git` 等隐藏项整行置灰但仍可进入；文件仅只读展示，不会修改任何内容。
 - **git 操作后台执行**：提交、拉取、推送、新建分支、打标签等操作均在后台线程执行（克隆除外，为同步执行），操作期间相关按钮禁用并显示动态进度条，窗口不再冻结；选中项目刷新状态时同样显示「加载中…」进度条。
 - **推送到远程**：操作面板「推送…」打开推送对话框，可选择远端与分支，并可勾选「设置上游（-u）」；凭据注入与一键推送共用同一路径。对话框内的远端列表为同步查询（查询快，不冻结界面），推送本身仍在后台执行。注入凭据且设上游时，git 推送成功会把含明文凭据的注入 URL 写入仓库配置，程序会自动把上游指回真实远端名，避免凭据残留在 `.git/config` 中（回写失败不影响推送结果，会在输出区追加警告）。
 - **提交历史**：操作面板「历史…」打开只读提交历史窗口，初始加载为同步查询（快）；默认显示最近 10 条提交，点「加载更多」每次追加 20 条，取完后按钮置灰。
@@ -54,6 +54,8 @@ cargo run --release
 - **修改主密码**：菜单「设置 → 修改主密码」，需先验证旧密码；修改成功后所有已保存的凭据会立即用新密码重新加密，无需逐条重录。
 - **密码生成器明文 / 遮蔽切换**：生成结果默认明文显示（可选中复制），勾选「遮蔽显示」即切换为等宽 `•` 掩码，两种模式随时切换。
 - **图标**：工具栏各操作按钮带图标，便于快速识别；程序图标已嵌入 exe，在文件属性中可见。
+- **界面语言切换**：菜单「Language / 语言」可在中文 ⇄ English 间切换，即时生效，重启后保持上次选择；领域层错误信息与 git 原始输出保持原文，不做翻译。
+- **跨平台**：同一套代码支持 Windows 与 Linux；Linux 下自动探测 Noto CJK / WQY 等中文字体，Windows 专属功能自动降级（exe 图标嵌入仅 Windows）。
 
 ### 底部输出区
 
@@ -99,7 +101,7 @@ The window opens at 1440×900 by default (minimum 1200×800) and can be resized 
 
 ### Features
 
-- **Project tree**: add existing local git repositories to the list on the left and switch between them with a click; removing a project only deletes the list entry, never touches files on disk.
+- **Project tree**: add existing local git repositories to the list on the left and switch between them with a click; removing a project only deletes the list entry, never touches files on disk. Projects are grouped by parent directory into a collapsible tree, with names left-aligned.
 - **Status overview**: selecting a project shows `git status`, branches, and tags, with manual refresh.
 - **Commit**: enter a message, then one click runs `git add -A` + `git commit`.
 - **Pull / push**: runs `git pull` / `git push origin` on the current branch.
@@ -110,7 +112,7 @@ The window opens at 1440×900 by default (minimum 1200×800) and can be resized 
 - **Password generator**: one-click strong password generation inside the credentials dialog; length 8–64, upper/lowercase letters and digits always included, special characters optional. The result lives only in memory and can be copied or inserted into the password field.
 - **Standalone password generator**: menu "Tools → Password Generator" opens a standalone window with the same rules; the result lives only in memory, can be copied, and is discarded when the window closes.
 - **Theme switcher**: the "Theme" menu toggles dark / light instantly; the preference is persisted in the local database and restored on restart.
-- **Central file browser**: with a project selected, the central panel lists working-tree files in columns (name / type / size / modified time); click a directory row to enter it, "Up" goes back; hidden entries such as `.git` are grayed out but still clickable; files are read-only and never modified.
+- **Central file browser**: with a project selected, the central panel lists working-tree files in columns (name / type / size / modified time, with draggable column widths); click a directory row to enter it, "Up" goes back; hidden entries such as `.git` are grayed out but still clickable; files are read-only and never modified.
 - **Background git operations**: commit, pull, push, branch creation, and tagging all run on background threads (cloning is the exception and runs synchronously). Relevant buttons are disabled with an animated progress bar while an operation runs, so the window never freezes; refreshing a project's status shows a "Loading…" progress bar too.
 - **Push to remote**: the "Push…" button opens a push dialog where you choose the remote and branch, with an optional "set upstream (-u)" checkbox. Credential injection shares the same path as one-click push. The remote list in the dialog is fetched synchronously (fast, doesn't freeze the UI), while the push itself runs in the background. When injecting credentials with `-u`, git would record the injected URL (containing plaintext credentials) in the repository config; the app automatically points the upstream back to the real remote name so no credentials linger in `.git/config` (if the rewrite fails the push still succeeds and a warning is appended to the output area).
 - **Commit history**: the "History…" button opens a read-only commit history window; the initial load is a synchronous query (fast). It shows the latest 10 commits by default; "Load more" appends 20 at a time, and the button disables once exhausted.
@@ -118,6 +120,8 @@ The window opens at 1440×900 by default (minimum 1200×800) and can be resized 
 - **Change master password**: menu "Settings → Change Master Password" verifies the old password first; on success, all stored credentials are immediately re-encrypted with the new password — no need to re-enter them.
 - **Password generator plaintext / masking toggle**: results are shown in plaintext by default (selectable and copyable); checking "Mask display" switches to a monospaced `•` mask. Switch between the two modes at any time.
 - **Icons**: every toolbar button carries an icon for quick recognition; the application icon is embedded in the exe and visible in file properties.
+- **UI language switch**: the "Language / 语言" menu toggles between Chinese ⇄ English instantly, and the choice persists across restarts; domain-layer error messages and raw git output stay in their original language, untranslated.
+- **Cross-platform**: the same codebase supports Windows and Linux; on Linux, CJK fonts such as Noto CJK / WQY are detected automatically, and Windows-only features degrade gracefully (exe icon embedding is Windows-only).
 
 ### Bottom Output Area
 
