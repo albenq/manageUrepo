@@ -44,6 +44,8 @@ mod icons {
     pub const ICON_BRANCH: &str = "🌿";
     /// 打标签
     pub const ICON_TAG: &str = "🏷";
+    /// 提交历史
+    pub const ICON_HISTORY: &str = "🕘";
 }
 
 /// `meta` key that marks an initialized vault (written by `crypto::setup_master`).
@@ -88,6 +90,18 @@ const DEFAULT_PUSH_REMOTE: &str = "origin";
 
 /// Width of the single-line inputs inside the modal dialogs.
 const DIALOG_FIELD_WIDTH: f32 = 360.0;
+
+/// 提交历史窗口首次打开时加载的条数。
+const HISTORY_FIRST_PAGE: usize = 10;
+
+/// 提交历史窗口「加载更多」每次追加的条数。
+const HISTORY_PAGE_SIZE: usize = 20;
+
+/// 修改/重命名状态标记的颜色（金琥珀色：纯黄在明亮主题下不可读）。
+const COLOR_STATUS_CHANGED: egui::Color32 = egui::Color32::from_rgb(224, 176, 0);
+
+/// 新增/未跟踪状态标记的颜色（绿色）。
+const COLOR_STATUS_ADDED: egui::Color32 = egui::Color32::from_rgb(64, 200, 112);
 
 /// One rendered git invocation in the bottom read-only output area.
 struct LogEntry {
@@ -169,15 +183,19 @@ enum ResultKind {
     TagList,
     /// `git rev-parse --abbrev-ref HEAD` (pull/push prerequisite).
     Head,
-    /// `git remote get-url origin` (credential injection prerequisite; only
+    /// `git remote get-url <remote>` (credential injection prerequisite; only
     /// sent on io failure, mirroring the old silent-degrade behaviour).
-    RemoteUrl,
+    /// Payload = the remote name, for the output-log label.
+    RemoteUrl(String),
     /// `git add -A` + `git commit -m <msg>`; payload = output-log label.
     Commit(String),
     /// `git pull [...]`; payload = output-log label.
     Pull(String),
-    /// `git push [...]`; payload = output-log label.
+    /// `git push [...]` (one-click push to `origin`); payload = output-log label.
     Push(String),
+    /// `git push [-u] <remote> <branch>` from the push dialog; payload =
+    /// output-log label.
+    PushTo(String),
     /// `git branch <name>`; payload = output-log label.
     BranchCreate(String),
     /// `git checkout <name>`; payload = output-log label.
@@ -231,6 +249,26 @@ fn send_plain_push(tx: &mpsc::Sender<GitResult>, project_id: i64, path: &Path, b
     let label = format!("git push {DEFAULT_PUSH_REMOTE} {branch}");
     let output = git::push(path, DEFAULT_PUSH_REMOTE, branch);
     let _ = tx.send(GitResult { project_id, kind: ResultKind::Push(label), output });
+}
+
+/// Worker helper: run a plain `git push [-u] <remote> <branch>` (push dialog,
+/// no injected credentials) and send the result back.
+fn send_plain_push_to(
+    tx: &mpsc::Sender<GitResult>,
+    project_id: i64,
+    path: &Path,
+    remote: &str,
+    branch: &str,
+    set_upstream: bool,
+) {
+    let flag = if set_upstream { "-u " } else { "" };
+    let label = format!("git push {flag}{remote} {branch}");
+    let output = if set_upstream {
+        git::run(path, &["push", "-u", remote, branch])
+    } else {
+        git::push(path, remote, branch)
+    };
+    let _ = tx.send(GitResult { project_id, kind: ResultKind::PushTo(label), output });
 }
 
 /// Split a successful read-only output into trimmed non-empty lines.
@@ -371,6 +409,286 @@ fn show_section(ui: &mut egui::Ui, title: &str, section: Option<&StatusSection>)
     }
 }
 
+// ------------------------------------------------------ porcelain parsing
+//
+// `git status --porcelain=v1 -b` 解析纯函数（只依赖 std，不依赖 egui）：
+// 浏览器文件状态标记的数据源是 `status_cache` 里的 porcelain 缓存文本。
+
+/// 浏览器条目的工作区文件状态（由 porcelain 的 XY 状态对推导）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileStatus {
+    /// 未合并冲突（UU/AA/DD/AU/UA/DU/UD）。
+    Conflict,
+    /// 已删除（XY 中含 D）。
+    Deleted,
+    /// 已修改（XY 中含 M 或 T）。
+    Modified,
+    /// 重命名/复制（XY 中含 R 或 C）。
+    Renamed,
+    /// 新增或未跟踪（A / ??）。
+    Added,
+}
+
+impl FileStatus {
+    /// 同一路径多个状态的取舍优先级：冲突 > 删除 > 修改 > 重命名 > 新增。
+    fn rank(self) -> u8 {
+        match self {
+            FileStatus::Conflict => 5,
+            FileStatus::Deleted => 4,
+            FileStatus::Modified => 3,
+            FileStatus::Renamed => 2,
+            FileStatus::Added => 1,
+        }
+    }
+
+    /// 名称前显示的标记字符。
+    fn marker(self) -> &'static str {
+        match self {
+            FileStatus::Conflict => "!",
+            FileStatus::Deleted => "−",
+            FileStatus::Modified => "M",
+            FileStatus::Renamed => "R",
+            FileStatus::Added => "+",
+        }
+    }
+}
+
+/// 一对 porcelain XY 状态字符 → 文件状态。
+///
+/// 冲突对（git status 文档）优先；`??` 未跟踪视为新增；其余按
+/// 冲突 > 删除 > 修改 > 重命名 > 新增 在 XY 两个字母之间取舍。
+fn status_from_xy(x: u8, y: u8) -> FileStatus {
+    if matches!(
+        [x, y],
+        [b'D', b'D']
+            | [b'A', b'U']
+            | [b'U', b'D']
+            | [b'U', b'A']
+            | [b'D', b'U']
+            | [b'A', b'A']
+            | [b'U', b'U']
+    ) {
+        return FileStatus::Conflict;
+    }
+    if x == b'?' && y == b'?' {
+        return FileStatus::Added; // 未跟踪
+    }
+    let letters = [x, y];
+    if letters.contains(&b'D') {
+        return FileStatus::Deleted;
+    }
+    if letters.contains(&b'M') || letters.contains(&b'T') {
+        return FileStatus::Modified;
+    }
+    if letters.contains(&b'R') || letters.contains(&b'C') {
+        return FileStatus::Renamed;
+    }
+    if letters.contains(&b'A') {
+        return FileStatus::Added;
+    }
+    FileStatus::Modified // 未知组合退回通用「已修改」标记
+}
+
+/// 扫描一个 C 风格引号字符串（`bytes[i]` 必须是开引号 `"`）。
+///
+/// 返回（解码后的字符串，闭引号之后的下标）。转义支持 git 使用的集合
+/// `\a \b \f \n \r \t \v \\ \"` 与八进制 `\NNN`（原始 UTF-8 字节）。
+/// 格式非法（无闭引号、未知转义、八进制超界）返回 None，调用方回退为
+/// 原文，绝不 panic。
+fn scan_quoted(bytes: &[u8], mut i: usize) -> Option<(String, usize)> {
+    i += 1; // 跳过开引号
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => return String::from_utf8(out).ok().map(|s| (s, i + 1)),
+            b'\\' => {
+                i += 1;
+                match bytes.get(i)? {
+                    b'a' => out.push(0x07),
+                    b'b' => out.push(0x08),
+                    b'f' => out.push(0x0C),
+                    b'n' => out.push(b'\n'),
+                    b'r' => out.push(b'\r'),
+                    b't' => out.push(b'\t'),
+                    b'v' => out.push(0x0B),
+                    b'\\' => out.push(b'\\'),
+                    b'"' => out.push(b'"'),
+                    b'0'..=b'7' => {
+                        // 八进制转义：最多 3 位（当前这位已读入）。
+                        let mut value = u32::from(bytes[i] - b'0');
+                        let mut count = 1;
+                        while count < 3 {
+                            match bytes.get(i + 1) {
+                                Some(d @ b'0'..=b'7') => {
+                                    value = value * 8 + u32::from(d - b'0');
+                                    i += 1;
+                                }
+                                _ => break,
+                            }
+                            count += 1;
+                        }
+                        if value > u32::from(u8::MAX) {
+                            return None;
+                        }
+                        out.push(value as u8);
+                    }
+                    _ => return None,
+                }
+            }
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    None // 没有闭引号
+}
+
+/// 引号包裹的路径 → 去引号并解码转义；引号不成对或格式非法时回退为
+/// 去引号的原文（宁可匹配不上，也不 panic）。
+fn unquoted_or_raw(path: &str) -> Option<String> {
+    if path.as_bytes().first() == Some(&b'"') {
+        return match scan_quoted(path.as_bytes(), 0)
+            .filter(|(_, end)| path[*end..].trim().is_empty())
+        {
+            Some((decoded, _)) => Some(decoded),
+            None => Some(path.trim_matches('"').to_string()),
+        };
+    }
+    Some(path.to_string())
+}
+
+/// porcelain 路径字段 → 实际路径；rename 行取 `->` 右侧的新路径。
+///
+/// 兼容实测 git（Windows，`core.quotePath=true`）的两种形态：
+/// - rename：任一侧含空格/非 ASCII 时该侧独立加引号，
+///   `RM "src dir/a.txt" -> "src dir/b moved.txt"`；
+/// - 普通条目：含空格或非 ASCII 时整体引号并转义，` M "with space.txt"`、
+///   ` M "\346\226\207.txt"`。
+fn porcelain_entry_path(field: &str) -> Option<String> {
+    if field.as_bytes().first() == Some(&b'"') {
+        // 引号开头：扫描第一个引号串。其后为空 → 路径本身；
+        // 其后是 ` -> …` → rename，取右侧（实测 git 对 rename 逐侧加引号）。
+        let (decoded, end) = scan_quoted(field.as_bytes(), 0)?;
+        let rest = field[end..].trim_start();
+        if rest.is_empty() {
+            return Some(decoded);
+        }
+        let new_part = rest.strip_prefix("-> ")?;
+        unquoted_or_raw(new_part.trim_start())
+    } else {
+        match field.rsplit_once(" -> ") {
+            Some((_old, new)) => unquoted_or_raw(new),
+            None => Some(field.to_string()),
+        }
+    }
+}
+
+/// 解析 `git status --porcelain=v1 [-b]` 输出 → 仓库相对路径 → 状态。
+///
+/// - 跳过 `## <branch>` 头行、空行与已忽略条目（`!!`）；
+/// - `R  old -> new` 取新路径（见 [`porcelain_entry_path`]）；
+/// - 引号路径去引号并解码转义（含 UTF-8 八进制转义）；
+/// - 未跟踪目录 `?? dir/` 去掉尾部 `/`，使目录条目可精确匹配；
+/// - 同一路径多行按 冲突 > 删除 > 修改 > 重命名 > 新增 取最高优先级。
+fn parse_status_map(porcelain: &str) -> HashMap<String, FileStatus> {
+    let mut map: HashMap<String, FileStatus> = HashMap::new();
+    for line in porcelain.lines() {
+        if line.starts_with("## ")
+            || line.starts_with("!!")
+            || line.trim().is_empty()
+        {
+            continue;
+        }
+        let bytes = line.as_bytes();
+        if bytes.len() < 4 || bytes[2] != b' ' {
+            continue; // 不是 XY␣path 形态，跳过（不 panic）
+        }
+        let status = status_from_xy(bytes[0], bytes[1]);
+        let Some(path) = porcelain_entry_path(&line[3..]) else {
+            continue; // 路径字段格式非法，跳过该行
+        };
+        let path = path.trim_end_matches('/');
+        if path.is_empty() {
+            continue;
+        }
+        let entry = map.entry(path.to_string()).or_insert(status);
+        if status.rank() > entry.rank() {
+            *entry = status;
+        }
+    }
+    map
+}
+
+/// 浏览器条目的状态：文件按相对路径精确匹配；目录做前缀匹配，取其下
+/// 所有变更条目里优先级最高的状态（porcelain 路径恒以 `/` 分隔）。
+fn status_for_entry(
+    map: &HashMap<String, FileStatus>,
+    rel_path: &str,
+    is_dir: bool,
+) -> Option<FileStatus> {
+    if let Some(status) = map.get(rel_path) {
+        return Some(*status);
+    }
+    if !is_dir {
+        return None;
+    }
+    let prefix = format!("{rel_path}/");
+    map.iter()
+        .filter(|(path, _)| path.starts_with(&prefix))
+        .map(|(_, status)| *status)
+        .max_by_key(|status| status.rank())
+}
+
+/// 从 `git status --porcelain=v1 -b` 输出解析当前分支名（`## <branch>` 行）。
+///
+/// 兼容 `master...origin/master [ahead 1]` 与未出生分支的
+/// `No commits yet on master`（老 git：`Initial commit on master`）；
+/// 分离 HEAD（`HEAD (no branch)`）或无头行返回 None。
+fn current_branch_from_porcelain(porcelain: &str) -> Option<String> {
+    let head = porcelain.lines().find_map(|l| l.strip_prefix("## "))?.trim();
+    if head.starts_with("HEAD (no branch)") {
+        return None;
+    }
+    if let Some(rest) = head.strip_prefix("No commits yet on ") {
+        return Some(rest.to_string());
+    }
+    if let Some(rest) = head.strip_prefix("Initial commit on ") {
+        return Some(rest.to_string());
+    }
+    let branch = head.split("...").next().unwrap_or_default();
+    if branch.is_empty() {
+        None
+    } else {
+        Some(branch.to_string())
+    }
+}
+
+/// 浏览器条目名前的状态标记：着色字符；冲突为红底加粗白字。
+fn status_marker_rich(status: FileStatus) -> egui::RichText {
+    let (color, conflict) = match status {
+        FileStatus::Conflict => (egui::Color32::WHITE, true),
+        FileStatus::Deleted => (egui::Color32::RED, false),
+        FileStatus::Modified | FileStatus::Renamed => (COLOR_STATUS_CHANGED, false),
+        FileStatus::Added => (COLOR_STATUS_ADDED, false),
+    };
+    let text = egui::RichText::new(status.marker()).color(color);
+    if conflict {
+        text.strong().background_color(egui::Color32::RED)
+    } else {
+        text
+    }
+}
+
+/// 状态标记的图例说明（浏览器列表下方显示一次）。
+fn status_legend_text(status: FileStatus) -> &'static str {
+    match status {
+        FileStatus::Conflict => "冲突",
+        FileStatus::Deleted => "已删除",
+        FileStatus::Modified => "已修改",
+        FileStatus::Renamed => "重命名/复制",
+        FileStatus::Added => "新增/未跟踪",
+    }
+}
+
 /// Which screen the main window currently shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -442,6 +760,30 @@ pub struct GitPmApp {
     tag_msg: String,
     /// Bottom read-only log, one entry per git invocation.
     log: Vec<LogEntry>,
+
+    // Push dialog（操作面板「推送…」）。
+    show_push_dialog: bool,
+    /// Configured remotes, loaded once when the dialog opens.
+    push_remotes: Vec<String>,
+    /// Index into `push_remotes` chosen in the dropdown.
+    push_remote_sel: usize,
+    /// Branch name input; defaults to the current branch from the status cache.
+    push_branch: String,
+    /// `-u`：推送并设置上游。
+    push_set_upstream: bool,
+    /// Validation error shown inside the push dialog.
+    push_error: Option<String>,
+    /// `remote_list` failure shown inside the push dialog (push disabled).
+    push_remotes_error: Option<String>,
+
+    // Commit history window（操作面板「历史…」，只读）。
+    show_history_window: bool,
+    /// Commits loaded for the current window session; cleared on close.
+    history_commits: Vec<git::CommitInfo>,
+    /// `log_recent` failure shown inside the window; older commits stay.
+    history_error: Option<String>,
+    /// True when the last page came back short: no more commits to load.
+    history_exhausted: bool,
 
     // Central panel: file browser of the selected project.
     /// The directory currently being browsed; `None` = not yet initialized (or no project selected).
@@ -518,6 +860,17 @@ impl GitPmApp {
             tag_name: String::new(),
             tag_msg: String::new(),
             log: Vec::new(),
+            show_push_dialog: false,
+            push_remotes: Vec::new(),
+            push_remote_sel: 0,
+            push_branch: String::new(),
+            push_set_upstream: false,
+            push_error: None,
+            push_remotes_error: None,
+            show_history_window: false,
+            history_commits: Vec::new(),
+            history_error: None,
+            history_exhausted: false,
             browser_path: None,
             browser_entries: Vec::new(),
             browser_err: None,
@@ -761,6 +1114,8 @@ impl GitPmApp {
         self.show_clone_dialog(ctx);
         self.show_cred_dialog(ctx);
         self.show_pw_change_dialog(ctx);
+        self.show_push_dialog(ctx);
+        self.show_history_window(ctx);
         self.show_gen_dialog(ctx);
         self.show_tool_generator(ctx);
         // While a git call runs on a worker thread, keep waking the UI to
@@ -999,6 +1354,28 @@ impl GitPmApp {
                             {
                                 self.do_push();
                             }
+                            // 一键推送保持不变；「推送…」打开可选远程/分支的对话框。
+                            if ui
+                                .add_enabled(
+                                    !busy.is_some(),
+                                    egui::Button::new(format!("{} 推送…", icons::ICON_PUSH)),
+                                )
+                                .clicked()
+                            {
+                                self.open_push_dialog();
+                            }
+                        });
+                        ui.add_space(4.0);
+                        ui.horizontal(|ui| {
+                            if ui
+                                .add_enabled(
+                                    !busy.is_some(),
+                                    egui::Button::new(format!("{} 历史…", icons::ICON_HISTORY)),
+                                )
+                                .clicked()
+                            {
+                                self.open_history_window();
+                            }
                             if ui
                                 .add_enabled(
                                     !busy.is_some(),
@@ -1219,6 +1596,39 @@ impl GitPmApp {
             })
             .collect();
 
+        // 文件状态标记：数据源是选中项目的 porcelain 缓存；未选中项目或
+        // 无缓存时为空映射（不显示标记，不报错）。
+        let status_map = self
+            .selected_project()
+            .and_then(|p| self.status_cache.get(&p.id))
+            .map(|cache| parse_status_map(&cache.porcelain))
+            .unwrap_or_default();
+        // 当前浏览目录相对仓库根的路径（porcelain 路径恒以 `/` 分隔）。
+        let rel_prefix: String = self
+            .browser_path
+            .as_ref()
+            .and_then(|p| p.strip_prefix(root).ok())
+            .map(|rel| {
+                rel.components()
+                    .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    .join("/")
+            })
+            .unwrap_or_default();
+        // 每行的状态：文件精确匹配，目录做后代前缀匹配。
+        let row_status: Vec<Option<FileStatus>> = self
+            .browser_entries
+            .iter()
+            .map(|e| {
+                let rel = if rel_prefix.is_empty() {
+                    e.name.clone()
+                } else {
+                    format!("{rel_prefix}/{}", e.name)
+                };
+                status_for_entry(&status_map, &rel, e.is_dir)
+            })
+            .collect();
+
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -1237,7 +1647,9 @@ impl GitPmApp {
                         ui.strong("修改时间");
                         ui.end_row();
 
-                        for (name, is_dir, size, modified, is_hidden) in rows {
+                        for ((name, is_dir, size, modified, is_hidden), entry_status) in
+                            rows.into_iter().zip(row_status)
+                        {
                             // 隐藏项（.git 等）正常显示但整行视觉弱化，仍可进入。
                             let dim = |rt: egui::RichText| {
                                 if is_hidden {
@@ -1253,11 +1665,25 @@ impl GitPmApp {
                             } else {
                                 egui::Sense::hover()
                             };
-                            let name_resp = ui.add(
-                                egui::Label::new(dim(egui::RichText::new(&name)))
-                                    .wrap_mode(egui::TextWrapMode::Truncate)
-                                    .sense(sense),
-                            );
+                            // 名称格：git 状态标记（着色）在前，名称随后；
+                            // 两者感应一致，目录行点标记也能进入。
+                            let (name_resp, marker_resp) = ui
+                                .horizontal(|ui| {
+                                    let marker = entry_status.map(|st| {
+                                        ui.add(egui::Label::new(status_marker_rich(st)).sense(sense))
+                                    });
+                                    let name = ui.add(
+                                        egui::Label::new(dim(egui::RichText::new(&name)))
+                                            .wrap_mode(egui::TextWrapMode::Truncate)
+                                            .sense(sense),
+                                    );
+                                    (name, marker)
+                                })
+                                .inner;
+                            let mut name_resp = name_resp;
+                            if let Some(marker) = marker_resp {
+                                name_resp = name_resp.union(marker);
+                            }
                             let type_resp = ui.add(
                                 egui::Label::new(dim(egui::RichText::new(if is_dir {
                                     "目录"
@@ -1296,6 +1722,25 @@ impl GitPmApp {
                             }
                         }
                     });
+
+                // 行尾图例：porcelain 有数据（存在状态标记）时显示一次。
+                if !status_map.is_empty() {
+                    ui.add_space(6.0);
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new("图例：").weak());
+                        for st in [
+                            FileStatus::Conflict,
+                            FileStatus::Deleted,
+                            FileStatus::Modified,
+                            FileStatus::Renamed,
+                            FileStatus::Added,
+                        ] {
+                            ui.label(status_marker_rich(st));
+                            ui.label(egui::RichText::new(status_legend_text(st)).weak());
+                            ui.add_space(6.0);
+                        }
+                    });
+                }
             });
     }
 
@@ -1362,12 +1807,12 @@ impl GitPmApp {
                     self.clear_busy_if(project_id);
                 }
             },
-            ResultKind::RemoteUrl => {
+            ResultKind::RemoteUrl(remote) => {
                 // Only io failures are sent (and logged); successful and
                 // git-failed get-url results degrade to a plain pull/push
                 // silently, like the old synchronous flow.
                 if let Err(e) = &result.output {
-                    let label = format!("git remote get-url {DEFAULT_PUSH_REMOTE}");
+                    let label = format!("git remote get-url {remote}");
                     self.log_git_error(&label, e);
                 }
             }
@@ -1381,7 +1826,7 @@ impl GitPmApp {
                 self.clear_busy_if(project_id);
                 self.trigger_status_refresh(project_id);
             }
-            ResultKind::Pull(label) | ResultKind::Push(label) => {
+            ResultKind::Pull(label) | ResultKind::Push(label) | ResultKind::PushTo(label) => {
                 self.log_write_result(&label, &result.output);
                 self.clear_busy_if(project_id);
                 self.trigger_status_refresh(project_id);
@@ -1523,21 +1968,23 @@ impl GitPmApp {
         }
     }
 
-    /// Decrypt the stored credential (`origin`) for a project on the UI
-    /// thread. The secret only moves into the worker thread, where the URL is
-    /// built and scrubbed; it is never logged, rendered, or stored anywhere.
-    /// Returns `None` when absent or on failure (the failure is logged here).
-    fn load_credential_parts(&mut self, project_id: i64) -> Option<(String, String)> {
+    /// Decrypt the stored credential for a project on the UI thread (the
+    /// credential label is usually `origin`, or the remote chosen in the push
+    /// dialog). The secret only moves into the worker thread, where the URL
+    /// is built and scrubbed; it is never logged, rendered, or stored
+    /// anywhere. Returns `None` when absent or on failure (the failure is
+    /// logged here).
+    fn load_credential_parts(&mut self, project_id: i64, label: &str) -> Option<(String, String)> {
         let secret = {
             let keys = self.keys.as_ref()?;
             let conn = self.conn.as_ref()?;
-            match db::get_credential(conn, keys, project_id, DEFAULT_PUSH_REMOTE) {
+            match db::get_credential(conn, keys, project_id, label) {
                 Ok(Some(secret)) => secret,
                 Ok(None) => return None,
                 Err(e) => {
                     self.log.push(LogEntry {
                         ok: false,
-                        title: format!("读取凭据（{DEFAULT_PUSH_REMOTE}）失败"),
+                        title: format!("读取凭据（{label}）失败"),
                         // CryptoError messages never contain the secret.
                         text: e.to_string(),
                     });
@@ -1585,7 +2032,7 @@ impl GitPmApp {
         let Some(project) = self.selected_project().cloned() else {
             return;
         };
-        let auth_parts = self.load_credential_parts(project.id);
+        let auth_parts = self.load_credential_parts(project.id, DEFAULT_PUSH_REMOTE);
         self.busy = Some(BusyOp {
             project_id: project.id,
             label: "正在拉取（pull）…".to_string(),
@@ -1629,7 +2076,7 @@ impl GitPmApp {
                 Err(e) => {
                     let _ = tx.send(GitResult {
                         project_id,
-                        kind: ResultKind::RemoteUrl,
+                        kind: ResultKind::RemoteUrl(DEFAULT_PUSH_REMOTE.to_string()),
                         output: Err(e),
                     });
                     send_plain_pull(&tx, project_id, &path);
@@ -1665,7 +2112,7 @@ impl GitPmApp {
         let Some(project) = self.selected_project().cloned() else {
             return;
         };
-        let auth_parts = self.load_credential_parts(project.id);
+        let auth_parts = self.load_credential_parts(project.id, DEFAULT_PUSH_REMOTE);
         self.busy = Some(BusyOp {
             project_id: project.id,
             label: "正在推送（push）…".to_string(),
@@ -1706,7 +2153,7 @@ impl GitPmApp {
                 Err(e) => {
                     let _ = tx.send(GitResult {
                         project_id,
-                        kind: ResultKind::RemoteUrl,
+                        kind: ResultKind::RemoteUrl(DEFAULT_PUSH_REMOTE.to_string()),
                         output: Err(e),
                     });
                     send_plain_push(&tx, project_id, &path, &branch);
@@ -1728,6 +2175,338 @@ impl GitPmApp {
                 .map(|out| redact_output(out, &auth.redact_pairs()));
             let _ = tx.send(GitResult { project_id, kind: ResultKind::Push(label), output });
         });
+    }
+
+    // ---------------------------------------------------------- push dialog
+
+    /// 操作面板「推送…」：打开推送对话框。remote 列表同步读取（查询快、
+    /// 秒回，裁定不走 busy 异步）；默认分支从状态缓存 porcelain 的
+    /// `## <branch>` 行取当前分支。
+    fn open_push_dialog(&mut self) {
+        self.error = None;
+        self.push_error = None;
+        self.push_remotes_error = None;
+        self.push_set_upstream = false;
+        self.push_remote_sel = 0;
+        self.push_remotes.clear();
+        self.push_branch = self
+            .selected_project()
+            .and_then(|p| self.status_cache.get(&p.id))
+            .map(|cache| current_branch_from_porcelain(&cache.porcelain).unwrap_or_default())
+            .unwrap_or_default();
+        let Some(project) = self.selected_project().cloned() else {
+            return; // 按钮仅在选中项目后可见；防御性兜底
+        };
+        match git::remote_list(Path::new(&project.path)) {
+            Ok(remotes) => self.push_remotes = remotes,
+            Err(e) => self.push_remotes_error = Some(e),
+        }
+        self.show_push_dialog = true;
+    }
+
+    fn close_push_dialog(&mut self) {
+        self.show_push_dialog = false;
+        self.push_remotes.clear();
+        self.push_remote_sel = 0;
+        self.push_branch.clear();
+        self.push_set_upstream = false;
+        self.push_error = None;
+        self.push_remotes_error = None;
+    }
+
+    fn show_push_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_push_dialog {
+            return;
+        }
+        let Some(project_name) = self.selected_project().map(|p| p.name.clone()) else {
+            self.show_push_dialog = false;
+            return;
+        };
+        let busy = self.busy.is_some();
+        let no_remotes = self.push_remotes.is_empty();
+        let mut open = self.show_push_dialog;
+        egui::Window::new(format!("推送到远程 — {project_name}"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("选择远程仓库与分支进行推送；凭据注入与一键推送共用同一路径。");
+                ui.add_space(6.0);
+                if let Some(err) = &self.push_remotes_error {
+                    ui.colored_label(egui::Color32::RED, err);
+                } else if no_remotes {
+                    ui.label("无远程仓库，请先用命令行 git remote add");
+                } else {
+                    egui::ComboBox::from_label("远程：")
+                        .selected_text(
+                            self.push_remotes
+                                .get(self.push_remote_sel)
+                                .map(String::as_str)
+                                .unwrap_or_default(),
+                        )
+                        .show_ui(ui, |ui| {
+                            for (idx, remote) in self.push_remotes.iter().enumerate() {
+                                ui.selectable_value(&mut self.push_remote_sel, idx, remote);
+                            }
+                        });
+                }
+                ui.add_space(6.0);
+                ui.add_sized(
+                    [DIALOG_FIELD_WIDTH, 22.0],
+                    egui::TextEdit::singleline(&mut self.push_branch)
+                        .hint_text("分支名（如 main）"),
+                );
+                ui.checkbox(&mut self.push_set_upstream, "设置上游（-u）");
+                if let Some(err) = &self.push_error {
+                    ui.add_space(6.0);
+                    ui.colored_label(egui::Color32::RED, err);
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("取消").clicked() {
+                        self.close_push_dialog();
+                    }
+                    let can_push = !busy
+                        && !no_remotes
+                        && !self.push_branch.trim().is_empty()
+                        && self.push_remotes_error.is_none();
+                    if ui
+                        .add_enabled(
+                            can_push,
+                            egui::Button::new(format!("{} 推送", icons::ICON_PUSH)),
+                        )
+                        .clicked()
+                    {
+                        self.submit_push_dialog();
+                    }
+                });
+            });
+        // Closed via the window's X button.
+        if !open {
+            self.close_push_dialog();
+        }
+    }
+
+    /// 对话框「推送」按钮：校验后走 busy 异步推送（结果进底部输出区），
+    /// 并关闭对话框。
+    fn submit_push_dialog(&mut self) {
+        self.push_error = None;
+        let Some(project) = self.selected_project().cloned() else {
+            self.push_error = Some("未选择项目".into());
+            return;
+        };
+        let Some(remote) = self.push_remotes.get(self.push_remote_sel).cloned() else {
+            self.push_error = Some("请选择远程仓库".into());
+            return;
+        };
+        let branch = self.push_branch.trim().to_string();
+        if branch.is_empty() {
+            self.push_error = Some("请填写分支名".into());
+            return;
+        }
+        let set_upstream = self.push_set_upstream;
+        self.do_push_to(&project, &remote, &branch, set_upstream);
+        self.close_push_dialog();
+    }
+
+    /// 推送对话框后台执行：与一键推送同一凭据注入路径，但凭据标签与
+    /// `remote get-url` 换成所选远程名；https URL 注入与输出三重脱敏仍在
+    /// 线程内完成。分支名由对话框给定，无需再 rev-parse。
+    fn do_push_to(&mut self, project: &Project, remote: &str, branch: &str, set_upstream: bool) {
+        if self.busy.is_some() {
+            return;
+        }
+        let auth_parts = self.load_credential_parts(project.id, remote);
+        self.busy = Some(BusyOp {
+            project_id: project.id,
+            label: format!("正在推送到 {remote}（{branch}）…"),
+        });
+        let tx = self.result_tx.clone();
+        let path = PathBuf::from(&project.path);
+        let project_id = project.id;
+        let remote = remote.to_string();
+        let branch = branch.to_string();
+        std::thread::spawn(move || {
+            let Some((user, pass)) = auth_parts else {
+                send_plain_push_to(&tx, project_id, &path, &remote, &branch, set_upstream);
+                return;
+            };
+            let plain_url = match git::run(&path, &["remote", "get-url", &remote]) {
+                Ok(out) if out.ok() => out.stdout.trim().to_string(),
+                // git's own failure surfaces on the subsequent push call.
+                Ok(_) => {
+                    send_plain_push_to(&tx, project_id, &path, &remote, &branch, set_upstream);
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx.send(GitResult {
+                        project_id,
+                        kind: ResultKind::RemoteUrl(remote.clone()),
+                        output: Err(e),
+                    });
+                    send_plain_push_to(&tx, project_id, &path, &remote, &branch, set_upstream);
+                    return;
+                }
+            };
+            let Some(url) = inject_https_userinfo(&plain_url, &user, &pass) else {
+                send_plain_push_to(&tx, project_id, &path, &remote, &branch, set_upstream);
+                return;
+            };
+            let auth = InjectedAuth {
+                url,
+                plain_url,
+                password: pass.clone(),
+                encoded_password: percent_encode_userinfo(&pass),
+            };
+            let flag = if set_upstream { " -u" } else { "" };
+            let label = format!("git push{flag} {remote} {branch}（凭据已注入）");
+            let args: Vec<&str> = if set_upstream {
+                vec!["push", "-u", &auth.url, &branch]
+            } else {
+                vec!["push", &auth.url, &branch]
+            };
+            let output = git::run(&path, &args)
+                .map(|out| redact_output(out, &auth.redact_pairs()));
+            let _ = tx.send(GitResult { project_id, kind: ResultKind::PushTo(label), output });
+        });
+    }
+
+    // ------------------------------------------------------- history window
+
+    /// 操作面板「历史…」：打开只读提交历史窗口。同步取最近 10 条；关闭时
+    /// 清空已加载列表，下次打开重新取。
+    fn open_history_window(&mut self) {
+        self.show_history_window = true;
+        self.history_commits.clear();
+        self.history_error = None;
+        self.history_exhausted = false;
+        let Some(project) = self.selected_project().cloned() else {
+            return; // 按钮仅在选中项目后可见；防御性兜底
+        };
+        match git::log_recent(Path::new(&project.path), 0, HISTORY_FIRST_PAGE) {
+            Ok(commits) => {
+                if commits.len() < HISTORY_FIRST_PAGE {
+                    self.history_exhausted = true;
+                }
+                self.history_commits = commits;
+            }
+            Err(e) => self.history_error = Some(e),
+        }
+    }
+
+    fn close_history_window(&mut self) {
+        self.show_history_window = false;
+        self.history_commits.clear();
+        self.history_error = None;
+        self.history_exhausted = false;
+    }
+
+    /// 「加载更多」：skip = 已加载数，每次追加 20 条；返回不足一页即认为
+    /// 已到底并禁用按钮。失败保留已加载内容，窗口内红字提示。
+    fn history_load_more(&mut self) {
+        if self.history_exhausted {
+            return;
+        }
+        let Some(project) = self.selected_project().cloned() else {
+            return;
+        };
+        let skip = self.history_commits.len();
+        match git::log_recent(Path::new(&project.path), skip, HISTORY_PAGE_SIZE) {
+            Ok(mut commits) => {
+                if commits.len() < HISTORY_PAGE_SIZE {
+                    self.history_exhausted = true;
+                }
+                self.history_commits.append(&mut commits);
+                self.history_error = None;
+            }
+            Err(e) => self.history_error = Some(e),
+        }
+    }
+
+    fn show_history_window(&mut self, ctx: &egui::Context) {
+        if !self.show_history_window {
+            return;
+        }
+        let Some(project_name) = self.selected_project().map(|p| p.name.clone()) else {
+            self.show_history_window = false;
+            return;
+        };
+        let exhausted = self.history_exhausted;
+        let mut open = self.show_history_window;
+        egui::Window::new(format!("提交历史 — {project_name}"))
+            .collapsible(false)
+            .default_width(560.0)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                if let Some(err) = &self.history_error {
+                    ui.colored_label(egui::Color32::RED, err);
+                    ui.add_space(4.0);
+                }
+                if self.history_commits.is_empty() {
+                    if self.history_error.is_none() {
+                        ui.label("（无提交）");
+                    }
+                } else {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false, false])
+                        .max_height(360.0)
+                        .show(ui, |ui| {
+                            egui::Grid::new("history_grid")
+                                .striped(true)
+                                .num_columns(4)
+                                .spacing(egui::vec2(16.0, 4.0))
+                                .max_col_width(360.0)
+                                .show(ui, |ui| {
+                                    ui.strong("哈希");
+                                    ui.strong("作者");
+                                    ui.strong("日期");
+                                    ui.strong("说明");
+                                    ui.end_row();
+                                    for commit in &self.history_commits {
+                                        let short = commit.hash.get(..8).unwrap_or(&commit.hash);
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(short).monospace(),
+                                            )
+                                            .wrap_mode(egui::TextWrapMode::Truncate),
+                                        );
+                                        ui.add(
+                                            egui::Label::new(egui::RichText::new(&commit.author))
+                                                .wrap_mode(egui::TextWrapMode::Truncate),
+                                        );
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(&commit.date).monospace(),
+                                            )
+                                            .wrap_mode(egui::TextWrapMode::Truncate),
+                                        );
+                                        ui.add(
+                                            egui::Label::new(egui::RichText::new(&commit.subject))
+                                                .wrap_mode(egui::TextWrapMode::Truncate),
+                                        )
+                                        .on_hover_text(&commit.subject);
+                                        ui.end_row();
+                                    }
+                                });
+                        });
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(!exhausted, egui::Button::new("加载更多"))
+                        .clicked()
+                    {
+                        self.history_load_more();
+                    }
+                    if ui.button("关闭").clicked() {
+                        self.close_history_window();
+                    }
+                });
+            });
+        // Closed via the window's X button.
+        if !open {
+            self.close_history_window();
+        }
     }
 
     /// “新建分支”：后台线程先 `create_branch` 成功后 `checkout`，结果回填
@@ -2622,5 +3401,173 @@ mod tests {
         );
         assert!(!scrubbed.stdout.contains("s3cret"));
         assert!(!scrubbed.stderr.contains("s3cret"));
+    }
+
+    // ------------------------------------------------ porcelain parsing
+
+    #[test]
+    fn status_from_xy_maps_pairs() {
+        assert_eq!(status_from_xy(b'M', b' '), FileStatus::Modified);
+        assert_eq!(status_from_xy(b'M', b'M'), FileStatus::Modified);
+        assert_eq!(status_from_xy(b' ', b'T'), FileStatus::Modified);
+        assert_eq!(status_from_xy(b'?', b'?'), FileStatus::Added);
+        assert_eq!(status_from_xy(b'A', b' '), FileStatus::Added);
+        assert_eq!(status_from_xy(b' ', b'D'), FileStatus::Deleted);
+        assert_eq!(status_from_xy(b'R', b' '), FileStatus::Renamed);
+        assert_eq!(status_from_xy(b'C', b' '), FileStatus::Renamed);
+        // 同一 XY 内按 冲突 > 删除 > 修改 > 重命名 > 新增 取舍。
+        assert_eq!(status_from_xy(b'A', b'M'), FileStatus::Modified);
+        assert_eq!(status_from_xy(b'A', b'D'), FileStatus::Deleted);
+        assert_eq!(status_from_xy(b'R', b'M'), FileStatus::Modified);
+        for (x, y) in [
+            (b'U', b'U'),
+            (b'A', b'A'),
+            (b'D', b'D'),
+            (b'A', b'U'),
+            (b'U', b'A'),
+            (b'D', b'U'),
+            (b'U', b'D'),
+        ] {
+            assert_eq!(status_from_xy(x, y), FileStatus::Conflict, "{x}{y}");
+        }
+    }
+
+    #[test]
+    fn parse_status_map_basic() {
+        let map = parse_status_map(
+            "## main...origin/main [ahead 1]\n M a.txt\n?? b.txt\nD  c.txt\nMM d.txt\n T e.txt\nR  f.txt -> g.txt\n",
+        );
+        assert_eq!(map.get("a.txt"), Some(&FileStatus::Modified));
+        assert_eq!(map.get("b.txt"), Some(&FileStatus::Added));
+        assert_eq!(map.get("c.txt"), Some(&FileStatus::Deleted));
+        assert_eq!(map.get("d.txt"), Some(&FileStatus::Modified));
+        assert_eq!(map.get("e.txt"), Some(&FileStatus::Modified));
+        // rename 行取新路径，旧路径不出现。
+        assert_eq!(map.get("g.txt"), Some(&FileStatus::Renamed));
+        assert!(!map.contains_key("f.txt"));
+        assert_eq!(map.len(), 6);
+    }
+
+    #[test]
+    fn parse_status_map_unquotes_paths() {
+        // 含空格路径被引号包裹（实测 porcelain 对含空格路径恒加引号）。
+        let map = parse_status_map(" M \"with space.txt\"\n");
+        assert_eq!(map.get("with space.txt"), Some(&FileStatus::Modified));
+        // UTF-8 八进制转义（core.quotePath 默认对非 ASCII 字节转义）。
+        let map = parse_status_map("?? \"\\346\\226\\207\\346\\241\\243.txt\"\n");
+        assert_eq!(map.get("文档.txt"), Some(&FileStatus::Added));
+        // 转义的引号与反斜杠。
+        let map = parse_status_map("?? \"quo\\\"te\\\\dir.txt\"\n");
+        assert_eq!(map.get("quo\"te\\dir.txt"), Some(&FileStatus::Added));
+    }
+
+    #[test]
+    fn parse_status_map_rename_with_quoted_sides() {
+        // 实测格式：rename 两侧各自独立加引号。
+        let map = parse_status_map("R  \"src dir/a.txt\" -> \"src dir/b moved.txt\"\n");
+        assert_eq!(map.get("src dir/b moved.txt"), Some(&FileStatus::Renamed));
+        assert!(!map.contains_key("src dir/a.txt"));
+        // 仅新路径一侧加引号。
+        let map = parse_status_map("R  old.txt -> \"new dir/b.txt\"\n");
+        assert_eq!(map.get("new dir/b.txt"), Some(&FileStatus::Renamed));
+        // RM（重命名暂存 + 工作区又改）：XY 内 修改 > 重命名 → M 标记，
+        // 但路径仍取 `->` 右侧。
+        let map = parse_status_map("RM \"src dir/a.txt\" -> \"src dir/b moved.txt\"\n");
+        assert_eq!(map.get("src dir/b moved.txt"), Some(&FileStatus::Modified));
+    }
+
+    #[test]
+    fn parse_status_map_priority_across_lines() {
+        // 同一路径两行：删除 > 新增（两种行序结果一致）。
+        let map = parse_status_map("D  x.txt\n?? x.txt\n");
+        assert_eq!(map.get("x.txt"), Some(&FileStatus::Deleted));
+        let map = parse_status_map("?? x.txt\nD  x.txt\n");
+        assert_eq!(map.get("x.txt"), Some(&FileStatus::Deleted));
+        // 新增 + 修改 → 修改。
+        let map = parse_status_map("A  y.txt\n M y.txt\n");
+        assert_eq!(map.get("y.txt"), Some(&FileStatus::Modified));
+        // 冲突优先于一切。
+        let map = parse_status_map(" M z.txt\nUU z.txt\n");
+        assert_eq!(map.get("z.txt"), Some(&FileStatus::Conflict));
+    }
+
+    #[test]
+    fn parse_status_map_untracked_dir_strips_slash() {
+        let map = parse_status_map("?? newdir/\n");
+        assert_eq!(map.get("newdir"), Some(&FileStatus::Added));
+        assert!(!map.contains_key("newdir/"));
+    }
+
+    #[test]
+    fn parse_status_map_skips_headers_and_garbage() {
+        let map = parse_status_map("## HEAD (no branch)\nUU both.txt\n\nshort\n!!!!\n#");
+        assert_eq!(map.get("both.txt"), Some(&FileStatus::Conflict));
+        assert_eq!(map.len(), 1);
+        // 空输入 → 空映射。
+        assert!(parse_status_map("").is_empty());
+        assert!(parse_status_map("## main\n").is_empty());
+    }
+
+    #[test]
+    fn status_for_entry_exact_and_dir_prefix() {
+        let map = parse_status_map(" M src/main.rs\nD  src/lib/dead.rs\n?? other.txt\n");
+        // 文件精确匹配。
+        assert_eq!(
+            status_for_entry(&map, "src/main.rs", false),
+            Some(FileStatus::Modified)
+        );
+        // 目录取后代最高优先级：删除 > 修改。
+        assert_eq!(status_for_entry(&map, "src", true), Some(FileStatus::Deleted));
+        // 前缀匹配不误伤同级名字（src2 ≠ src/…）。
+        assert_eq!(status_for_entry(&map, "src2", true), None);
+        // 无变更的目录 → None；文件无精确匹配 → None。
+        assert_eq!(status_for_entry(&map, "empty", true), None);
+        assert_eq!(status_for_entry(&map, "other", false), None);
+        // 未跟踪目录（尾部 / 已剥离）可直接匹配。
+        let map = parse_status_map("?? newdir/\n");
+        assert_eq!(
+            status_for_entry(&map, "newdir", true),
+            Some(FileStatus::Added)
+        );
+    }
+
+    #[test]
+    fn current_branch_from_porcelain_cases() {
+        assert_eq!(
+            current_branch_from_porcelain("## master...origin/master [ahead 1]\n M a\n"),
+            Some("master".to_string())
+        );
+        assert_eq!(
+            current_branch_from_porcelain("## dev\n"),
+            Some("dev".to_string())
+        );
+        assert_eq!(
+            current_branch_from_porcelain("## No commits yet on main\n?? x\n"),
+            Some("main".to_string())
+        );
+        assert_eq!(
+            current_branch_from_porcelain("## Initial commit on master\n"),
+            Some("master".to_string())
+        );
+        // 分离 HEAD / 空输出 / 无头行 → None。
+        assert_eq!(current_branch_from_porcelain("## HEAD (no branch)\n"), None);
+        assert_eq!(current_branch_from_porcelain(""), None);
+        assert_eq!(current_branch_from_porcelain(" M a.txt\n"), None);
+    }
+
+    #[test]
+    fn file_status_ranks_and_markers() {
+        // 优先级全序：冲突 > 删除 > 修改 > 重命名 > 新增。
+        assert!(FileStatus::Conflict.rank() > FileStatus::Deleted.rank());
+        assert!(FileStatus::Deleted.rank() > FileStatus::Modified.rank());
+        assert!(FileStatus::Modified.rank() > FileStatus::Renamed.rank());
+        assert!(FileStatus::Renamed.rank() > FileStatus::Added.rank());
+        // 标记字符与图例一一对应。
+        assert_eq!(FileStatus::Modified.marker(), "M");
+        assert_eq!(FileStatus::Added.marker(), "+");
+        assert_eq!(FileStatus::Deleted.marker(), "−");
+        assert_eq!(FileStatus::Conflict.marker(), "!");
+        assert_eq!(FileStatus::Renamed.marker(), "R");
+        assert!(!status_legend_text(FileStatus::Added).is_empty());
     }
 }

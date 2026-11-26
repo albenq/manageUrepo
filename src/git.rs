@@ -114,8 +114,6 @@ pub fn create_tag(dir: &Path, name: &str, message: Option<&str>) -> std::io::Res
 ///
 /// `hash` is the full 40-character SHA-1; `date` is formatted
 /// "YYYY-MM-DD HH:MM".
-// Consumed by the history UI in a later task; unused until then.
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitInfo {
     pub hash: String,
@@ -127,8 +125,6 @@ pub struct CommitInfo {
 /// List configured remotes (`git remote`), one name per entry.
 ///
 /// A repository with no remotes yields an empty vector, not an error.
-// Consumed by the remotes UI in a later task; unused until then.
-#[allow(dead_code)]
 pub fn remote_list(repo: &Path) -> Result<Vec<String>, String> {
     let out = run(repo, &["remote"]).map_err(|e| e.to_string())?;
     if !out.ok() {
@@ -145,8 +141,6 @@ pub fn remote_list(repo: &Path) -> Result<Vec<String>, String> {
 
 /// Field separator used by the `log_recent` `--pretty` format (ASCII unit
 /// separator, emitted by git's `%x1f` placeholder).
-// Consumed by the history UI in a later task; unused until then.
-#[allow(dead_code)]
 const LOG_FIELD_SEP: char = '\u{1f}';
 
 /// The newest commits of the current branch, newest first.
@@ -157,8 +151,6 @@ const LOG_FIELD_SEP: char = '\u{1f}';
 /// Note: `--max-count` is used instead of the equivalent short `-n` because
 /// git parses `-n=<limit>` as the count `0` (strtol over the leading `=`),
 /// silently returning nothing.
-// Consumed by the history UI in a later task; unused until then.
-#[allow(dead_code)]
 pub fn log_recent(repo: &Path, skip: usize, limit: usize) -> Result<Vec<CommitInfo>, String> {
     let skip_arg = format!("--skip={skip}");
     let limit_arg = format!("--max-count={limit}");
@@ -193,7 +185,6 @@ pub fn log_recent(repo: &Path, skip: usize, limit: usize) -> Result<Vec<CommitIn
 /// A record starts when a line yields four `\x1f`-separated fields with a
 /// 40-character hex hash first; any other line is treated as a continuation
 /// of the previous subject, keeping the parser safe against line breaks.
-#[allow(dead_code)]
 fn parse_commit_lines(stdout: &str) -> Vec<CommitInfo> {
     let mut commits = Vec::new();
     for line in stdout.lines() {
