@@ -201,6 +201,17 @@ enum Theme {
     Light,
 }
 
+/// Which window a password-generator UI is rendered in. Both instances share
+/// the same options/result state; only the copy inside the credential dialog
+/// offers「填入密码框」. Their open/close flags are fully independent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GenWindow {
+    /// The generator opened from the credential dialog's「生成…」button.
+    CredDialog,
+    /// The standalone generator opened from the top-bar「工具」menu.
+    ToolWindow,
+}
+
 pub struct GitPmApp {
     conn: Option<rusqlite::Connection>,
     /// Root cause captured when `gitpm.db` could not be opened.
@@ -249,11 +260,14 @@ pub struct GitPmApp {
     /// Error shown inside the credential dialog.
     cred_error: Option<String>,
 
-    // Password generator dialog (opened from the credential dialog).
+    // Password generator dialogs (one from the credential dialog, one
+    // standalone from the top-bar「工具」menu), sharing options and result.
     show_gen_dialog: bool,
+    show_tool_gen_window: bool,
     gen_opts: GenOptions,
     /// Last generated password, masked, until copied or filled into the
-    /// credential dialog's password field.
+    /// credential dialog's password field. Cleared whenever either generator
+    /// window closes.
     gen_result: String,
     gen_error: Option<String>,
 }
@@ -291,6 +305,7 @@ impl GitPmApp {
             cred_pass: String::new(),
             cred_error: None,
             show_gen_dialog: false,
+            show_tool_gen_window: false,
             gen_opts: GenOptions::default(),
             gen_result: String::new(),
             gen_error: None,
@@ -506,6 +521,7 @@ impl GitPmApp {
         self.show_clone_dialog(ctx);
         self.show_cred_dialog(ctx);
         self.show_gen_dialog(ctx);
+        self.show_tool_generator(ctx);
     }
 
     fn show_top_bar(&mut self, ctx: &egui::Context) {
@@ -533,9 +549,11 @@ impl GitPmApp {
         });
     }
 
-    /// 顶栏菜单栏（egui::menu::bar）：主题切换（暗黑/明亮）。
+    /// 顶栏菜单栏（egui::menu::bar）：主题切换（暗黑/明亮）与工具（独立
+    /// 密码生成器）。
     fn show_menu_bar(&mut self, ui: &mut egui::Ui) {
         let mut chosen_theme: Option<Theme> = None;
+        let mut open_generator = false;
         egui::menu::bar(ui, |ui| {
             ui.menu_button("主题", |ui| {
                 if ui.button("暗黑").clicked() {
@@ -545,9 +563,17 @@ impl GitPmApp {
                     chosen_theme = Some(Theme::Light);
                 }
             });
+            ui.menu_button("工具", |ui| {
+                if ui.button("密码生成器").clicked() {
+                    open_generator = true;
+                }
+            });
         });
         if let Some(theme) = chosen_theme {
             self.switch_theme(ui.ctx(), theme);
+        }
+        if open_generator {
+            self.open_tool_generator();
         }
     }
 
@@ -1498,70 +1524,114 @@ impl GitPmApp {
         self.show_gen_dialog = true;
     }
 
+    /// 顶栏「工具 → 密码生成器」：打开独立生成器窗口（清空上次结果）。
+    fn open_tool_generator(&mut self) {
+        self.gen_error = None;
+        self.gen_result.clear();
+        self.show_tool_gen_window = true;
+    }
+
+    /// 关闭指定生成器窗口并清空生成结果（「关闭」按钮与 X 按钮都走这里）。
+    fn close_generator(&mut self, window: GenWindow) {
+        match window {
+            GenWindow::CredDialog => self.show_gen_dialog = false,
+            GenWindow::ToolWindow => self.show_tool_gen_window = false,
+        }
+        self.gen_result.clear();
+    }
+
     fn show_gen_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_gen_dialog {
             return;
         }
         let mut open = self.show_gen_dialog;
         egui::Window::new("密码生成器")
+            .id(egui::Id::new("cred_password_generator"))
             .collapsible(false)
             .resizable(false)
             .open(&mut open)
             .show(ctx, |ui| {
-                ui.add(egui::Slider::new(&mut self.gen_opts.length, 8..=64).text("长度"));
-                // upper/lower/digits 固定启用（生成器要求至少一类字符）。
-                let mut fixed_upper = true;
-                ui.add_enabled(
-                    false,
-                    egui::Checkbox::new(&mut fixed_upper, "大写字母（固定启用）"),
-                );
-                let mut fixed_lower = true;
-                ui.add_enabled(
-                    false,
-                    egui::Checkbox::new(&mut fixed_lower, "小写字母（固定启用）"),
-                );
-                let mut fixed_digits = true;
-                ui.add_enabled(
-                    false,
-                    egui::Checkbox::new(&mut fixed_digits, "数字（固定启用）"),
-                );
-                ui.checkbox(&mut self.gen_opts.special, "特殊字符");
-                if ui.button("生成").clicked() {
-                    self.generate_password();
-                }
-                ui.add_sized(
-                    [DIALOG_FIELD_WIDTH, 22.0],
-                    egui::TextEdit::singleline(&mut self.gen_result)
-                        .password(true)
-                        .hint_text("（点击「生成」后显示在此，掩码显示）"),
-                );
-                if let Some(err) = &self.gen_error {
-                    ui.add_space(6.0);
-                    ui.colored_label(egui::Color32::RED, err);
-                }
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    let has_result = !self.gen_result.is_empty();
-                    if ui.add_enabled(has_result, egui::Button::new("复制")).clicked() {
-                        ui.ctx().copy_text(self.gen_result.clone());
-                    }
-                    if ui
-                        .add_enabled(has_result, egui::Button::new("填入密码框"))
-                        .clicked()
-                    {
-                        self.cred_pass = std::mem::take(&mut self.gen_result);
-                        self.show_gen_dialog = false;
-                    }
-                    if ui.button("关闭").clicked() {
-                        self.show_gen_dialog = false;
-                    }
-                });
+                self.show_generator_ui(ui, GenWindow::CredDialog);
             });
         // Closed via the window's X button: drop the generated password.
         if !open {
-            self.gen_result.clear();
-            self.show_gen_dialog = false;
+            self.close_generator(GenWindow::CredDialog);
         }
+    }
+
+    /// 顶栏「工具 → 密码生成器」打开的独立窗口（与凭据对话框内的弹窗共享
+    /// 选项与结果状态，但打开/关闭互不干扰）。
+    fn show_tool_generator(&mut self, ctx: &egui::Context) {
+        if !self.show_tool_gen_window {
+            return;
+        }
+        let mut open = self.show_tool_gen_window;
+        egui::Window::new("密码生成器")
+            .id(egui::Id::new("tool_password_generator"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                self.show_generator_ui(ui, GenWindow::ToolWindow);
+            });
+        // Closed via the window's X button: drop the generated password.
+        if !open {
+            self.close_generator(GenWindow::ToolWindow);
+        }
+    }
+
+    /// 密码生成器共享 UI：长度滑块 8–64（默认 20）、大写/小写/数字固定启用、
+    /// 特殊字符可选、生成 / 复制 / 关闭；仅凭据对话框内额外提供「填入密码框」。
+    fn show_generator_ui(&mut self, ui: &mut egui::Ui, window: GenWindow) {
+        ui.add(egui::Slider::new(&mut self.gen_opts.length, 8..=64).text("长度"));
+        // upper/lower/digits 固定启用（生成器要求至少一类字符）。
+        let mut fixed_upper = true;
+        ui.add_enabled(
+            false,
+            egui::Checkbox::new(&mut fixed_upper, "大写字母（固定启用）"),
+        );
+        let mut fixed_lower = true;
+        ui.add_enabled(
+            false,
+            egui::Checkbox::new(&mut fixed_lower, "小写字母（固定启用）"),
+        );
+        let mut fixed_digits = true;
+        ui.add_enabled(
+            false,
+            egui::Checkbox::new(&mut fixed_digits, "数字（固定启用）"),
+        );
+        ui.checkbox(&mut self.gen_opts.special, "特殊字符");
+        if ui.button("生成").clicked() {
+            self.generate_password();
+        }
+        ui.add_sized(
+            [DIALOG_FIELD_WIDTH, 22.0],
+            egui::TextEdit::singleline(&mut self.gen_result)
+                .password(true)
+                .hint_text("（点击「生成」后显示在此，掩码显示）"),
+        );
+        if let Some(err) = &self.gen_error {
+            ui.add_space(6.0);
+            ui.colored_label(egui::Color32::RED, err);
+        }
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let has_result = !self.gen_result.is_empty();
+            if ui.add_enabled(has_result, egui::Button::new("复制")).clicked() {
+                ui.ctx().copy_text(self.gen_result.clone());
+            }
+            if window == GenWindow::CredDialog
+                && ui
+                    .add_enabled(has_result, egui::Button::new("填入密码框"))
+                    .clicked()
+            {
+                self.cred_pass = std::mem::take(&mut self.gen_result);
+                self.close_generator(window);
+            }
+            if ui.button("关闭").clicked() {
+                self.close_generator(window);
+            }
+        });
     }
 
     /// 生成按钮：`password::generate`，结果只保存在内存中。
