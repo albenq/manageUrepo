@@ -687,12 +687,6 @@ impl GitPmApp {
 
     fn show_main(&mut self, ctx: &egui::Context) {
         self.drain_results();
-        // While a git call runs on a worker thread, keep waking the UI to
-        // animate the progress bar and poll the result channel.
-        if self.busy.is_some() || self.selected.is_some_and(|id| self.status_inflight.contains(&id))
-        {
-            ctx.request_repaint_after(std::time::Duration::from_millis(BUSY_REPAINT_MS));
-        }
         self.show_top_bar(ctx);
         self.show_project_list(ctx);
         self.sync_status_for_selection();
@@ -723,6 +717,16 @@ impl GitPmApp {
         self.show_cred_dialog(ctx);
         self.show_gen_dialog(ctx);
         self.show_tool_generator(ctx);
+        // While a git call runs on a worker thread, keep waking the UI to
+        // animate the progress bar and poll the result channel. Any in-flight
+        // status batch counts, not just the selected project's, and the check
+        // runs at the END of the frame: spawns happen mid-frame (selection
+        // change,「刷新」button, post-operation refresh), and the「加载中」
+        // bar is gone as soon as the first segment lands, so only this
+        // condition reliably keeps frames alive until the batch completes.
+        if self.busy.is_some() || !self.status_inflight.is_empty() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(BUSY_REPAINT_MS));
+        }
     }
 
     fn show_top_bar(&mut self, ctx: &egui::Context) {
@@ -1331,7 +1335,15 @@ impl GitPmApp {
     /// cache successful output, log + display it when the project is selected.
     fn apply_status_part(&mut self, result: GitResult, part: StatusPart) {
         let project_id = result.project_id;
-        self.status_inflight.remove(&project_id);
+        // The in-flight guard stays closed until the batch's last segment
+        // (TagList, always sent last by the worker) lands: clearing it on the
+        // first message would end the batch-driven repaints right after the
+        // status text fills in, leaving BranchList/TagList stuck in the
+        // channel until the next user input. It also keeps the duplicate-
+        // spawn guard closed for the whole batch.
+        if matches!(part, StatusPart::Tags) {
+            self.status_inflight.remove(&project_id);
+        }
         let label = match part {
             StatusPart::Status => LABEL_STATUS,
             StatusPart::Branches => LABEL_BRANCHES,
