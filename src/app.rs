@@ -17,6 +17,13 @@ use crate::password::{self, GenOptions};
 /// `meta` key that marks an initialized vault (written by `crypto::setup_master`).
 const VERIFIER_KEY: &str = "verifier";
 
+/// `meta` key storing the persisted UI theme.
+const THEME_KEY: &str = "theme";
+
+/// Bytes stored under `meta[THEME_KEY]` for the light theme. Anything else
+/// (missing key, other value, read failure) falls back to the dark default.
+const THEME_LIGHT: &[u8] = b"light";
+
 /// Local database, created next to the program's working directory.
 const DB_PATH: &str = "gitpm.db";
 
@@ -187,11 +194,20 @@ pub enum Phase {
     Main,
 }
 
+/// UI theme, persisted in the meta table under [`THEME_KEY`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Theme {
+    Dark,
+    Light,
+}
+
 pub struct GitPmApp {
     conn: Option<rusqlite::Connection>,
     /// Root cause captured when `gitpm.db` could not be opened.
     open_error: Option<String>,
     phase: Phase,
+    /// UI theme, restored from the meta table at startup.
+    theme: Theme,
     error: Option<String>,
 
     setup_pw1: String,
@@ -248,6 +264,7 @@ impl GitPmApp {
             conn: None,
             open_error: None,
             phase: Phase::Setup,
+            theme: Theme::Dark,
             error: None,
             setup_pw1: String::new(),
             setup_pw2: String::new(),
@@ -290,6 +307,22 @@ impl GitPmApp {
                         // an existing vault and the error is shown there.
                         app.phase = Phase::Setup;
                         app.error = Some(format!("读取保险库状态失败：{e}"));
+                    }
+                }
+                // Persisted theme preference: `light` wins, everything else
+                // (missing key or read failure) keeps the dark default.
+                match db::get_meta(&conn, THEME_KEY) {
+                    Ok(Some(value)) => {
+                        if value == THEME_LIGHT {
+                            app.theme = Theme::Light;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        // Cosmetic only; keep any more important startup error.
+                        if app.error.is_none() {
+                            app.error = Some(format!("读取主题偏好失败，已回退到暗黑主题：{e}"));
+                        }
                     }
                 }
                 app.conn = Some(conn);
@@ -494,8 +527,59 @@ impl GitPmApp {
                     self.confirm_remove = true;
                     self.error = None;
                 }
+                ui.separator();
+                self.show_menu_bar(ui);
             });
         });
+    }
+
+    /// 顶栏菜单栏（egui::menu::bar）：主题切换（暗黑/明亮）。
+    fn show_menu_bar(&mut self, ui: &mut egui::Ui) {
+        let mut chosen_theme: Option<Theme> = None;
+        egui::menu::bar(ui, |ui| {
+            ui.menu_button("主题", |ui| {
+                if ui.button("暗黑").clicked() {
+                    chosen_theme = Some(Theme::Dark);
+                }
+                if ui.button("明亮").clicked() {
+                    chosen_theme = Some(Theme::Light);
+                }
+            });
+        });
+        if let Some(theme) = chosen_theme {
+            self.switch_theme(ui.ctx(), theme);
+        }
+    }
+
+    /// 切换主题：立即生效，并尽力写入 meta 表持久化；写失败仅记入日志区，
+    /// 不影响本次切换。
+    fn switch_theme(&mut self, ctx: &egui::Context, theme: Theme) {
+        self.theme = theme;
+        ctx.set_visuals(match theme {
+            Theme::Dark => egui::Visuals::dark(),
+            Theme::Light => egui::Visuals::light(),
+        });
+        let Some(conn) = self.conn.as_ref() else {
+            self.log_theme_save_error("数据库未打开");
+            return;
+        };
+        let value: &[u8] = match theme {
+            Theme::Dark => b"dark",
+            Theme::Light => THEME_LIGHT,
+        };
+        if let Err(e) = db::set_meta(conn, THEME_KEY, value) {
+            self.log_theme_save_error(&e.to_string());
+        }
+    }
+
+    /// 主题偏好写库失败：仅在底部日志区提示一条失败记录。
+    fn log_theme_save_error(&mut self, text: &str) {
+        self.log.push(LogEntry {
+            ok: false,
+            title: "主题偏好保存失败".to_string(),
+            text: text.to_string(),
+        });
+        self.trim_log();
     }
 
     fn show_project_list(&mut self, ctx: &egui::Context) {
@@ -1491,6 +1575,18 @@ impl GitPmApp {
 
     // --------------------------------------------------------------- shared
 
+    /// Apply the persisted theme every frame; a cheap no-op once applied, and
+    /// it re-asserts the choice if anything else resets the style.
+    fn apply_theme(&self, ctx: &egui::Context) {
+        let visuals = match self.theme {
+            Theme::Dark => egui::Visuals::dark(),
+            Theme::Light => egui::Visuals::light(),
+        };
+        if ctx.style().visuals != visuals {
+            ctx.set_visuals(visuals);
+        }
+    }
+
     fn show_error(&self, ui: &mut egui::Ui) {
         if let Some(err) = &self.error {
             ui.add_space(8.0);
@@ -1507,6 +1603,7 @@ impl Default for GitPmApp {
 
 impl eframe::App for GitPmApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.apply_theme(ctx);
         match self.phase {
             Phase::Setup => self.show_setup(ctx),
             Phase::Unlock => self.show_unlock(ctx),

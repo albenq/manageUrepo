@@ -142,7 +142,6 @@ pub fn get_meta(conn: &Connection, key: &str) -> rusqlite::Result<Option<Vec<u8>
 }
 
 /// Insert or replace the raw blob stored under `key` in the `meta` table.
-#[allow(dead_code)] // interface required by the plan; first wired up in Task 9/10
 pub fn set_meta(conn: &Connection, key: &str, value: &[u8]) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
