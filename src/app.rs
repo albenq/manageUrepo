@@ -744,6 +744,116 @@ fn status_legend_text(status: FileStatus) -> &'static str {
     }
 }
 
+// ------------------------------------------------- project tree grouping
+//
+// 左侧项目树的纯分组逻辑（只依赖 std，不依赖 egui）：项目按父目录归组，
+// 互为祖先链的父目录合并为同一节点；不同盘符等无公共层级的各自成节点。
+// 单元测试见文件末尾 tests 模块。
+
+/// 项目树的一个分组节点：共享同一（合并后）父目录的项目集合。
+struct ProjectGroup {
+    /// 节点标题：根父目录的原始拼写（该 key 首次出现时的写法）；
+    /// 无法推导父目录的项目共用「(未分组)」节点。
+    label: String,
+    /// 排序与折叠态记忆键：规范化后的父目录（Windows 模式下小写并把
+    /// `/` 统一为 `\`）。
+    key: String,
+    /// 成员项目在调用方列表中的下标，保持输入顺序。
+    members: Vec<usize>,
+}
+
+/// 项目路径 → 父目录分组 key；返回 None 表示无法归组（空路径、纯根路径、
+/// 单段相对路径等推导不出父目录的情形）。
+///
+/// `case_insensitive`（调用方传 `cfg!(windows)`）：Windows 路径大小写
+/// 不敏感，且 `/` 与 `\` 视为同一分隔符；POSIX 路径保持原样比较。
+fn parent_group_key(path: &str, case_insensitive: bool) -> Option<String> {
+    let parent = Path::new(path).parent()?;
+    let text = parent.to_string_lossy();
+    if text.is_empty() {
+        return None;
+    }
+    Some(if case_insensitive {
+        text.to_lowercase().replace('/', "\\")
+    } else {
+        text.to_string()
+    })
+}
+
+/// 路径的组件数（祖先链合并时用于选取最短前缀）。
+fn path_depth(path: &str) -> usize {
+    Path::new(path).components().count()
+}
+
+/// 项目树分组：key 相同的父目录合并；某父目录是另一父目录的路径前缀
+/// （组件级比较）时合并到最短的祖先节点，标题取祖先目录拼写；无前缀
+/// 关系的（如不同盘符）各自成节点。组按 key 字典序排序，无法归组的
+/// 项目归入单一的「(未分组)」节点排在最后；每个输入下标恰好出现在
+/// 一个组的 `members` 中（顺序与输入一致）。
+fn group_projects_by_parent(paths: &[String], case_insensitive: bool) -> Vec<ProjectGroup> {
+    // 1) 逐项目推导父目录 key；无法推导的进入未分组桶。
+    let mut key_labels: HashMap<String, String> = HashMap::new(); // key → 首现拼写
+    let mut keys: Vec<String> = Vec::new(); // 去重 key，首现顺序
+    let mut member_keys: Vec<Option<String>> = vec![None; paths.len()];
+    let mut ungrouped: Vec<usize> = Vec::new();
+    for (idx, path) in paths.iter().enumerate() {
+        let Some(key) = parent_group_key(path, case_insensitive) else {
+            ungrouped.push(idx);
+            continue;
+        };
+        if !key_labels.contains_key(&key) {
+            let label = Path::new(path)
+                .parent()
+                .unwrap_or(Path::new(""))
+                .to_string_lossy()
+                .into_owned();
+            key_labels.insert(key.clone(), label);
+            keys.push(key.clone());
+        }
+        member_keys[idx] = Some(key);
+    }
+
+    // 2) 祖先链合并：每个 key 归入 key 集内最短的前缀（含自身；过滤结果
+    //    必含自身，unwrap_or 仅防御）。
+    let root_of = |key: &str| -> String {
+        let kpath = Path::new(key);
+        keys.iter()
+            .filter(|other| kpath.starts_with(Path::new(other.as_str())))
+            .min_by_key(|other| path_depth(other.as_str()))
+            .map(String::as_str)
+            .unwrap_or(key)
+            .to_string()
+    };
+
+    // 3) 以根 key 聚合成员（保持输入顺序），组按 key 排序输出。
+    let mut roots: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, key) in member_keys.iter().enumerate() {
+        let Some(key) = key else { continue };
+        roots.entry(root_of(key)).or_default().push(idx);
+    }
+    let mut group_keys: Vec<String> = roots.keys().cloned().collect();
+    group_keys.sort();
+    let mut groups: Vec<ProjectGroup> = group_keys
+        .into_iter()
+        .map(|key| {
+            let members = roots.remove(&key).unwrap_or_default();
+            let label = key_labels
+                .get(&key)
+                .cloned()
+                .unwrap_or_else(|| key.clone());
+            ProjectGroup { label, key, members }
+        })
+        .collect();
+    if !ungrouped.is_empty() {
+        groups.push(ProjectGroup {
+            label: "(未分组)".to_string(),
+            key: String::new(),
+            members: ungrouped,
+        });
+    }
+    groups
+}
+
 /// Which screen the main window currently shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -1302,21 +1412,39 @@ impl GitPmApp {
                         .collect();
                     if rows.is_empty() {
                         ui.label("（暂无项目，点击上方「添加项目…」）");
+                        return;
                     }
-                    for (id, name, path) in rows {
-                        let selected = self.selected == Some(id);
-                        let resp = ui.add_sized(
-                            [ui.available_width(), 22.0],
-                            egui::SelectableLabel::new(selected, name),
-                        );
-                        if resp.clicked() && self.selected != Some(id) {
-                            // 选中项目变化：浏览器重置为新项目的根目录。
-                            self.selected = Some(id);
-                            self.reset_browser_to(Path::new(&path));
-                        }
-                        if !path.is_empty() {
-                            resp.on_hover_text(path);
-                        }
+                    // 树状分组：按父目录归组（祖先链合并），组节点默认展开，
+                    // 折叠态用 egui::Id（按规范化路径 key）在会话内记忆。
+                    let paths: Vec<String> =
+                        rows.iter().map(|(_, _, path)| path.clone()).collect();
+                    let groups = group_projects_by_parent(&paths, cfg!(windows));
+                    for group in groups {
+                        let member_rows: Vec<(i64, String, String)> = group
+                            .members
+                            .iter()
+                            .map(|&idx| rows[idx].clone())
+                            .collect();
+                        egui::CollapsingHeader::new(group.label.as_str())
+                            .id_source(egui::Id::new(("project_tree_group", group.key)))
+                            .default_open(true)
+                            .show(ui, |ui| {
+                                for (id, name, path) in member_rows {
+                                    let selected = self.selected == Some(id);
+                                    let resp = ui.add_sized(
+                                        [ui.available_width(), 22.0],
+                                        egui::SelectableLabel::new(selected, name),
+                                    );
+                                    if resp.clicked() && self.selected != Some(id) {
+                                        // 选中项目变化：浏览器重置为新项目的根目录。
+                                        self.selected = Some(id);
+                                        self.reset_browser_to(Path::new(&path));
+                                    }
+                                    if !path.is_empty() {
+                                        resp.on_hover_text(path);
+                                    }
+                                }
+                            });
                     }
                 });
         });
@@ -3463,6 +3591,150 @@ mod tests {
         );
         assert!(!scrubbed.stdout.contains("s3cret"));
         assert!(!scrubbed.stderr.contains("s3cret"));
+    }
+
+    // ------------------------------------------------ project tree grouping
+
+    fn paths(value: &[&str]) -> Vec<String> {
+        value.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn group_same_parent_into_one_node() {
+        // 分组正确：同一父目录下的项目归入同一节点，成员保持输入顺序。
+        let groups = group_projects_by_parent(
+            &paths(&["E:\\ws\\a\\repo1", "E:\\ws\\a\\repo2", "E:\\ws\\a\\repo3"]),
+            true,
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].label, "E:\\ws\\a");
+        assert_eq!(groups[0].members, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn group_merges_ancestor_chain_parents() {
+        // 前缀合并：互为祖先链的父目录合并为同一节点（标题取最短祖先）。
+        let groups = group_projects_by_parent(
+            &paths(&["E:\\ws\\deep\\nest\\repo", "E:\\ws\\other\\repo2", "E:\\ws\\top"]),
+            true,
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].label, "E:\\ws");
+        assert_eq!(groups[0].members, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn group_keeps_unrelated_parents_separate() {
+        // 无前缀关系的兄弟父目录不合并，各自成节点；组按 key 排序。
+        let groups = group_projects_by_parent(
+            &paths(&["E:\\ws\\beta\\r2", "E:\\ws\\alpha\\r1"]),
+            true,
+        );
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].label, "E:\\ws\\alpha");
+        assert_eq!(groups[0].members, vec![1]);
+        assert_eq!(groups[1].label, "E:\\ws\\beta");
+        assert_eq!(groups[1].members, vec![0]);
+    }
+
+    #[test]
+    fn group_different_drives_form_separate_nodes() {
+        // 不同盘符无法归组：按根各成节点。
+        let groups =
+            group_projects_by_parent(&paths(&["C:\\data\\r1", "D:\\stuff\\r2"]), true);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].label, "C:\\data");
+        assert_eq!(groups[1].label, "D:\\stuff");
+    }
+
+    #[test]
+    fn group_mixed_realistic_layout() {
+        // 真实布局：同盘不同父目录各自成节点，深层项目并入存在的祖先节点。
+        let groups = group_projects_by_parent(
+            &paths(&[
+                "E:\\Workspace\\opencode\\git-gui",
+                "E:\\Workspace\\opencode\\tools\\deploy",
+                "E:\\Workspace\\rust\\cargo-scan",
+                "C:\\Users\\me\\notes",
+            ]),
+            true,
+        );
+        assert_eq!(groups.len(), 3);
+        assert_eq!(groups[0].label, "C:\\Users\\me");
+        assert_eq!(groups[0].members, vec![3]);
+        assert_eq!(groups[1].label, "E:\\Workspace\\opencode");
+        assert_eq!(groups[1].members, vec![0, 1]);
+        assert_eq!(groups[2].label, "E:\\Workspace\\rust");
+        assert_eq!(groups[2].members, vec![2]);
+    }
+
+    #[test]
+    fn group_is_case_insensitive_in_windows_mode() {
+        // Windows 路径大小写不敏感：仅大小写不同的父目录合并为同一节点，
+        // 标题取首次出现的拼写。
+        let groups = group_projects_by_parent(
+            &paths(&["E:\\Workspace\\opencode\\r1", "e:\\workspace\\OPENCODE\\r2"]),
+            true,
+        );
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].label, "E:\\Workspace\\opencode");
+        assert_eq!(groups[0].members, vec![0, 1]);
+    }
+
+    #[test]
+    fn group_is_case_sensitive_outside_windows_mode() {
+        // POSIX 模式（case_insensitive=false）：大小写不同的父目录不合并。
+        let groups =
+            group_projects_by_parent(&paths(&["/home/u/Code/r1", "/home/u/code/r2"]), false);
+        assert_eq!(groups.len(), 2);
+    }
+
+    #[test]
+    fn group_normalizes_separators_in_windows_mode() {
+        // Windows 模式下 `/` 与 `\` 视为同一分隔符（克隆产生的路径可能是
+        // 正斜杠），同一目录不因分隔符写法不同而拆成两个节点。
+        let groups = group_projects_by_parent(&paths(&["E:\\ws\\r1", "E:/ws/r2"]), true);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].label, "E:\\ws");
+        assert_eq!(groups[0].members, vec![0, 1]);
+    }
+
+    #[test]
+    fn group_handles_ungroupable_paths() {
+        // 空路径 / 纯根路径 / 单段相对路径推导不出父目录：归入单一的
+        // 「(未分组)」节点（排在最后），其余正常归组。
+        let groups = group_projects_by_parent(
+            &paths(&["", "C:\\", "relative-repo", "E:\\ws\\normal"]),
+            true,
+        );
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].label, "E:\\ws");
+        assert_eq!(groups[0].members, vec![3]);
+        assert_eq!(groups[1].label, "(未分组)");
+        assert_eq!(groups[1].members, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn group_member_indices_cover_every_input_exactly_once() {
+        // 契约：每个输入下标恰好出现在一个组里，且保持输入顺序。
+        let input = paths(&[
+            "E:\\ws\\a\\r1",
+            "D:\\r2",
+            "E:\\ws\\a\\b\\r3",
+            "",
+            "E:\\ws\\a\\r4",
+            "D:\\deep\\r5",
+        ]);
+        let groups = group_projects_by_parent(&input, true);
+        let mut seen: Vec<usize> = groups.iter().flat_map(|g| g.members.iter().copied()).collect();
+        seen.sort();
+        assert_eq!(seen, vec![0, 1, 2, 3, 4, 5]);
+        // 组内顺序与输入一致。
+        for group in &groups {
+            let mut members = group.members.clone();
+            members.sort();
+            assert_eq!(group.members, members);
+        }
     }
 
     // ------------------------------------------------ porcelain parsing
