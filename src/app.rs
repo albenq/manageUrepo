@@ -1553,7 +1553,7 @@ impl GitPmApp {
                             .iter()
                             .map(|&idx| rows[idx].clone())
                             .collect();
-                        let group_title: &str = if group.label == GROUP_UNGROUPED_KEY {
+                        let group_title: &str = if group.key.is_empty() {
                             i18n::t(lang, GROUP_UNGROUPED_KEY)
                         } else {
                             group.label.as_str()
