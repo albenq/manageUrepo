@@ -1640,6 +1640,9 @@ impl GitPmApp {
         let row_h = ui.spacing().interact_size.y;
         let mut toggle = false;
         ui.horizontal(|ui| {
+            // 精确对齐：本行内去掉控件间距，目录名的 x 恒为 indent + 2 个字符
+            // 宽（箭头槽），与子层项目名的起点一致。
+            ui.spacing_mut().item_spacing.x = 0.0;
             ui.add_space(indent);
             let (rect, arrow_resp) =
                 ui.allocate_exact_size(egui::vec2(2.0 * char_w, row_h), egui::Sense::click());
@@ -1672,20 +1675,45 @@ impl GitPmApp {
         for &idx in &node.projects {
             let (id, name, path) = &rows[idx];
             let selected = self.selected == Some(*id);
-            let mut clicked = false;
-            ui.horizontal(|ui| {
+            let clicked = ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
                 ui.add_space(child_indent);
-                let resp = ui.add_sized(
-                    [ui.available_width(), 22.0],
-                    egui::SelectableLabel::new(selected, name.clone()),
+                // 自绘整行（保留整行可点击与选中高亮），文本严格左对齐：
+                // egui 的 add_sized 内部是居中对齐布局，会把项目名画在行中间。
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), 22.0),
+                    egui::Sense::click(),
                 );
-                if resp.clicked() {
-                    clicked = true;
+                if ui.is_rect_visible(rect) {
+                    let visuals = ui.style().interact_selectable(&resp, selected);
+                    if selected || resp.hovered() {
+                        let bg = rect.expand(visuals.expansion);
+                        ui.painter().rect(
+                            bg,
+                            visuals.rounding,
+                            visuals.weak_bg_fill,
+                            visuals.bg_stroke,
+                        );
+                    }
+                    let text_x = rect.left() + ui.spacing().button_padding.x;
+                    let wrap_width =
+                        (rect.right() - ui.spacing().button_padding.x - text_x).max(0.0);
+                    let galley = ui.painter().layout(
+                        name.clone(),
+                        egui::TextStyle::Button.resolve(ui.style()),
+                        visuals.text_color(),
+                        wrap_width,
+                    );
+                    let pos = egui::pos2(text_x, rect.center().y - galley.size().y * 0.5);
+                    ui.painter().galley(pos, galley, visuals.text_color());
                 }
+                let mut resp = resp;
                 if !path.is_empty() {
-                    resp.on_hover_text(path.as_str());
+                    resp = resp.on_hover_text(path.as_str());
                 }
+                resp.clicked()
             });
+            let clicked = clicked.inner;
             if clicked && self.selected != Some(*id) {
                 // 选中项目变化：浏览器重置为新项目的根目录。
                 self.selected = Some(*id);
