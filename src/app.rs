@@ -1,4 +1,5 @@
-//! eframe main window: master-password setup/unlock flow and the project tree.
+//! eframe main window: master-password setup/unlock flow, the project tree,
+//! and the per-project git operations panel.
 //!
 //! This module is UI glue only: it binds the domain modules (`crypto`, `db`,
 //! `git`) to egui widgets. Every fallible call is matched and its error is
@@ -20,6 +21,80 @@ const DB_PATH: &str = "gitpm.db";
 
 /// Width of the centered password inputs on the Setup/Unlock screens.
 const FIELD_WIDTH: f32 = 320.0;
+
+/// Maximum number of entries kept in the bottom output log.
+const LOG_MAX: usize = 200;
+
+/// Remote name used by the Push button (credential injection lands in Task 10).
+const DEFAULT_PUSH_REMOTE: &str = "origin";
+
+/// One rendered git invocation in the bottom read-only output area.
+struct LogEntry {
+    /// False when the call failed (non-zero exit or git could not run).
+    ok: bool,
+    /// Header line: what ran and how it ended.
+    title: String,
+    /// Combined stdout/stderr, or the io error message.
+    text: String,
+}
+
+/// Result of one read-only git query, shown in the right panel's status area.
+struct StatusSection {
+    ok: bool,
+    text: String,
+}
+
+/// Latest snapshot of the three read-only queries for the selected project.
+struct StatusSnapshot {
+    status: Option<StatusSection>,
+    branches: Option<StatusSection>,
+    tags: Option<StatusSection>,
+}
+
+/// Combine the stdout/stderr of a git result into displayable text.
+fn git_output_text(out: &git::GitOutput) -> String {
+    let stdout = out.stdout.trim_end();
+    let stderr = out.stderr.trim_end();
+    let mut text = String::new();
+    if !stdout.is_empty() {
+        text.push_str(stdout);
+    }
+    if !stderr.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(stderr);
+    }
+    if text.is_empty() {
+        text.push_str("（无输出）");
+    }
+    text
+}
+
+/// Convert a finished git call into a status-area section.
+fn status_section(out: &git::GitOutput) -> StatusSection {
+    StatusSection {
+        ok: out.ok(),
+        text: git_output_text(out),
+    }
+}
+
+/// Render one status-area section: plain text on success, red on failure.
+fn show_section(ui: &mut egui::Ui, title: &str, section: Option<&StatusSection>) {
+    ui.add_space(4.0);
+    ui.strong(title);
+    match section {
+        Some(s) if s.ok => {
+            ui.monospace(&s.text);
+        }
+        Some(s) => {
+            ui.colored_label(egui::Color32::RED, &s.text);
+        }
+        None => {
+            ui.label("（尚未加载）");
+        }
+    }
+}
 
 /// Which screen the main window currently shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +125,18 @@ pub struct GitPmApp {
     projects: Vec<Project>,
     selected: Option<i64>,
     confirm_remove: bool,
+
+    // Right panel: per-project git operations.
+    /// Latest status/branch/tag snapshot for the selected project.
+    status: Option<StatusSnapshot>,
+    /// Project id the snapshot belongs to; refreshed on selection change.
+    status_loaded_for: Option<i64>,
+    commit_msg: String,
+    new_branch: String,
+    tag_name: String,
+    tag_msg: String,
+    /// Bottom read-only log, one entry per git invocation.
+    log: Vec<LogEntry>,
 }
 
 impl GitPmApp {
@@ -66,6 +153,13 @@ impl GitPmApp {
             projects: Vec::new(),
             selected: None,
             confirm_remove: false,
+            status: None,
+            status_loaded_for: None,
+            commit_msg: String::new(),
+            new_branch: String::new(),
+            tag_name: String::new(),
+            tag_msg: String::new(),
+            log: Vec::new(),
         };
 
         match db::init_db(Path::new(DB_PATH)) {
@@ -241,6 +335,9 @@ impl GitPmApp {
     fn show_main(&mut self, ctx: &egui::Context) {
         self.show_top_bar(ctx);
         self.show_project_list(ctx);
+        self.sync_status_for_selection();
+        self.show_operations_panel(ctx);
+        self.show_output_area(ctx);
         egui::CentralPanel::default().show(ctx, |ui| {
             match self.selected_project().cloned() {
                 Some(project) => {
@@ -253,9 +350,6 @@ impl GitPmApp {
                     ui.label("从左侧选择一个项目，或点击「添加项目…」将一个 git 仓库加入列表。");
                 }
             }
-            ui.add_space(12.0);
-            ui.separator();
-            ui.label("项目的 git 操作面板将在后续版本提供。");
             self.show_error(ui);
         });
         self.show_remove_confirm(ctx);
@@ -312,6 +406,367 @@ impl GitPmApp {
                     }
                 });
         });
+    }
+
+    // ---------------------------------------------------- project operations
+
+    /// Refresh the status area when the selection changes.
+    fn sync_status_for_selection(&mut self) {
+        if self.selected == self.status_loaded_for {
+            return;
+        }
+        self.status_loaded_for = self.selected;
+        match self.selected {
+            Some(_) => self.refresh_status(),
+            None => self.status = None,
+        }
+    }
+
+    fn show_operations_panel(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::right("operations_panel")
+            .default_width(380.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.heading("操作");
+                ui.separator();
+                if self.selected_project().is_none() {
+                    ui.label("从左侧选择一个项目，即可查看其 git 状态并执行操作。");
+                    return;
+                }
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.show_status_area(ui);
+                        ui.add_space(8.0);
+                        ui.separator();
+                        self.show_commit_area(ui);
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("拉取（pull）").clicked() {
+                                self.do_pull();
+                            }
+                            if ui.button("推送（push）").clicked() {
+                                self.do_push();
+                            }
+                        });
+                        ui.add_space(8.0);
+                        ui.separator();
+                        self.show_branch_area(ui);
+                        ui.add_space(8.0);
+                        self.show_tag_area(ui);
+                    });
+            });
+    }
+
+    /// 状态区：status --porcelain 输出 + 分支列表 + 标签列表。
+    fn show_status_area(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.strong("状态");
+            if ui.button("刷新").clicked() {
+                self.refresh_status();
+            }
+        });
+        let Some(snapshot) = self.status.as_ref() else {
+            ui.label("（尚未加载）");
+            return;
+        };
+        show_section(ui, "工作区（status）", snapshot.status.as_ref());
+        show_section(ui, "分支（branch）", snapshot.branches.as_ref());
+        show_section(ui, "标签（tag）", snapshot.tags.as_ref());
+    }
+
+    /// Commit 消息输入框 + Commit 按钮（空消息禁用）。
+    fn show_commit_area(&mut self, ui: &mut egui::Ui) {
+        ui.strong("提交（commit）");
+        ui.add_sized(
+            [ui.available_width(), 22.0],
+            egui::TextEdit::singleline(&mut self.commit_msg).hint_text("提交信息（必填）"),
+        );
+        let can_commit = !self.commit_msg.trim().is_empty();
+        if ui
+            .add_enabled(can_commit, egui::Button::new("提交"))
+            .clicked()
+        {
+            self.do_commit();
+        }
+    }
+
+    /// “新建分支”：名称输入 → create_branch + checkout。
+    fn show_branch_area(&mut self, ui: &mut egui::Ui) {
+        ui.strong("新建分支");
+        ui.add_sized(
+            [ui.available_width(), 22.0],
+            egui::TextEdit::singleline(&mut self.new_branch).hint_text("分支名称（必填）"),
+        );
+        let can_create = !self.new_branch.trim().is_empty();
+        if ui
+            .add_enabled(can_create, egui::Button::new("创建并切换"))
+            .clicked()
+        {
+            self.do_new_branch();
+        }
+    }
+
+    /// “打 tag”：名称 + 可选 message → create_tag。
+    fn show_tag_area(&mut self, ui: &mut egui::Ui) {
+        ui.strong("打标签（tag）");
+        ui.add_sized(
+            [ui.available_width(), 22.0],
+            egui::TextEdit::singleline(&mut self.tag_name).hint_text("标签名称（必填）"),
+        );
+        ui.add_sized(
+            [ui.available_width(), 22.0],
+            egui::TextEdit::singleline(&mut self.tag_msg)
+                .hint_text("标签说明（可选；填写则创建附注标签）"),
+        );
+        let can_tag = !self.tag_name.trim().is_empty();
+        if ui.add_enabled(can_tag, egui::Button::new("打标签")).clicked() {
+            self.do_tag();
+        }
+    }
+
+    /// 底部只读输出区：每次 git 调用一条记录，失败为红色。
+    fn show_output_area(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("output_area")
+            .default_height(180.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.heading("输出");
+                    if ui.button("清空").clicked() {
+                        self.log.clear();
+                    }
+                });
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        if self.log.is_empty() {
+                            ui.label("（暂无输出：对项目执行 git 操作后，结果会显示在这里）");
+                        }
+                        for entry in &self.log {
+                            let color = if entry.ok {
+                                egui::Color32::LIGHT_GREEN
+                            } else {
+                                egui::Color32::RED
+                            };
+                            ui.colored_label(color, &entry.title);
+                            ui.monospace(&entry.text);
+                            ui.add_space(6.0);
+                        }
+                    });
+            });
+    }
+
+    // -------------------------------------------------- git operation handlers
+
+    /// Append a finished git invocation to the bottom output log.
+    fn log_git_output(&mut self, label: &str, out: &git::GitOutput) {
+        self.log.push(LogEntry {
+            ok: out.ok(),
+            title: format!("{label}（退出码 {}）", out.code),
+            text: git_output_text(out),
+        });
+        self.trim_log();
+    }
+
+    /// Append a failed-to-run entry (git could not be spawned / cwd missing).
+    fn log_git_error(&mut self, label: &str, err: &std::io::Error) {
+        self.log.push(LogEntry {
+            ok: false,
+            title: format!("{label}（执行失败）"),
+            text: format!("无法运行 git：{err}"),
+        });
+        self.trim_log();
+    }
+
+    fn trim_log(&mut self) {
+        if self.log.len() > LOG_MAX {
+            let excess = self.log.len() - LOG_MAX;
+            self.log.drain(0..excess);
+        }
+    }
+
+    /// Run one read-only query, log its result, and return the section to show.
+    fn run_readonly(
+        &mut self,
+        label: &str,
+        result: std::io::Result<git::GitOutput>,
+    ) -> StatusSection {
+        match result {
+            Ok(out) => {
+                self.log_git_output(label, &out);
+                status_section(&out)
+            }
+            Err(e) => {
+                self.log_git_error(label, &e);
+                StatusSection {
+                    ok: false,
+                    text: format!("无法运行 git：{e}"),
+                }
+            }
+        }
+    }
+
+    /// Re-run the three read-only queries for the selected project.
+    fn refresh_status(&mut self) {
+        let Some(project) = self.selected_project().cloned() else {
+            return;
+        };
+        let path = Path::new(&project.path);
+        let snapshot = StatusSnapshot {
+            status: Some(self.run_readonly(
+                "git status --porcelain=v1 -b",
+                git::status_porcelain(path),
+            )),
+            branches: Some(self.run_readonly(
+                "git branch --format=%(refname:short)",
+                git::branch_list(path),
+            )),
+            tags: Some(self.run_readonly("git tag --list", git::tag_list(path))),
+        };
+        self.status = Some(snapshot);
+    }
+
+    /// Commit 按钮：`commit_all`，成功后清空输入并刷新状态区。
+    fn do_commit(&mut self) {
+        let Some(project) = self.selected_project().cloned() else {
+            return;
+        };
+        let message = self.commit_msg.trim().to_string();
+        if message.is_empty() {
+            return; // the button is disabled; defensive only
+        }
+        let label = format!("git add -A + git commit -m {message}");
+        match git::commit_all(Path::new(&project.path), &message) {
+            Ok(out) => {
+                self.log_git_output(&label, &out);
+                if out.ok() {
+                    self.commit_msg.clear();
+                }
+            }
+            Err(e) => self.log_git_error(&label, &e),
+        }
+        self.refresh_status();
+    }
+
+    /// Pull 按钮：`git pull`，随后刷新状态区。
+    fn do_pull(&mut self) {
+        let Some(project) = self.selected_project().cloned() else {
+            return;
+        };
+        match git::pull(Path::new(&project.path)) {
+            Ok(out) => self.log_git_output("git pull", &out),
+            Err(e) => self.log_git_error("git pull", &e),
+        }
+        self.refresh_status();
+    }
+
+    /// Push 按钮：先取当前分支，再推送到 origin（凭据注入见 Task 10）。
+    fn do_push(&mut self) {
+        let Some(project) = self.selected_project().cloned() else {
+            return;
+        };
+        let path = Path::new(&project.path);
+        const HEAD_LABEL: &str = "git rev-parse --abbrev-ref HEAD";
+        let branch = match git::run(path, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+            Ok(out) => {
+                self.log_git_output(HEAD_LABEL, &out);
+                if !out.ok() {
+                    return; // e.g. unborn branch; the stderr is already logged
+                }
+                out.stdout.trim().to_string()
+            }
+            Err(e) => {
+                self.log_git_error(HEAD_LABEL, &e);
+                return;
+            }
+        };
+        if branch.is_empty() {
+            self.log.push(LogEntry {
+                ok: false,
+                title: "git push".to_string(),
+                text: "无法确定当前分支：rev-parse 输出为空".to_string(),
+            });
+            self.trim_log();
+            return;
+        }
+        let label = format!("git push {DEFAULT_PUSH_REMOTE} {branch}");
+        match git::push(path, DEFAULT_PUSH_REMOTE, &branch) {
+            Ok(out) => self.log_git_output(&label, &out),
+            Err(e) => self.log_git_error(&label, &e),
+        }
+    }
+
+    /// “新建分支”：`create_branch` 成功后 `checkout`，随后刷新状态区。
+    fn do_new_branch(&mut self) {
+        let Some(project) = self.selected_project().cloned() else {
+            return;
+        };
+        let name = self.new_branch.trim().to_string();
+        if name.is_empty() {
+            return; // the button is disabled; defensive only
+        }
+        let path = Path::new(&project.path);
+        let create_label = format!("git branch {name}");
+        let created = match git::create_branch(path, &name) {
+            Ok(out) => {
+                self.log_git_output(&create_label, &out);
+                out.ok()
+            }
+            Err(e) => {
+                self.log_git_error(&create_label, &e);
+                false
+            }
+        };
+        if !created {
+            return;
+        }
+        let checkout_label = format!("git checkout {name}");
+        match git::checkout(path, &name) {
+            Ok(out) => {
+                self.log_git_output(&checkout_label, &out);
+                if out.ok() {
+                    self.new_branch.clear();
+                }
+            }
+            Err(e) => self.log_git_error(&checkout_label, &e),
+        }
+        self.refresh_status();
+    }
+
+    /// “打 tag”：有 message 则附注标签，否则轻量标签，随后刷新状态区。
+    fn do_tag(&mut self) {
+        let Some(project) = self.selected_project().cloned() else {
+            return;
+        };
+        let name = self.tag_name.trim().to_string();
+        if name.is_empty() {
+            return; // the button is disabled; defensive only
+        }
+        let trimmed_msg = self.tag_msg.trim();
+        let message = if trimmed_msg.is_empty() {
+            None
+        } else {
+            Some(trimmed_msg.to_string())
+        };
+        let label = if message.is_some() {
+            format!("git tag -a {name} -m <说明>")
+        } else {
+            format!("git tag {name}")
+        };
+        match git::create_tag(Path::new(&project.path), &name, message.as_deref()) {
+            Ok(out) => {
+                self.log_git_output(&label, &out);
+                if out.ok() {
+                    self.tag_name.clear();
+                    self.tag_msg.clear();
+                }
+            }
+            Err(e) => self.log_git_error(&label, &e),
+        }
+        self.refresh_status();
     }
 
     fn show_remove_confirm(&mut self, ctx: &egui::Context) {
