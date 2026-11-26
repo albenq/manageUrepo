@@ -110,6 +110,118 @@ pub fn create_tag(dir: &Path, name: &str, message: Option<&str>) -> std::io::Res
     }
 }
 
+/// One commit as shown in the history view.
+///
+/// `hash` is the full 40-character SHA-1; `date` is formatted
+/// "YYYY-MM-DD HH:MM".
+// Consumed by the history UI in a later task; unused until then.
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitInfo {
+    pub hash: String,
+    pub author: String,
+    pub date: String,
+    pub subject: String,
+}
+
+/// List configured remotes (`git remote`), one name per entry.
+///
+/// A repository with no remotes yields an empty vector, not an error.
+// Consumed by the remotes UI in a later task; unused until then.
+#[allow(dead_code)]
+pub fn remote_list(repo: &Path) -> Result<Vec<String>, String> {
+    let out = run(repo, &["remote"]).map_err(|e| e.to_string())?;
+    if !out.ok() {
+        return Err(format!("git remote failed: {}", out.stderr));
+    }
+    Ok(out
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect())
+}
+
+/// Field separator used by the `log_recent` `--pretty` format (ASCII unit
+/// separator, emitted by git's `%x1f` placeholder).
+// Consumed by the history UI in a later task; unused until then.
+#[allow(dead_code)]
+const LOG_FIELD_SEP: char = '\u{1f}';
+
+/// The newest commits of the current branch, newest first.
+///
+/// `skip` pages past the newest commits and `limit` caps the page size. An
+/// empty history (no commits yet) yields an empty vector, not an error.
+///
+/// Note: `--max-count` is used instead of the equivalent short `-n` because
+/// git parses `-n=<limit>` as the count `0` (strtol over the leading `=`),
+/// silently returning nothing.
+// Consumed by the history UI in a later task; unused until then.
+#[allow(dead_code)]
+pub fn log_recent(repo: &Path, skip: usize, limit: usize) -> Result<Vec<CommitInfo>, String> {
+    let skip_arg = format!("--skip={skip}");
+    let limit_arg = format!("--max-count={limit}");
+    let out = run(
+        repo,
+        &[
+            "log",
+            skip_arg.as_str(),
+            limit_arg.as_str(),
+            "--date=format:%Y-%m-%d %H:%M",
+            "--pretty=%H%x1f%an%x1f%ad%x1f%s",
+        ],
+    )
+    .map_err(|e| e.to_string())?;
+    if !out.ok() {
+        // `git log` fails on an unborn HEAD (no commits yet); report that as
+        // an empty log. `rev-parse --verify --quiet HEAD` exits 1 exactly
+        // when HEAD does not resolve, while other failures (not a
+        // repository: 128, spawn errors) surface as Err here.
+        let probe = run(repo, &["rev-parse", "--verify", "--quiet", "HEAD"])
+            .map_err(|e| e.to_string())?;
+        if probe.code == 1 {
+            return Ok(Vec::new());
+        }
+        return Err(format!("git log failed: {}", out.stderr));
+    }
+    Ok(parse_commit_lines(&out.stdout))
+}
+
+/// Parse `git log --pretty=%H%x1f%an%x1f%ad%x1f%s` output.
+///
+/// A record starts when a line yields four `\x1f`-separated fields with a
+/// 40-character hex hash first; any other line is treated as a continuation
+/// of the previous subject, keeping the parser safe against line breaks.
+#[allow(dead_code)]
+fn parse_commit_lines(stdout: &str) -> Vec<CommitInfo> {
+    let mut commits = Vec::new();
+    for line in stdout.lines() {
+        let mut fields = line.splitn(4, LOG_FIELD_SEP);
+        match (fields.next(), fields.next(), fields.next(), fields.next()) {
+            (Some(hash), Some(author), Some(date), Some(subject))
+                if hash.len() == 40 && hash.bytes().all(|b| b.is_ascii_hexdigit()) =>
+            {
+                commits.push(CommitInfo {
+                    hash: hash.to_string(),
+                    author: author.to_string(),
+                    date: date.to_string(),
+                    subject: subject.to_string(),
+                });
+            }
+            _ => {
+                if let Some(last) = commits.last_mut() {
+                    if !last.subject.is_empty() {
+                        last.subject.push(' ');
+                    }
+                    last.subject.push_str(line);
+                }
+            }
+        }
+    }
+    commits
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,5 +391,97 @@ mod tests {
         let t2 = run(&repo, &["cat-file", "-t", "v2"]).expect("cat-file v2");
         assert!(t2.ok(), "cat-file v2 failed: {}", t2.stderr);
         assert_eq!(t2.stdout.trim(), "commit", "v2 should point directly at a commit");
+    }
+
+    /// Create a git repository in a tempdir with no commits (unborn HEAD).
+    fn temp_repo_unborn() -> (tempfile::TempDir, PathBuf) {
+        let guard = tempfile::tempdir().expect("create tempdir");
+        let repo = guard.path().to_path_buf();
+        let init = run(&repo, &["init"]).expect("git init in tempdir");
+        assert!(init.ok(), "git init failed: {}", init.stderr);
+        (guard, repo)
+    }
+
+    /// temp_repo plus a second, empty commit by a different author.
+    fn temp_repo_two_commits() -> (tempfile::TempDir, PathBuf) {
+        let (guard, repo) = temp_repo();
+        let second = run(
+            &repo,
+            &[
+                "commit",
+                "--allow-empty",
+                "--author=Alice <alice@example.com>",
+                "-m",
+                "second commit",
+            ],
+        )
+        .expect("second commit in tempdir");
+        assert!(second.ok(), "second commit failed: {}", second.stderr);
+        (guard, repo)
+    }
+
+    /// Assert that `date` looks like "YYYY-MM-DD HH:MM".
+    fn assert_date_format(date: &str) {
+        assert_eq!(date.len(), 16, "date must be 16 chars: {date:?}");
+        let b = date.as_bytes();
+        for idx in [0usize, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15] {
+            assert!(b[idx].is_ascii_digit(), "non-digit at {idx} in {date:?}");
+        }
+        assert_eq!(b[4], b'-', "expected dash at index 4 in {date:?}");
+        assert_eq!(b[7], b'-', "expected dash at index 7 in {date:?}");
+        assert_eq!(b[10], b' ', "expected space at index 10 in {date:?}");
+        assert_eq!(b[13], b':', "expected colon at index 13 in {date:?}");
+    }
+
+    #[test]
+    fn remote_list_empty_repo_is_ok() {
+        let (_guard, repo) = temp_repo_unborn();
+        let remotes = remote_list(&repo).expect("remote_list on a repo without remotes");
+        assert!(remotes.is_empty(), "expected no remotes: {remotes:?}");
+    }
+
+    #[test]
+    fn log_recent_parses_fields_in_order() {
+        let (_guard, repo) = temp_repo_two_commits();
+        let commits = log_recent(&repo, 0, 10).expect("log_recent");
+        assert_eq!(commits.len(), 2, "expected two commits: {commits:?}");
+        let newest = &commits[0];
+        let oldest = &commits[1];
+
+        // Newest first: HEAD's commit must come first, verbatim.
+        let head = run(&repo, &["rev-parse", "HEAD"]).expect("rev-parse HEAD");
+        assert!(head.ok(), "rev-parse HEAD failed: {}", head.stderr);
+        assert_eq!(newest.hash, head.stdout.trim(), "newest commit should be HEAD");
+        assert_eq!(newest.hash.len(), 40, "hash must be the full 40-char SHA-1");
+        assert!(
+            newest.hash.bytes().all(|b| b.is_ascii_hexdigit()),
+            "hash must be hex: {}",
+            newest.hash
+        );
+        assert_eq!(newest.author, "Alice");
+        assert_date_format(&newest.date);
+        assert_eq!(newest.subject, "second commit");
+
+        assert_eq!(oldest.author, "t");
+        assert_eq!(oldest.hash.len(), 40, "hash must be the full 40-char SHA-1");
+        assert_date_format(&oldest.date);
+        assert_eq!(oldest.subject, "init");
+        assert_ne!(newest.hash, oldest.hash, "the two commits must differ");
+    }
+
+    #[test]
+    fn log_recent_skip_pages() {
+        let (_guard, repo) = temp_repo_two_commits();
+        let page = log_recent(&repo, 1, 1).expect("log_recent with skip");
+        assert_eq!(page.len(), 1, "skip=1 limit=1 should return exactly one commit");
+        assert_eq!(page[0].subject, "init", "skip=1 should return the older commit");
+        assert_eq!(page[0].author, "t");
+    }
+
+    #[test]
+    fn log_recent_empty_history_is_ok() {
+        let (_guard, repo) = temp_repo_unborn();
+        let commits = log_recent(&repo, 0, 10).expect("log_recent on empty history");
+        assert!(commits.is_empty(), "expected no commits: {commits:?}");
     }
 }
