@@ -17,6 +17,35 @@ use crate::db::{self, Project};
 use crate::git;
 use crate::password::{self, GenOptions};
 
+/// egui 0.28 does not ship the `egui::icons::ICON_*` constants (the module
+/// was added in later egui releases; verified against the vendored 0.28.1
+/// source, which has no `icons` module). These local constants mirror the
+/// upstream naming so upgrading is a mechanical substitution. Glyphs are
+/// Unicode symbols rendered by the bundled NotoEmoji-Regular font or the CJK
+/// fallback loaded in `main.rs`.
+mod icons {
+    /// 添加项目
+    pub const ICON_ADD: &str = "＋";
+    /// 移除项目
+    pub const ICON_REMOVE: &str = "➖";
+    /// 克隆仓库
+    pub const ICON_CLONE: &str = "📥";
+    /// 刷新状态
+    pub const ICON_REFRESH: &str = "🔄";
+    /// 提交（commit）
+    pub const ICON_COMMIT: &str = "💾";
+    /// 拉取（pull）
+    pub const ICON_PULL: &str = "⬇";
+    /// 推送（push）
+    pub const ICON_PUSH: &str = "⬆";
+    /// 凭据
+    pub const ICON_KEY: &str = "🔑";
+    /// 新建分支
+    pub const ICON_BRANCH: &str = "🌿";
+    /// 打标签
+    pub const ICON_TAG: &str = "🏷";
+}
+
 /// `meta` key that marks an initialized vault (written by `crypto::setup_master`).
 const VERIFIER_KEY: &str = "verifier";
 
@@ -439,11 +468,21 @@ pub struct GitPmApp {
     /// Error shown inside the credential dialog.
     cred_error: Option<String>,
 
+    // Master-password change dialog (菜单「设置 → 修改主密码」).
+    show_pw_change: bool,
+    pw_old: String,
+    pw_new: String,
+    pw_new2: String,
+    /// Error shown inside the master-password change dialog.
+    pw_error: Option<String>,
+
     // Password generator dialogs (one from the credential dialog, one
     // standalone from the top-bar「工具」menu), sharing options and result.
     show_gen_dialog: bool,
     show_tool_gen_window: bool,
     gen_opts: GenOptions,
+    /// `false` = 明文显示生成结果（默认，可选中复制）；`true` = 用 `•` 遮蔽显示。
+    gen_masked: bool,
     /// Last generated password, masked, until copied or filled into the
     /// credential dialog's password field. Cleared whenever either generator
     /// window closes.
@@ -492,9 +531,15 @@ impl GitPmApp {
             cred_user: String::new(),
             cred_pass: String::new(),
             cred_error: None,
+            show_pw_change: false,
+            pw_old: String::new(),
+            pw_new: String::new(),
+            pw_new2: String::new(),
+            pw_error: None,
             show_gen_dialog: false,
             show_tool_gen_window: false,
             gen_opts: GenOptions::default(),
+            gen_masked: false,
             gen_result: String::new(),
             gen_error: None,
         };
@@ -715,6 +760,7 @@ impl GitPmApp {
         self.show_remove_confirm(ctx);
         self.show_clone_dialog(ctx);
         self.show_cred_dialog(ctx);
+        self.show_pw_change_dialog(ctx);
         self.show_gen_dialog(ctx);
         self.show_tool_generator(ctx);
         // While a git call runs on a worker thread, keep waking the UI to
@@ -734,15 +780,24 @@ impl GitPmApp {
             ui.horizontal(|ui| {
                 ui.heading("git-pm");
                 ui.separator();
-                if ui.button("添加项目…").clicked() {
+                if ui
+                    .button(format!("{} 添加项目…", icons::ICON_ADD))
+                    .clicked()
+                {
                     self.pick_and_add_project();
                 }
-                if ui.button("克隆仓库…").clicked() {
+                if ui
+                    .button(format!("{} 克隆仓库…", icons::ICON_CLONE))
+                    .clicked()
+                {
                     self.open_clone_dialog();
                 }
                 let has_selection = self.selected.is_some();
                 if ui
-                    .add_enabled(has_selection, egui::Button::new("移除项目"))
+                    .add_enabled(
+                        has_selection,
+                        egui::Button::new(format!("{} 移除项目", icons::ICON_REMOVE)),
+                    )
                     .clicked()
                 {
                     self.confirm_remove = true;
@@ -754,11 +809,12 @@ impl GitPmApp {
         });
     }
 
-    /// 顶栏菜单栏（egui::menu::bar）：主题切换（暗黑/明亮）与工具（独立
-    /// 密码生成器）。
+    /// 顶栏菜单栏（egui::menu::bar）：主题切换（暗黑/明亮）、工具（独立
+    /// 密码生成器）与设置（修改主密码）。
     fn show_menu_bar(&mut self, ui: &mut egui::Ui) {
         let mut chosen_theme: Option<Theme> = None;
         let mut open_generator = false;
+        let mut open_pw_change = false;
         egui::menu::bar(ui, |ui| {
             ui.menu_button("主题", |ui| {
                 if ui.button("暗黑").clicked() {
@@ -773,12 +829,20 @@ impl GitPmApp {
                     open_generator = true;
                 }
             });
+            ui.menu_button("设置", |ui| {
+                if ui.button("修改主密码…").clicked() {
+                    open_pw_change = true;
+                }
+            });
         });
         if let Some(theme) = chosen_theme {
             self.switch_theme(ui.ctx(), theme);
         }
         if open_generator {
             self.open_tool_generator();
+        }
+        if open_pw_change {
+            self.open_pw_change_dialog();
         }
     }
 
@@ -918,19 +982,28 @@ impl GitPmApp {
                         ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             if ui
-                                .add_enabled(!busy.is_some(), egui::Button::new("拉取（pull）"))
+                                .add_enabled(
+                                    !busy.is_some(),
+                                    egui::Button::new(format!("{} 拉取（pull）", icons::ICON_PULL)),
+                                )
                                 .clicked()
                             {
                                 self.do_pull();
                             }
                             if ui
-                                .add_enabled(!busy.is_some(), egui::Button::new("推送（push）"))
+                                .add_enabled(
+                                    !busy.is_some(),
+                                    egui::Button::new(format!("{} 推送（push）", icons::ICON_PUSH)),
+                                )
                                 .clicked()
                             {
                                 self.do_push();
                             }
                             if ui
-                                .add_enabled(!busy.is_some(), egui::Button::new("凭据…"))
+                                .add_enabled(
+                                    !busy.is_some(),
+                                    egui::Button::new(format!("{} 凭据…", icons::ICON_KEY)),
+                                )
                                 .clicked()
                             {
                                 self.open_cred_dialog();
@@ -950,7 +1023,13 @@ impl GitPmApp {
     fn show_status_area(&mut self, ui: &mut egui::Ui, busy: bool) {
         ui.horizontal(|ui| {
             ui.strong("状态");
-            if ui.add_enabled(!busy, egui::Button::new("刷新")).clicked() {
+            if ui
+                .add_enabled(
+                    !busy,
+                    egui::Button::new(format!("{} 刷新", icons::ICON_REFRESH)),
+                )
+                .clicked()
+            {
                 self.manual_refresh_status();
             }
         });
@@ -973,7 +1052,10 @@ impl GitPmApp {
         );
         let can_commit = !self.commit_msg.trim().is_empty() && !busy;
         if ui
-            .add_enabled(can_commit, egui::Button::new("提交"))
+            .add_enabled(
+                can_commit,
+                egui::Button::new(format!("{} 提交", icons::ICON_COMMIT)),
+            )
             .clicked()
         {
             self.do_commit();
@@ -989,7 +1071,10 @@ impl GitPmApp {
         );
         let can_create = !self.new_branch.trim().is_empty() && !busy;
         if ui
-            .add_enabled(can_create, egui::Button::new("创建并切换"))
+            .add_enabled(
+                can_create,
+                egui::Button::new(format!("{} 创建并切换", icons::ICON_BRANCH)),
+            )
             .clicked()
         {
             self.do_new_branch();
@@ -1010,7 +1095,10 @@ impl GitPmApp {
         );
         let can_tag = !self.tag_name.trim().is_empty() && !busy;
         if ui
-            .add_enabled(can_tag, egui::Button::new("打标签"))
+            .add_enabled(
+                can_tag,
+                egui::Button::new(format!("{} 打标签", icons::ICON_TAG)),
+            )
             .clicked()
         {
             self.do_tag();
@@ -2120,6 +2208,134 @@ impl GitPmApp {
         }
     }
 
+    // -------------------------------------------------- master password change
+
+    /// 菜单「设置 → 修改主密码」：打开对话框（空白表单）。
+    fn open_pw_change_dialog(&mut self) {
+        self.error = None;
+        self.pw_old.clear();
+        self.pw_new.clear();
+        self.pw_new2.clear();
+        self.pw_error = None;
+        self.show_pw_change = true;
+    }
+
+    /// 关闭对话框并清空全部密码输入（取消按钮、X 按钮与成功后都走这里）。
+    fn close_pw_change_dialog(&mut self) {
+        self.show_pw_change = false;
+        self.pw_old.clear();
+        self.pw_new.clear();
+        self.pw_new2.clear();
+        self.pw_error = None;
+    }
+
+    fn show_pw_change_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_pw_change {
+            return;
+        }
+        let mut open = self.show_pw_change;
+        egui::Window::new("修改主密码")
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label("修改主密码后，所有已保存的凭据会立即用新密码重新加密。");
+                ui.add_space(6.0);
+                ui.add_sized(
+                    [DIALOG_FIELD_WIDTH, 22.0],
+                    egui::TextEdit::singleline(&mut self.pw_old)
+                        .password(true)
+                        .hint_text("旧主密码"),
+                );
+                ui.add_space(6.0);
+                ui.add_sized(
+                    [DIALOG_FIELD_WIDTH, 22.0],
+                    egui::TextEdit::singleline(&mut self.pw_new)
+                        .password(true)
+                        .hint_text("新主密码"),
+                );
+                ui.add_space(6.0);
+                let confirm = ui.add_sized(
+                    [DIALOG_FIELD_WIDTH, 22.0],
+                    egui::TextEdit::singleline(&mut self.pw_new2)
+                        .password(true)
+                        .hint_text("再次输入新主密码"),
+                );
+                let pressed_enter =
+                    confirm.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                if let Some(err) = &self.pw_error {
+                    ui.add_space(6.0);
+                    ui.colored_label(egui::Color32::RED, err);
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("取消").clicked() {
+                        self.close_pw_change_dialog();
+                    }
+                    if ui.button("修改").clicked() || pressed_enter {
+                        self.submit_master_password_change();
+                    }
+                });
+            });
+        // Closed via the window's X button.
+        if !open {
+            self.close_pw_change_dialog();
+        }
+    }
+
+    /// 「修改」按钮：校验三框非空且新==确认后，同步调用
+    /// `db::change_master_password`（操作秒级，不进 busy 通道）。成功后用新
+    /// 主密码重新解锁以刷新会话密钥（盐已轮换，旧密钥不再可用），并清空、
+    /// 关窗、在输出区提示；失败则在窗口内红色显示原因，保留输入。
+    fn submit_master_password_change(&mut self) {
+        self.pw_error = None;
+        if self.pw_old.is_empty() || self.pw_new.is_empty() || self.pw_new2.is_empty() {
+            self.pw_error = Some("请填写旧密码、新密码和确认密码".into());
+            return;
+        }
+        if self.pw_new != self.pw_new2 {
+            self.pw_error = Some("两次输入的新密码不一致，请重新输入".into());
+            self.pw_new2.clear();
+            return;
+        }
+        let Some(conn) = self.conn.as_ref() else {
+            self.pw_error = Some(self.open_error.clone().unwrap_or_else(|| "数据库未打开".into()));
+            return;
+        };
+        match db::change_master_password(conn, &self.pw_old, &self.pw_new) {
+            Ok(()) => {
+                // 盐已轮换：内存中的旧会话密钥不再能解密新密文，必须用新
+                // 主密码重新解锁。
+                match crypto::unlock(conn, &self.pw_new) {
+                    Ok(keys) => {
+                        self.keys = Some(keys);
+                        self.log.push(LogEntry {
+                            ok: true,
+                            title: "主密码已修改".to_string(),
+                            text: "所有已保存凭据已用新主密码重新加密。".to_string(),
+                        });
+                        self.trim_log();
+                        self.close_pw_change_dialog();
+                    }
+                    Err(e) => {
+                        // 理论上不可达（change_master_password 刚验证过新
+                        // 密码）；旧会话密钥已失效，不能继续沿用。
+                        self.keys = None;
+                        self.log.push(LogEntry {
+                            ok: false,
+                            title: "主密码已修改，但刷新会话密钥失败".to_string(),
+                            text: format!("{e}；请重启程序并用新主密码解锁。"),
+                        });
+                        self.trim_log();
+                        self.close_pw_change_dialog();
+                    }
+                }
+            }
+            Err(e) => self.pw_error = Some(format!("修改主密码失败：{e}")),
+        }
+    }
+
     /// 凭据对话框「生成…」：打开密码生成器弹窗。
     fn open_gen_dialog(&mut self) {
         self.gen_error = None;
@@ -2185,7 +2401,9 @@ impl GitPmApp {
     }
 
     /// 密码生成器共享 UI：长度滑块 8–64（默认 20）、大写/小写/数字固定启用、
-    /// 特殊字符可选、生成 / 复制 / 关闭；仅凭据对话框内额外提供「填入密码框」。
+    /// 特殊字符可选、生成 / 复制 / 关闭；结果默认明文显示（可选中复制），
+    /// 可勾选「遮蔽显示」切换为 `•` 等宽掩码；仅凭据对话框内额外提供
+    /// 「填入密码框」。
     fn show_generator_ui(&mut self, ui: &mut egui::Ui, window: GenWindow) {
         ui.add(egui::Slider::new(&mut self.gen_opts.length, 8..=64).text("长度"));
         // upper/lower/digits 固定启用（生成器要求至少一类字符）。
@@ -2208,12 +2426,26 @@ impl GitPmApp {
         if ui.button("生成").clicked() {
             self.generate_password();
         }
-        ui.add_sized(
-            [DIALOG_FIELD_WIDTH, 22.0],
-            egui::TextEdit::singleline(&mut self.gen_result)
-                .password(true)
-                .hint_text("（点击「生成」后显示在此，掩码显示）"),
-        );
+        // 明文（默认）用可编辑 TextEdit 显示（可选中复制）；遮蔽时以 `•`
+        // 重复等宽显示，长度与明文一致。
+        ui.checkbox(&mut self.gen_masked, "遮蔽显示");
+        if self.gen_masked {
+            let dots = "•".repeat(self.gen_result.chars().count());
+            if dots.is_empty() {
+                ui.label("（点击「生成」后显示在此）");
+            } else {
+                ui.add_sized(
+                    [DIALOG_FIELD_WIDTH, 22.0],
+                    egui::Label::new(egui::RichText::new(dots).monospace()),
+                );
+            }
+        } else {
+            ui.add_sized(
+                [DIALOG_FIELD_WIDTH, 22.0],
+                egui::TextEdit::singleline(&mut self.gen_result)
+                    .hint_text("（点击「生成」后显示在此，明文显示）"),
+            );
+        }
         if let Some(err) = &self.gen_error {
             ui.add_space(6.0);
             ui.colored_label(egui::Color32::RED, err);

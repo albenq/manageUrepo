@@ -158,8 +158,6 @@ pub fn set_meta(conn: &Connection, key: &str, value: &[u8]) -> rusqlite::Result<
 /// master still unlocks it and every credential stays readable.
 ///
 /// Refuses an empty `new_password` (it would defeat the lock screen).
-// Wired into the settings UI by Task D; unused until then.
-#[allow(dead_code)]
 pub fn change_master_password(
     conn: &Connection,
     old_password: &str,
