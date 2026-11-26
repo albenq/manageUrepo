@@ -1154,6 +1154,41 @@ fn paint_tree_arrow(ui: &egui::Ui, rect: egui::Rect, open: bool) {
 }
 
 
+/// 项目树工具栏：搜索框 + 清除按钮，返回输入框的响应（供调用方处理 Esc）。
+///
+/// 注意：`SidePanel` 的宽度取自上一帧的内容宽度，因此本行必须恰好填满
+/// 可用宽度；若用「可用宽度 − 固定值」反推输入框宽度，会与面板宽度形成
+/// 逐帧反馈循环（输入字符后清除按钮出现，面板和输入框会不断变宽）。
+fn show_tree_search_toolbar(
+    ui: &mut egui::Ui,
+    search: &mut String,
+    lang: Lang,
+) -> egui::Response {
+    let mut response = None;
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(icons::ICON_SEARCH).weak());
+        // 右到左子布局：清除按钮贴右，输入框以 INFINITY 填满其余宽度。
+        // 整行恰好占满可用宽度，避免与 SidePanel 的「按内容定宽」互相反馈。
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if !search.is_empty()
+                && ui
+                    .button("✕")
+                    .on_hover_text(i18n::t(lang, "tree-search-clear"))
+                    .clicked()
+            {
+                search.clear();
+            }
+            let resp = ui.add(
+                egui::TextEdit::singleline(search)
+                    .hint_text(i18n::t(lang, "tree-search-hint"))
+                    .desired_width(f32::INFINITY),
+            );
+            response = Some(resp);
+        });
+    });
+    response.expect("tree search toolbar always adds a text edit")
+}
+
 /// Which screen the main window currently shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Phase {
@@ -1813,29 +1848,11 @@ impl GitPmApp {
             ui.heading(i18n::t(lang, "heading-projects"));
             // 工具栏：搜索框 + 清除按钮。输入即过滤（英文目录按字母逐字、
             // 子串、忽略大小写），过滤期间自动展开命中路径。
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(icons::ICON_SEARCH).weak());
-                let field_w = (ui.available_width() - 34.0).max(80.0);
-                let search_resp = ui.add(
-                    egui::TextEdit::singleline(&mut self.tree_search)
-                        .hint_text(i18n::t(lang, "tree-search-hint"))
-                        .desired_width(field_w),
-                );
-                if !self.tree_search.is_empty()
-                    && ui
-                        .button("✕")
-                        .on_hover_text(i18n::t(lang, "tree-search-clear"))
-                        .clicked()
-                {
-                    self.tree_search.clear();
-                }
-                // Esc 快速清空搜索（焦点在输入框内时）。
-                if search_resp.has_focus()
-                    && ui.input(|i| i.key_pressed(egui::Key::Escape))
-                {
-                    self.tree_search.clear();
-                }
-            });
+            let search_resp = show_tree_search_toolbar(ui, &mut self.tree_search, lang);
+            // Esc 快速清空搜索（焦点在输入框内时）。
+            if search_resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+                self.tree_search.clear();
+            }
             ui.separator();
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
@@ -4659,6 +4676,37 @@ mod tests {
         let by_project = filter_project_tree(&tree, &names, "cargo");
         assert_eq!(count_tree_projects(&by_project), 1);
         assert_eq!(count_tree_projects(&tree), 3);
+    }
+
+    #[test]
+    fn tree_search_toolbar_width_stays_stable_after_typing() {
+        // 回归：可调宽度 SidePanel 的宽度取自内容宽度；输入第一个字符后
+        // 清除按钮出现，搜索框不得因此逐帧变宽（或变窄）。
+        let ctx = egui::Context::default();
+        ctx.set_fonts(egui::FontDefinitions::empty());
+        let mut search = String::new();
+        let mut widths: Vec<f32> = Vec::new();
+        for frame in 0..6 {
+            let mut w = 0.0;
+            let _ = ctx.run(Default::default(), |ctx| {
+                egui::SidePanel::left("search-toolbar-probe").show(ctx, |ui| {
+                    let resp = show_tree_search_toolbar(ui, &mut search, Lang::Zh);
+                    w = resp.rect.width();
+                });
+            });
+            widths.push(w);
+            if frame == 0 {
+                search.push('a'); // 第一个字符：清除按钮开始出现
+            } else {
+                search.push('b');
+            }
+        }
+        let steady = &widths[1..];
+        assert!(
+            steady.windows(2).all(|p| (p[0] - p[1]).abs() < 0.5),
+            "搜索框宽度不稳定：{widths:?}"
+        );
+        assert!(widths[0] > 0.0);
     }
 
     // ------------------------------------------------ porcelain parsing
