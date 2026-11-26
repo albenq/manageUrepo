@@ -49,7 +49,7 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("err-open-db", "无法打开数据库 {path}：{err}", "Cannot open database {path}: {err}"),
     ("err-db-not-open", "数据库未打开", "Database not open"),
     // ------------------------------------------------ Setup 界面
-    ("setup-title", "欢迎使用 git-pm", "Welcome to git-pm"),
+    ("setup-title", "欢迎使用 LocalRepoManager", "Welcome to LocalRepoManager"),
     ("setup-intro", "首次使用：请设置一个主密码，用于加密本机保存的凭据。", "First run: set a master password to encrypt the credentials stored on this machine."),
     ("setup-warning", "主密码无法找回，请务必牢记。", "The master password cannot be recovered. Keep it safe."),
     ("hint-master-password", "主密码", "Master password"),
@@ -60,7 +60,7 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("err-setup-master", "设置主密码失败：{err}", "Failed to set the master password: {err}"),
     ("err-unlock-new-vault", "解锁刚创建的保险库失败：{err}", "Failed to unlock the freshly created vault: {err}"),
     // ------------------------------------------------ Unlock 界面
-    ("unlock-title", "解锁 git-pm", "Unlock git-pm"),
+    ("unlock-title", "解锁 LocalRepoManager", "Unlock LocalRepoManager"),
     ("unlock-intro", "请输入主密码以解锁凭据保险库。", "Enter the master password to unlock the credential vault."),
     ("btn-unlock", "解锁", "Unlock"),
     ("err-wrong-master", "主密码错误，请重试", "Wrong master password; please try again"),

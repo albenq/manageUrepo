@@ -1436,7 +1436,7 @@ impl GitPmApp {
                     self.show_browser(ui, Path::new(&project.path));
                 }
                 None => {
-                    ui.heading("git-pm");
+                    ui.heading("LocalRepoManager");
                     ui.label(i18n::t(lang, "main-empty-intro"));
                 }
             }
@@ -1466,7 +1466,7 @@ impl GitPmApp {
         let lang = self.lang;
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("git-pm");
+                ui.heading("LocalRepoManager");
                 ui.separator();
                 if ui
                     .button(format!(

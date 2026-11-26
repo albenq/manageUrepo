@@ -1,4 +1,4 @@
-# git-pm / git-pm（中英双语说明 Bilingual README）
+# LocalRepoManager / LocalRepoManager（中英双语说明 Bilingual README）
 
 [中文](#中文) | [English](#english)
 
@@ -24,7 +24,7 @@ cargo run --release
 
 - 第一次启动会进入「设置主密码」界面：输入主密码并重复确认即可。主密码用于加密本机保存的凭据，**无法找回，请务必牢记**。
 - 之后每次启动都会要求输入主密码解锁，才能进入主界面。
-- 不保存凭据也可以正常使用 git-pm 的其他功能（仅 push/pull 时不会自动注入凭据）。
+- 不保存凭据也可以正常使用 LocalRepoManager 的其他功能（仅 push/pull 时不会自动注入凭据）。
 
 ### 数据文件
 
@@ -90,7 +90,7 @@ The window opens at 1440×900 by default (minimum 1200×800) and can be resized 
 
 - On first launch you will see the "Set Master Password" screen: enter a master password and confirm it. The master password encrypts credentials stored on this machine — **it cannot be recovered, so keep it safe**.
 - Every subsequent launch asks for the master password to unlock the vault before entering the main screen.
-- git-pm works fine without stored credentials (push/pull simply won't auto-inject credentials).
+- LocalRepoManager works fine without stored credentials (push/pull simply won't auto-inject credentials).
 
 ### Data Files
 

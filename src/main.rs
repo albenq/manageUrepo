@@ -78,7 +78,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
     eframe::run_native(
-        "git-pm",
+        "LocalRepoManager",
         options,
         Box::new(|cc| {
             load_cjk_fonts(&cc.egui_ctx);
