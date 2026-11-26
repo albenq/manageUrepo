@@ -130,6 +130,27 @@ pub fn delete_credential(
     )
 }
 
+/// Read the raw blob stored under `key` in the `meta` table, or `None` when
+/// the key is absent.
+pub fn get_meta(conn: &Connection, key: &str) -> rusqlite::Result<Option<Vec<u8>>> {
+    conn.query_row(
+        "SELECT value FROM meta WHERE key = ?1",
+        params![key],
+        |row| row.get::<_, Vec<u8>>(0),
+    )
+    .optional()
+}
+
+/// Insert or replace the raw blob stored under `key` in the `meta` table.
+#[allow(dead_code)] // interface required by the plan; first wired up in Task 9/10
+pub fn set_meta(conn: &Connection, key: &str, value: &[u8]) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO meta (key, value) VALUES (?1, ?2)",
+        params![key, value],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -285,5 +306,28 @@ mod tests {
             count, 0,
             "ON DELETE CASCADE must remove credentials with their project"
         );
+    }
+
+    #[test]
+    fn meta_get_set_roundtrip() {
+        let dir = tempdir().unwrap();
+        let conn = init_db(&dir.path().join("meta.db")).unwrap();
+
+        assert!(
+            get_meta(&conn, "no_such_key").unwrap().is_none(),
+            "absent meta key must read as None"
+        );
+
+        set_meta(&conn, "probe", b"first").unwrap();
+        assert_eq!(get_meta(&conn, "probe").unwrap().as_deref(), Some(b"first".as_slice()));
+
+        // set_meta upserts: a second write replaces the previous value.
+        set_meta(&conn, "probe", b"second").unwrap();
+        assert_eq!(get_meta(&conn, "probe").unwrap().as_deref(), Some(b"second".as_slice()));
+
+        // Binary values (non-UTF-8) survive the roundtrip.
+        let blob: Vec<u8> = (0u8..=255).collect();
+        set_meta(&conn, "blob", &blob).unwrap();
+        assert_eq!(get_meta(&conn, "blob").unwrap().as_deref(), Some(blob.as_slice()));
     }
 }
