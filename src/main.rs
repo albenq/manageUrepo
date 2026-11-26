@@ -5,6 +5,7 @@ mod browser;
 mod crypto;
 mod db;
 mod git;
+mod i18n;
 mod password;
 
 use eframe::egui;

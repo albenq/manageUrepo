@@ -16,7 +16,18 @@ use crate::browser;
 use crate::crypto::{self, CryptoError, VaultKeys};
 use crate::db::{self, Project};
 use crate::git;
+use crate::i18n::{self, Lang};
 use crate::password::{self, GenOptions};
+
+/// t() + 占位符替换：把文案中的 `{name}` 依次替换为 pairs 的值，用于带
+/// 动态参数的句子级文案；占位符名未提供时保留原文（便于发现缺漏）。
+fn tf(lang: Lang, key: &'static str, pairs: &[(&str, &str)]) -> String {
+    let mut out = i18n::t(lang, key).to_string();
+    for (name, value) in pairs {
+        out = out.replace(&format!("{{{name}}}"), value);
+    }
+    out
+}
 
 /// egui 0.28 does not ship the `egui::icons::ICON_*` constants (the module
 /// was added in later egui releases; verified against the vendored 0.28.1
@@ -58,6 +69,10 @@ const THEME_KEY: &str = "theme";
 /// Bytes stored under `meta[THEME_KEY]` for the light theme. Anything else
 /// (missing key, other value, read failure) falls back to the dark default.
 const THEME_LIGHT: &[u8] = b"light";
+
+/// 项目树「未分组」节点的稳定 key：`group_projects_by_parent` 返回它，
+/// UI 层再经 `t()` 翻译为当前语言的展示文案。
+const GROUP_UNGROUPED_KEY: &str = "group-ungrouped";
 
 /// Local database, created next to the program's working directory.
 const DB_PATH: &str = "gitpm.db";
@@ -106,10 +121,6 @@ const COLOR_STATUS_CHANGED: egui::Color32 = egui::Color32::from_rgb(224, 176, 0)
 
 /// 新增/未跟踪状态标记的颜色（绿色）。
 const COLOR_STATUS_ADDED: egui::Color32 = egui::Color32::from_rgb(64, 200, 112);
-
-/// 注入凭据 + `-u` 推送成功但上游回写失败时，追加到输出区的警告文案。
-const WARN_UPSTREAM_RESTORE_FAILED: &str =
-    "⚠ 上游回写失败，.git/config 中可能残留含凭据的 URL，请手动检查";
 
 /// One rendered git invocation in the bottom read-only output area.
 struct LogEntry {
@@ -294,7 +305,7 @@ fn push_needs_upstream_restore(injected: bool, set_upstream: bool) -> bool {
 ///
 /// - 仅在推送成功时回写：推送失败时 git 不写配置，无可回写；
 /// - 回写失败**不改判**推送失败：在输出 stderr 追加
-///   [`WARN_UPSTREAM_RESTORE_FAILED`] 与回写失败详情；
+///   `warn-upstream-restore-failed` 文案（按 `lang` 取）与回写失败详情；
 /// - 回写命令的输出并入后，合成结果整体再过一次 [`redact_output`]
 ///   （双保险），任何凭据残留都不会进入输出区/日志。
 fn restore_upstream_remote(
@@ -302,6 +313,7 @@ fn restore_upstream_remote(
     path: &Path,
     remote: &str,
     branch: &str,
+    lang: Lang,
     auth: &InjectedAuth,
 ) -> std::io::Result<git::GitOutput> {
     // git 本就没运行（Err）：没有推送也没有配置写入，原样返回错误。
@@ -313,14 +325,14 @@ fn restore_upstream_remote(
     let key = format!("branch.{branch}.remote");
     let detail = match git::run(path, &["config", &key, remote]) {
         Ok(cfg) if cfg.ok() => return Ok(push_out),
-        Ok(cfg) => git_output_text(&cfg),
-        Err(e) => format!("无法运行 git：{e}"),
+        Ok(cfg) => git_output_text(lang, &cfg),
+        Err(e) => tf(lang, "err-git-run", &[("err", &e.to_string())]),
     };
     let mut stderr = push_out.stderr;
     if !stderr.is_empty() {
         stderr.push('\n');
     }
-    stderr.push_str(WARN_UPSTREAM_RESTORE_FAILED);
+    stderr.push_str(i18n::t(lang, "warn-upstream-restore-failed"));
     stderr.push('\n');
     stderr.push_str(&detail);
     // 双保险：合成后的完整输出整体再脱敏一次。
@@ -424,7 +436,7 @@ fn redact_text(text: String, pairs: &[(String, String)]) -> String {
 }
 
 /// Combine the stdout/stderr of a git result into displayable text.
-fn git_output_text(out: &git::GitOutput) -> String {
+fn git_output_text(lang: Lang, out: &git::GitOutput) -> String {
     let stdout = out.stdout.trim_end();
     let stderr = out.stderr.trim_end();
     let mut text = String::new();
@@ -438,21 +450,26 @@ fn git_output_text(out: &git::GitOutput) -> String {
         text.push_str(stderr);
     }
     if text.is_empty() {
-        text.push_str("（无输出）");
+        text.push_str(i18n::t(lang, "no-output"));
     }
     text
 }
 
 /// Convert a finished git call into a status-area section.
-fn status_section(out: &git::GitOutput) -> StatusSection {
+fn status_section(lang: Lang, out: &git::GitOutput) -> StatusSection {
     StatusSection {
         ok: out.ok(),
-        text: git_output_text(out),
+        text: git_output_text(lang, out),
     }
 }
 
 /// Render one status-area section: plain text on success, red on failure.
-fn show_section(ui: &mut egui::Ui, title: &str, section: Option<&StatusSection>) {
+fn show_section(
+    ui: &mut egui::Ui,
+    lang: Lang,
+    title: &str,
+    section: Option<&StatusSection>,
+) {
     ui.add_space(4.0);
     ui.strong(title);
     match section {
@@ -463,7 +480,7 @@ fn show_section(ui: &mut egui::Ui, title: &str, section: Option<&StatusSection>)
             ui.colored_label(egui::Color32::RED, &s.text);
         }
         None => {
-            ui.label("（尚未加载）");
+            ui.label(i18n::t(lang, "not-loaded"));
         }
     }
 }
@@ -738,13 +755,13 @@ fn status_marker_rich(status: FileStatus) -> egui::RichText {
 }
 
 /// 状态标记的图例说明（浏览器列表下方显示一次）。
-fn status_legend_text(status: FileStatus) -> &'static str {
+fn status_legend_text(lang: Lang, status: FileStatus) -> &'static str {
     match status {
-        FileStatus::Conflict => "冲突",
-        FileStatus::Deleted => "已删除",
-        FileStatus::Modified => "已修改",
-        FileStatus::Renamed => "重命名/复制",
-        FileStatus::Added => "新增/未跟踪",
+        FileStatus::Conflict => i18n::t(lang, "legend-conflict"),
+        FileStatus::Deleted => i18n::t(lang, "legend-deleted"),
+        FileStatus::Modified => i18n::t(lang, "legend-modified"),
+        FileStatus::Renamed => i18n::t(lang, "legend-renamed"),
+        FileStatus::Added => i18n::t(lang, "legend-added"),
     }
 }
 
@@ -757,7 +774,8 @@ fn status_legend_text(status: FileStatus) -> &'static str {
 /// 项目树的一个分组节点：共享同一（合并后）父目录的项目集合。
 struct ProjectGroup {
     /// 节点标题：根父目录的原始拼写（该 key 首次出现时的写法）；
-    /// 无法推导父目录的项目共用「(未分组)」节点。
+    /// 无法推导父目录的项目共用 [`GROUP_UNGROUPED_KEY`] 节点（展示时
+    /// 由 UI 层按当前语言翻译）。
     label: String,
     /// 排序与折叠态记忆键：规范化后的父目录（Windows 模式下小写并把
     /// `/` 统一为 `\`）。
@@ -792,8 +810,9 @@ fn path_depth(path: &str) -> usize {
 /// 项目树分组：key 相同的父目录合并；某父目录是另一父目录的路径前缀
 /// （组件级比较）时合并到最短的祖先节点，标题取祖先目录拼写；无前缀
 /// 关系的（如不同盘符）各自成节点。组按 key 字典序排序，无法归组的
-/// 项目归入单一的「(未分组)」节点排在最后；每个输入下标恰好出现在
-/// 一个组的 `members` 中（顺序与输入一致）。
+/// 项目归入单一的未分组节点（label 为 [`GROUP_UNGROUPED_KEY`] 稳定
+/// key，排在最后）；每个输入下标恰好出现在一个组的 `members` 中
+/// （顺序与输入一致）。
 fn group_projects_by_parent(paths: &[String], case_insensitive: bool) -> Vec<ProjectGroup> {
     // 1) 逐项目推导父目录 key；无法推导的进入未分组桶。
     let mut key_labels: HashMap<String, String> = HashMap::new(); // key → 首现拼写
@@ -850,7 +869,7 @@ fn group_projects_by_parent(paths: &[String], case_insensitive: bool) -> Vec<Pro
         .collect();
     if !ungrouped.is_empty() {
         groups.push(ProjectGroup {
-            label: "(未分组)".to_string(),
+            label: GROUP_UNGROUPED_KEY.to_string(),
             key: String::new(),
             members: ungrouped,
         });
@@ -894,6 +913,8 @@ pub struct GitPmApp {
     phase: Phase,
     /// UI theme, restored from the meta table at startup.
     theme: Theme,
+    /// UI language, restored from the meta table at startup (Zh on failure).
+    lang: Lang,
     error: Option<String>,
 
     setup_pw1: String,
@@ -1009,6 +1030,7 @@ impl GitPmApp {
             open_error: None,
             phase: Phase::Setup,
             theme: Theme::Dark,
+            lang: Lang::Zh,
             error: None,
             setup_pw1: String::new(),
             setup_pw2: String::new(),
@@ -1068,6 +1090,18 @@ impl GitPmApp {
 
         match db::init_db(Path::new(DB_PATH)) {
             Ok(conn) => {
+                // 语言偏好先读：后续启动错误文案按所选语言渲染（读失败
+                // 降级中文，不 panic）。
+                match db::get_meta(&conn, i18n::LANG_KEY) {
+                    Ok(value) => app.lang = i18n::from_meta(value.as_deref()),
+                    Err(e) => {
+                        // Cosmetic only; keep any more important startup error.
+                        if app.error.is_none() {
+                            app.error =
+                                Some(tf(app.lang, "err-read-lang", &[("err", &e.to_string())]));
+                        }
+                    }
+                }
                 match db::get_meta(&conn, VERIFIER_KEY) {
                     Ok(Some(_)) => app.phase = Phase::Unlock,
                     Ok(None) => app.phase = Phase::Setup,
@@ -1076,7 +1110,11 @@ impl GitPmApp {
                         // stay on Setup: `setup_master` refuses to re-initialize
                         // an existing vault and the error is shown there.
                         app.phase = Phase::Setup;
-                        app.error = Some(format!("读取保险库状态失败：{e}"));
+                        app.error = Some(tf(
+                            app.lang,
+                            "err-read-vault-state",
+                            &[("err", &e.to_string())],
+                        ));
                     }
                 }
                 // Persisted theme preference: `light` wins, everything else
@@ -1091,14 +1129,22 @@ impl GitPmApp {
                     Err(e) => {
                         // Cosmetic only; keep any more important startup error.
                         if app.error.is_none() {
-                            app.error = Some(format!("读取主题偏好失败，已回退到暗黑主题：{e}"));
+                            app.error = Some(tf(
+                                app.lang,
+                                "err-read-theme",
+                                &[("err", &e.to_string())],
+                            ));
                         }
                     }
                 }
                 app.conn = Some(conn);
             }
             Err(e) => {
-                let msg = format!("无法打开数据库 {DB_PATH}：{e}");
+                let msg = tf(
+                    app.lang,
+                    "err-open-db",
+                    &[("path", DB_PATH), ("err", &e.to_string())],
+                );
                 app.open_error = Some(msg.clone());
                 app.error = Some(msg);
             }
@@ -1109,32 +1155,36 @@ impl GitPmApp {
     // ---------------------------------------------------------------- setup
 
     fn show_setup(&mut self, ctx: &egui::Context) {
+        let lang = self.lang;
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(64.0);
-                ui.heading("欢迎使用 git-pm");
+                ui.heading(i18n::t(lang, "setup-title"));
                 ui.add_space(8.0);
-                ui.label("首次使用：请设置一个主密码，用于加密本机保存的凭据。");
-                ui.label("主密码无法找回，请务必牢记。");
+                ui.label(i18n::t(lang, "setup-intro"));
+                ui.label(i18n::t(lang, "setup-warning"));
                 ui.add_space(24.0);
                 ui.add_sized(
                     [FIELD_WIDTH, 24.0],
                     egui::TextEdit::singleline(&mut self.setup_pw1)
                         .password(true)
-                        .hint_text("主密码"),
+                        .hint_text(i18n::t(lang, "hint-master-password")),
                 );
                 ui.add_space(8.0);
                 let confirm = ui.add_sized(
                     [FIELD_WIDTH, 24.0],
                     egui::TextEdit::singleline(&mut self.setup_pw2)
                         .password(true)
-                        .hint_text("再次输入主密码"),
+                        .hint_text(i18n::t(lang, "hint-repeat-master-password")),
                 );
                 let pressed_enter =
                     confirm.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 ui.add_space(12.0);
                 let clicked = ui
-                    .add_sized([FIELD_WIDTH, 32.0], egui::Button::new("设置主密码"))
+                    .add_sized(
+                        [FIELD_WIDTH, 32.0],
+                        egui::Button::new(i18n::t(lang, "btn-set-master-password")),
+                    )
                     .clicked();
                 if clicked || pressed_enter {
                     self.submit_setup();
@@ -1147,16 +1197,20 @@ impl GitPmApp {
     fn submit_setup(&mut self) {
         self.error = None;
         if self.setup_pw1.is_empty() || self.setup_pw2.is_empty() {
-            self.error = Some("请输入主密码并在第二栏重复输入".into());
+            self.error = Some(i18n::t(self.lang, "err-setup-empty").into());
             return;
         }
         if self.setup_pw1 != self.setup_pw2 {
-            self.error = Some("两次输入的主密码不一致，请重新输入".into());
+            self.error = Some(i18n::t(self.lang, "err-setup-mismatch").into());
             self.setup_pw2.clear();
             return;
         }
         let Some(conn) = self.conn.as_ref() else {
-            self.error = Some(self.open_error.clone().unwrap_or_else(|| "数据库未打开".into()));
+            self.error = Some(
+                self.open_error
+                    .clone()
+                    .unwrap_or_else(|| i18n::t(self.lang, "err-db-not-open").into()),
+            );
             return;
         };
 
@@ -1171,13 +1225,14 @@ impl GitPmApp {
             }
             Ok(None) => {}
             Err(e) => {
-                self.error = Some(format!("读取保险库状态失败：{e}"));
+                self.error =
+                    Some(tf(self.lang, "err-read-vault-state", &[("err", &e.to_string())]));
                 return;
             }
         }
 
         if let Err(e) = crypto::setup_master(conn, &self.setup_pw1) {
-            self.error = Some(format!("设置主密码失败：{e}"));
+            self.error = Some(tf(self.lang, "err-setup-master", &[("err", &e.to_string())]));
             return;
         }
         // setup_master does not hand back keys; unlock to start the session.
@@ -1188,31 +1243,35 @@ impl GitPmApp {
                 self.setup_pw2.clear();
                 self.enter_main();
             }
-            Err(e) => self.error = Some(format!("解锁刚创建的保险库失败：{e}")),
+            Err(e) => {
+                self.error =
+                    Some(tf(self.lang, "err-unlock-new-vault", &[("err", &e.to_string())]))
+            }
         }
     }
 
     // --------------------------------------------------------------- unlock
 
     fn show_unlock(&mut self, ctx: &egui::Context) {
+        let lang = self.lang;
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.vertical_centered(|ui| {
                 ui.add_space(80.0);
-                ui.heading("解锁 git-pm");
+                ui.heading(i18n::t(lang, "unlock-title"));
                 ui.add_space(8.0);
-                ui.label("请输入主密码以解锁凭据保险库。");
+                ui.label(i18n::t(lang, "unlock-intro"));
                 ui.add_space(24.0);
                 let field = ui.add_sized(
                     [FIELD_WIDTH, 24.0],
                     egui::TextEdit::singleline(&mut self.unlock_pw)
                         .password(true)
-                        .hint_text("主密码"),
+                        .hint_text(i18n::t(lang, "hint-master-password")),
                 );
                 let pressed_enter =
                     field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 ui.add_space(12.0);
                 let clicked = ui
-                    .add_sized([FIELD_WIDTH, 32.0], egui::Button::new("解锁"))
+                    .add_sized([FIELD_WIDTH, 32.0], egui::Button::new(i18n::t(lang, "btn-unlock")))
                     .clicked();
                 if clicked || pressed_enter {
                     self.submit_unlock();
@@ -1225,7 +1284,11 @@ impl GitPmApp {
     fn submit_unlock(&mut self) {
         self.error = None;
         let Some(conn) = self.conn.as_ref() else {
-            self.error = Some(self.open_error.clone().unwrap_or_else(|| "数据库未打开".into()));
+            self.error = Some(
+                self.open_error
+                    .clone()
+                    .unwrap_or_else(|| i18n::t(self.lang, "err-db-not-open").into()),
+            );
             return;
         };
         match crypto::unlock(conn, &self.unlock_pw) {
@@ -1236,10 +1299,12 @@ impl GitPmApp {
             }
             Err(e) => match e {
                 CryptoError::WrongMaster => {
-                    self.error = Some("主密码错误，请重试".into());
+                    self.error = Some(i18n::t(self.lang, "err-wrong-master").into());
                     self.unlock_pw.clear();
                 }
-                other => self.error = Some(format!("解锁失败：{other}")),
+                other => {
+                    self.error = Some(tf(self.lang, "err-unlock", &[("err", &other.to_string())]))
+                }
             },
         }
     }
@@ -1260,11 +1325,12 @@ impl GitPmApp {
         self.show_operations_panel(ctx);
         self.show_output_area(ctx);
         egui::CentralPanel::default().show(ctx, |ui| {
+            let lang = self.lang;
             match self.selected_project().cloned() {
                 Some(project) => {
                     ui.heading(&project.name);
-                    ui.label(format!("路径：{}", project.path));
-                    ui.label(format!("添加时间：{}", project.added_at));
+                    ui.label(tf(lang, "project-path", &[("path", &project.path)]));
+                    ui.label(tf(lang, "project-added-at", &[("time", &project.added_at)]));
                     ui.separator();
                     // 防御性兜底：已选中项目但浏览器尚未初始化时，重置到项目根目录。
                     if self.browser_path.is_none() {
@@ -1274,7 +1340,7 @@ impl GitPmApp {
                 }
                 None => {
                     ui.heading("git-pm");
-                    ui.label("从左侧选择一个项目，或点击「添加项目…」将一个 git 仓库加入列表。");
+                    ui.label(i18n::t(lang, "main-empty-intro"));
                 }
             }
             self.show_error(ui);
@@ -1300,18 +1366,27 @@ impl GitPmApp {
     }
 
     fn show_top_bar(&mut self, ctx: &egui::Context) {
+        let lang = self.lang;
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("git-pm");
                 ui.separator();
                 if ui
-                    .button(format!("{} 添加项目…", icons::ICON_ADD))
+                    .button(format!(
+                        "{} {}",
+                        icons::ICON_ADD,
+                        i18n::t(lang, "btn-add-project")
+                    ))
                     .clicked()
                 {
                     self.pick_and_add_project();
                 }
                 if ui
-                    .button(format!("{} 克隆仓库…", icons::ICON_CLONE))
+                    .button(format!(
+                        "{} {}",
+                        icons::ICON_CLONE,
+                        i18n::t(lang, "btn-clone-repo")
+                    ))
                     .clicked()
                 {
                     self.open_clone_dialog();
@@ -1320,7 +1395,11 @@ impl GitPmApp {
                 if ui
                     .add_enabled(
                         has_selection,
-                        egui::Button::new(format!("{} 移除项目", icons::ICON_REMOVE)),
+                        egui::Button::new(format!(
+                            "{} {}",
+                            icons::ICON_REMOVE,
+                            i18n::t(lang, "btn-remove-project")
+                        )),
                     )
                     .clicked()
                 {
@@ -1333,28 +1412,43 @@ impl GitPmApp {
         });
     }
 
-    /// 顶栏菜单栏（egui::menu::bar）：主题切换（暗黑/明亮）、工具（独立
-    /// 密码生成器）与设置（修改主密码）。
+    /// 顶栏菜单栏（egui::menu::bar）：主题切换（暗黑/明亮）、语言切换
+    /// （中文/English）、工具（独立密码生成器）与设置（修改主密码）。
     fn show_menu_bar(&mut self, ui: &mut egui::Ui) {
+        let lang = self.lang;
         let mut chosen_theme: Option<Theme> = None;
+        let mut chosen_lang: Option<Lang> = None;
         let mut open_generator = false;
         let mut open_pw_change = false;
         egui::menu::bar(ui, |ui| {
-            ui.menu_button("主题", |ui| {
-                if ui.button("暗黑").clicked() {
+            ui.menu_button(i18n::t(lang, "menu-theme"), |ui| {
+                if ui.button(i18n::t(lang, "theme-dark")).clicked() {
                     chosen_theme = Some(Theme::Dark);
                 }
-                if ui.button("明亮").clicked() {
+                if ui.button(i18n::t(lang, "theme-light")).clicked() {
                     chosen_theme = Some(Theme::Light);
                 }
             });
-            ui.menu_button("工具", |ui| {
-                if ui.button("密码生成器").clicked() {
+            // 语言项用各自语言的本地化名称（中文 / English），任何界面
+            // 语言下都可直接辨认。
+            ui.menu_button(i18n::t(lang, "menu-language"), |ui| {
+                if ui.button(i18n::t(lang, "lang-zh")).clicked() {
+                    chosen_lang = Some(Lang::Zh);
+                }
+                if ui.button(i18n::t(lang, "lang-en")).clicked() {
+                    chosen_lang = Some(Lang::En);
+                }
+            });
+            ui.menu_button(i18n::t(lang, "menu-tools"), |ui| {
+                if ui.button(i18n::t(lang, "tool-password-generator")).clicked() {
                     open_generator = true;
                 }
             });
-            ui.menu_button("设置", |ui| {
-                if ui.button("修改主密码…").clicked() {
+            ui.menu_button(i18n::t(lang, "menu-settings"), |ui| {
+                if ui
+                    .button(i18n::t(lang, "settings-change-master-password"))
+                    .clicked()
+                {
                     open_pw_change = true;
                 }
             });
@@ -1362,11 +1456,28 @@ impl GitPmApp {
         if let Some(theme) = chosen_theme {
             self.switch_theme(ui.ctx(), theme);
         }
+        if let Some(value) = chosen_lang {
+            self.switch_language(value);
+        }
         if open_generator {
             self.open_tool_generator();
         }
         if open_pw_change {
             self.open_pw_change_dialog();
+        }
+    }
+
+    /// 切换语言：立即生效（所有文案每帧经 t() 重新渲染），并尽力写入
+    /// meta 表持久化；写失败仅记入日志区，不影响本次切换。
+    fn switch_language(&mut self, lang: Lang) {
+        self.lang = lang;
+        let Some(conn) = self.conn.as_ref() else {
+            let text = i18n::t(self.lang, "err-db-not-open").to_string();
+            self.log_lang_save_error(&text);
+            return;
+        };
+        if let Err(e) = db::set_meta(conn, i18n::LANG_KEY, i18n::to_meta(lang)) {
+            self.log_lang_save_error(&e.to_string());
         }
     }
 
@@ -1379,7 +1490,8 @@ impl GitPmApp {
             Theme::Light => egui::Visuals::light(),
         });
         let Some(conn) = self.conn.as_ref() else {
-            self.log_theme_save_error("数据库未打开");
+            let text = i18n::t(self.lang, "err-db-not-open").to_string();
+            self.log_theme_save_error(&text);
             return;
         };
         let value: &[u8] = match theme {
@@ -1395,15 +1507,26 @@ impl GitPmApp {
     fn log_theme_save_error(&mut self, text: &str) {
         self.log.push(LogEntry {
             ok: false,
-            title: "主题偏好保存失败".to_string(),
+            title: i18n::t(self.lang, "err-theme-save").to_string(),
+            text: text.to_string(),
+        });
+        self.trim_log();
+    }
+
+    /// 语言偏好写库失败：仅在底部日志区提示一条失败记录。
+    fn log_lang_save_error(&mut self, text: &str) {
+        self.log.push(LogEntry {
+            ok: false,
+            title: i18n::t(self.lang, "err-lang-save").to_string(),
             text: text.to_string(),
         });
         self.trim_log();
     }
 
     fn show_project_list(&mut self, ctx: &egui::Context) {
+        let lang = self.lang;
         egui::SidePanel::left("project_list").show(ctx, |ui| {
-            ui.heading("项目");
+            ui.heading(i18n::t(lang, "heading-projects"));
             ui.separator();
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
@@ -1415,11 +1538,12 @@ impl GitPmApp {
                         .map(|p| (p.id, p.name.clone(), p.path.clone()))
                         .collect();
                     if rows.is_empty() {
-                        ui.label("（暂无项目，点击上方「添加项目…」）");
+                        ui.label(i18n::t(lang, "empty-project-list"));
                         return;
                     }
                     // 树状分组：按父目录归组（祖先链合并），组节点默认展开，
                     // 折叠态用 egui::Id（按规范化路径 key）在会话内记忆。
+                    // 「未分组」节点的 label 是稳定 key，展示时经 t() 翻译。
                     let paths: Vec<String> =
                         rows.iter().map(|(_, _, path)| path.clone()).collect();
                     let groups = group_projects_by_parent(&paths, cfg!(windows));
@@ -1429,7 +1553,12 @@ impl GitPmApp {
                             .iter()
                             .map(|&idx| rows[idx].clone())
                             .collect();
-                        egui::CollapsingHeader::new(group.label.as_str())
+                        let group_title: &str = if group.label == GROUP_UNGROUPED_KEY {
+                            i18n::t(lang, GROUP_UNGROUPED_KEY)
+                        } else {
+                            group.label.as_str()
+                        };
+                        egui::CollapsingHeader::new(group_title)
                             .id_source(egui::Id::new(("project_tree_group", group.key)))
                             .default_open(true)
                             .show(ui, |ui| {
@@ -1486,11 +1615,12 @@ impl GitPmApp {
 
     fn show_operations_panel(&mut self, ctx: &egui::Context) {
         let busy = self.busy.clone();
+        let lang = self.lang;
         egui::SidePanel::right("operations_panel")
             .default_width(380.0)
             .resizable(true)
             .show(ctx, |ui| {
-                ui.heading("操作");
+                ui.heading(i18n::t(lang, "heading-operations"));
                 ui.separator();
                 if let Some(op) = &busy {
                     // Indeterminate animated progress bar while the write
@@ -1505,13 +1635,17 @@ impl GitPmApp {
                     if project_name.is_empty() {
                         ui.label(&op.label);
                     } else {
-                        ui.label(format!("{}（{}）", op.label, project_name));
+                        ui.label(tf(
+                            lang,
+                            "busy-op-project",
+                            &[("label", &op.label), ("project", &project_name)],
+                        ));
                     }
                     ui.add_space(4.0);
                     ui.separator();
                 }
                 if self.selected_project().is_none() {
-                    ui.label("从左侧选择一个项目，即可查看其 git 状态并执行操作。");
+                    ui.label(i18n::t(lang, "empty-ops-intro"));
                     return;
                 }
                 egui::ScrollArea::vertical()
@@ -1526,7 +1660,11 @@ impl GitPmApp {
                             if ui
                                 .add_enabled(
                                     !busy.is_some(),
-                                    egui::Button::new(format!("{} 拉取（pull）", icons::ICON_PULL)),
+                                    egui::Button::new(format!(
+                                        "{} {}",
+                                        icons::ICON_PULL,
+                                        i18n::t(lang, "btn-pull")
+                                    )),
                                 )
                                 .clicked()
                             {
@@ -1535,7 +1673,11 @@ impl GitPmApp {
                             if ui
                                 .add_enabled(
                                     !busy.is_some(),
-                                    egui::Button::new(format!("{} 推送（push）", icons::ICON_PUSH)),
+                                    egui::Button::new(format!(
+                                        "{} {}",
+                                        icons::ICON_PUSH,
+                                        i18n::t(lang, "btn-push")
+                                    )),
                                 )
                                 .clicked()
                             {
@@ -1545,7 +1687,11 @@ impl GitPmApp {
                             if ui
                                 .add_enabled(
                                     !busy.is_some(),
-                                    egui::Button::new(format!("{} 推送…", icons::ICON_PUSH)),
+                                    egui::Button::new(format!(
+                                        "{} {}",
+                                        icons::ICON_PUSH,
+                                        i18n::t(lang, "btn-push-dialog")
+                                    )),
                                 )
                                 .clicked()
                             {
@@ -1557,7 +1703,11 @@ impl GitPmApp {
                             if ui
                                 .add_enabled(
                                     !busy.is_some(),
-                                    egui::Button::new(format!("{} 历史…", icons::ICON_HISTORY)),
+                                    egui::Button::new(format!(
+                                        "{} {}",
+                                        icons::ICON_HISTORY,
+                                        i18n::t(lang, "btn-history")
+                                    )),
                                 )
                                 .clicked()
                             {
@@ -1566,7 +1716,11 @@ impl GitPmApp {
                             if ui
                                 .add_enabled(
                                     !busy.is_some(),
-                                    egui::Button::new(format!("{} 凭据…", icons::ICON_KEY)),
+                                    egui::Button::new(format!(
+                                        "{} {}",
+                                        icons::ICON_KEY,
+                                        i18n::t(lang, "btn-credentials")
+                                    )),
                                 )
                                 .clicked()
                             {
@@ -1585,12 +1739,17 @@ impl GitPmApp {
     /// 状态区：status --porcelain 输出 + 分支列表 + 标签列表。无快照且选中了
     /// 项目时显示「加载中…」+ 动态进度条（后台线程正在取数）。
     fn show_status_area(&mut self, ui: &mut egui::Ui, busy: bool) {
+        let lang = self.lang;
         ui.horizontal(|ui| {
-            ui.strong("状态");
+            ui.strong(i18n::t(lang, "heading-status"));
             if ui
                 .add_enabled(
                     !busy,
-                    egui::Button::new(format!("{} 刷新", icons::ICON_REFRESH)),
+                    egui::Button::new(format!(
+                        "{} {}",
+                        icons::ICON_REFRESH,
+                        i18n::t(lang, "btn-refresh")
+                    )),
                 )
                 .clicked()
             {
@@ -1598,27 +1757,33 @@ impl GitPmApp {
             }
         });
         let Some(snapshot) = self.status.as_ref() else {
-            ui.label("加载中…");
+            ui.label(i18n::t(lang, "loading"));
             ui.add(egui::ProgressBar::new(0.0).animate(true));
             return;
         };
-        show_section(ui, "工作区（status）", snapshot.status.as_ref());
-        show_section(ui, "分支（branch）", snapshot.branches.as_ref());
-        show_section(ui, "标签（tag）", snapshot.tags.as_ref());
+        show_section(ui, lang, i18n::t(lang, "section-worktree"), snapshot.status.as_ref());
+        show_section(ui, lang, i18n::t(lang, "section-branches"), snapshot.branches.as_ref());
+        show_section(ui, lang, i18n::t(lang, "section-tags"), snapshot.tags.as_ref());
     }
 
     /// Commit 消息输入框 + Commit 按钮（空消息禁用；busy 期间禁用）。
     fn show_commit_area(&mut self, ui: &mut egui::Ui, busy: bool) {
-        ui.strong("提交（commit）");
+        let lang = self.lang;
+        ui.strong(i18n::t(lang, "heading-commit"));
         ui.add_sized(
             [ui.available_width(), 22.0],
-            egui::TextEdit::singleline(&mut self.commit_msg).hint_text("提交信息（必填）"),
+            egui::TextEdit::singleline(&mut self.commit_msg)
+                .hint_text(i18n::t(lang, "hint-commit-message")),
         );
         let can_commit = !self.commit_msg.trim().is_empty() && !busy;
         if ui
             .add_enabled(
                 can_commit,
-                egui::Button::new(format!("{} 提交", icons::ICON_COMMIT)),
+                egui::Button::new(format!(
+                    "{} {}",
+                    icons::ICON_COMMIT,
+                    i18n::t(lang, "btn-commit")
+                )),
             )
             .clicked()
         {
@@ -1628,16 +1793,22 @@ impl GitPmApp {
 
     /// “新建分支”：名称输入 → create_branch + checkout。
     fn show_branch_area(&mut self, ui: &mut egui::Ui, busy: bool) {
-        ui.strong("新建分支");
+        let lang = self.lang;
+        ui.strong(i18n::t(lang, "heading-new-branch"));
         ui.add_sized(
             [ui.available_width(), 22.0],
-            egui::TextEdit::singleline(&mut self.new_branch).hint_text("分支名称（必填）"),
+            egui::TextEdit::singleline(&mut self.new_branch)
+                .hint_text(i18n::t(lang, "hint-branch-name")),
         );
         let can_create = !self.new_branch.trim().is_empty() && !busy;
         if ui
             .add_enabled(
                 can_create,
-                egui::Button::new(format!("{} 创建并切换", icons::ICON_BRANCH)),
+                egui::Button::new(format!(
+                    "{} {}",
+                    icons::ICON_BRANCH,
+                    i18n::t(lang, "btn-create-checkout")
+                )),
             )
             .clicked()
         {
@@ -1647,21 +1818,27 @@ impl GitPmApp {
 
     /// “打 tag”：名称 + 可选 message → create_tag。
     fn show_tag_area(&mut self, ui: &mut egui::Ui, busy: bool) {
-        ui.strong("打标签（tag）");
+        let lang = self.lang;
+        ui.strong(i18n::t(lang, "heading-tag"));
         ui.add_sized(
             [ui.available_width(), 22.0],
-            egui::TextEdit::singleline(&mut self.tag_name).hint_text("标签名称（必填）"),
+            egui::TextEdit::singleline(&mut self.tag_name)
+                .hint_text(i18n::t(lang, "hint-tag-name")),
         );
         ui.add_sized(
             [ui.available_width(), 22.0],
             egui::TextEdit::singleline(&mut self.tag_msg)
-                .hint_text("标签说明（可选；填写则创建附注标签）"),
+                .hint_text(i18n::t(lang, "hint-tag-message")),
         );
         let can_tag = !self.tag_name.trim().is_empty() && !busy;
         if ui
             .add_enabled(
                 can_tag,
-                egui::Button::new(format!("{} 打标签", icons::ICON_TAG)),
+                egui::Button::new(format!(
+                    "{} {}",
+                    icons::ICON_TAG,
+                    i18n::t(lang, "btn-tag")
+                )),
             )
             .clicked()
         {
@@ -1671,13 +1848,14 @@ impl GitPmApp {
 
     /// 底部只读输出区：每次 git 调用一条记录，失败为红色。
     fn show_output_area(&mut self, ctx: &egui::Context) {
+        let lang = self.lang;
         egui::TopBottomPanel::bottom("output_area")
             .default_height(180.0)
             .resizable(true)
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.heading("输出");
-                    if ui.button("清空").clicked() {
+                    ui.heading(i18n::t(lang, "heading-output"));
+                    if ui.button(i18n::t(lang, "btn-clear")).clicked() {
                         self.log.clear();
                     }
                 });
@@ -1687,7 +1865,7 @@ impl GitPmApp {
                     .stick_to_bottom(true)
                     .show(ui, |ui| {
                         if self.log.is_empty() {
-                            ui.label("（暂无输出：对项目执行 git 操作后，结果会显示在这里）");
+                            ui.label(i18n::t(lang, "empty-output"));
                         }
                         for entry in &self.log {
                             let color = if entry.ok {
@@ -1717,7 +1895,8 @@ impl GitPmApp {
             Err(e) => {
                 self.browser_path = Some(root.to_path_buf());
                 self.browser_entries = Vec::new();
-                self.browser_err = Some(format!("无法读取目录：{e}"));
+                self.browser_err =
+                    Some(tf(self.lang, "err-read-dir", &[("err", &e.to_string())]));
             }
         }
     }
@@ -1731,19 +1910,23 @@ impl GitPmApp {
                 self.browser_entries = entries;
                 self.browser_err = None;
             }
-            Err(e) => self.browser_err = Some(format!("无法进入目录：{e}")),
+            Err(e) => {
+                self.browser_err =
+                    Some(tf(self.lang, "err-enter-dir", &[("err", &e.to_string())]))
+            }
         }
     }
 
     /// 中央文件浏览器：只读路径行 +「上一级」+ 多列条目列表。
     fn show_browser(&mut self, ui: &mut egui::Ui, root: &Path) {
+        let lang = self.lang;
         ui.horizontal(|ui| {
-            ui.strong("位置：");
+            ui.strong(i18n::t(lang, "location-label"));
             let path_text = self
                 .browser_path
                 .as_ref()
                 .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "（未加载）".to_string());
+                .unwrap_or_else(|| i18n::t(lang, "not-loaded-path").to_string());
             // 只读文本（Label 不可编辑）；固定宽度截断，避免长路径把按钮挤出面板。
             ui.add_sized(
                 [(ui.available_width() - 96.0).max(0.0), 18.0],
@@ -1752,7 +1935,7 @@ impl GitPmApp {
             );
             let at_root = self.browser_path.as_ref().is_none_or(|p| p == root);
             if ui
-                .add_enabled(!at_root, egui::Button::new("上一级"))
+                .add_enabled(!at_root, egui::Button::new(i18n::t(lang, "btn-parent-dir")))
                 .clicked()
             {
                 // 到达项目根时按钮禁用；这里只会在根目录之下被触发。
@@ -1836,16 +2019,16 @@ impl GitPmApp {
             .column(Column::initial(130.0).resizable(true).at_least(60.0))
             .header(20.0, |mut header| {
                 header.col(|ui| {
-                    ui.strong("名称");
+                    ui.strong(i18n::t(lang, "col-name"));
                 });
                 header.col(|ui| {
-                    ui.strong("类型");
+                    ui.strong(i18n::t(lang, "col-type"));
                 });
                 header.col(|ui| {
-                    ui.strong("大小");
+                    ui.strong(i18n::t(lang, "col-size"));
                 });
                 header.col(|ui| {
-                    ui.strong("修改时间");
+                    ui.strong(i18n::t(lang, "col-modified"));
                 });
             })
             .body(|body| {
@@ -1889,16 +2072,16 @@ impl GitPmApp {
                     let (_, type_resp) = row.col(|ui| {
                         ui.add(
                             egui::Label::new(dim(egui::RichText::new(if *is_dir {
-                                "目录"
+                                i18n::t(lang, "type-dir")
                             } else {
-                                "文件"
+                                i18n::t(lang, "type-file")
                             })))
                             .sense(sense),
                         );
                     });
                     let (_, size_resp) = row.col(|ui| {
                         let size_text = if *is_dir {
-                            "—".to_string()
+                            i18n::t(lang, "placeholder-dash").to_string()
                         } else {
                             browser::fmt_size(*size)
                         };
@@ -1907,7 +2090,7 @@ impl GitPmApp {
                     let (_, time_resp) = row.col(|ui| {
                         ui.add(
                             egui::Label::new(dim(egui::RichText::new(
-                                modified.as_deref().unwrap_or("—"),
+                                modified.as_deref().unwrap_or(i18n::t(lang, "placeholder-dash")),
                             )))
                             .sense(sense),
                         );
@@ -1935,14 +2118,14 @@ impl GitPmApp {
             });
 
         if rows.is_empty() && self.browser_err.is_none() {
-            ui.label("（空目录）");
+            ui.label(i18n::t(lang, "empty-dir"));
         }
 
         // 行尾图例：porcelain 有数据（存在状态标记）时显示一次。
         if !status_map.is_empty() {
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new("图例：").weak());
+                ui.label(egui::RichText::new(i18n::t(lang, "legend-label")).weak());
                 for st in [
                     FileStatus::Conflict,
                     FileStatus::Deleted,
@@ -1951,7 +2134,7 @@ impl GitPmApp {
                     FileStatus::Added,
                 ] {
                     ui.label(status_marker_rich(st));
-                    ui.label(egui::RichText::new(status_legend_text(st)).weak());
+                    ui.label(egui::RichText::new(status_legend_text(lang, st)).weak());
                     ui.add_space(6.0);
                 }
             });
@@ -1964,8 +2147,12 @@ impl GitPmApp {
     fn log_git_output(&mut self, label: &str, out: &git::GitOutput) {
         self.log.push(LogEntry {
             ok: out.ok(),
-            title: format!("{label}（退出码 {}）", out.code),
-            text: git_output_text(out),
+            title: tf(
+                self.lang,
+                "log-exit-code",
+                &[("label", label), ("code", &out.code.to_string())],
+            ),
+            text: git_output_text(self.lang, out),
         });
         self.trim_log();
     }
@@ -1974,8 +2161,8 @@ impl GitPmApp {
     fn log_git_error(&mut self, label: &str, err: &std::io::Error) {
         self.log.push(LogEntry {
             ok: false,
-            title: format!("{label}（执行失败）"),
-            text: format!("无法运行 git：{err}"),
+            title: tf(self.lang, "log-run-failed", &[("label", label)]),
+            text: tf(self.lang, "err-git-run", &[("err", &err.to_string())]),
         });
         self.trim_log();
     }
@@ -2107,7 +2294,7 @@ impl GitPmApp {
             if out.ok() {
                 let entry = self.status_cache.entry(project_id).or_insert_with(CachedStatus::empty);
                 match part {
-                    StatusPart::Status => entry.porcelain = git_output_text(out),
+                    StatusPart::Status => entry.porcelain = git_output_text(self.lang, out),
                     StatusPart::Branches => entry.branches = output_lines(out),
                     StatusPart::Tags => entry.tags = output_lines(out),
                 }
@@ -2116,8 +2303,11 @@ impl GitPmApp {
         }
         if applies {
             let section = match &result.output {
-                Ok(out) => Some(status_section(out)),
-                Err(e) => Some(StatusSection { ok: false, text: format!("无法运行 git：{e}") }),
+                Ok(out) => Some(status_section(self.lang, out)),
+                Err(e) => Some(StatusSection {
+                    ok: false,
+                    text: tf(self.lang, "err-git-run", &[("err", &e.to_string())]),
+                }),
             };
             let snapshot = self.status.get_or_insert_with(StatusSnapshot::default);
             match part {
@@ -2198,7 +2388,7 @@ impl GitPmApp {
                 Err(e) => {
                     self.log.push(LogEntry {
                         ok: false,
-                        title: format!("读取凭据（{label}）失败"),
+                        title: tf(self.lang, "err-load-credential", &[("label", label)]),
                         // CryptoError messages never contain the secret.
                         text: e.to_string(),
                     });
@@ -2225,7 +2415,7 @@ impl GitPmApp {
         }
         self.busy = Some(BusyOp {
             project_id: project.id,
-            label: "正在提交（commit）…".to_string(),
+            label: i18n::t(self.lang, "busy-commit").to_string(),
         });
         let tx = self.result_tx.clone();
         let path = PathBuf::from(&project.path);
@@ -2249,11 +2439,12 @@ impl GitPmApp {
         let auth_parts = self.load_credential_parts(project.id, DEFAULT_PUSH_REMOTE);
         self.busy = Some(BusyOp {
             project_id: project.id,
-            label: "正在拉取（pull）…".to_string(),
+            label: i18n::t(self.lang, "busy-pull").to_string(),
         });
         let tx = self.result_tx.clone();
         let path = PathBuf::from(&project.path);
         let project_id = project.id;
+        let lang = self.lang;
         std::thread::spawn(move || {
             let head = git::run(&path, &["rev-parse", "--abbrev-ref", "HEAD"]);
             let branch = match &head {
@@ -2267,7 +2458,7 @@ impl GitPmApp {
                 let output = Ok(git::GitOutput {
                     code: 1,
                     stdout: String::new(),
-                    stderr: "无法确定当前分支：rev-parse 输出为空".to_string(),
+                    stderr: i18n::t(lang, "err-no-current-branch").to_string(),
                 });
                 let _ = tx.send(GitResult {
                     project_id,
@@ -2310,7 +2501,10 @@ impl GitPmApp {
             // `git pull <url>` without a refspec would merge the remote's
             // HEAD; passing the current branch keeps the default `git pull`
             // behaviour of merging the same-named upstream branch.
-            let label = format!("git pull {DEFAULT_PUSH_REMOTE} {branch}（凭据已注入）");
+            let label = format!(
+                "git pull {DEFAULT_PUSH_REMOTE} {branch}{}",
+                i18n::t(lang, "cred-injected")
+            );
             let output = git::run(&path, &["pull", &auth.url, &branch])
                 .map(|out| redact_output(out, &auth.redact_pairs()));
             let _ = tx.send(GitResult { project_id, kind: ResultKind::Pull(label), output });
@@ -2329,11 +2523,12 @@ impl GitPmApp {
         let auth_parts = self.load_credential_parts(project.id, DEFAULT_PUSH_REMOTE);
         self.busy = Some(BusyOp {
             project_id: project.id,
-            label: "正在推送（push）…".to_string(),
+            label: i18n::t(self.lang, "busy-push").to_string(),
         });
         let tx = self.result_tx.clone();
         let path = PathBuf::from(&project.path);
         let project_id = project.id;
+        let lang = self.lang;
         std::thread::spawn(move || {
             let head = git::run(&path, &["rev-parse", "--abbrev-ref", "HEAD"]);
             let branch = match &head {
@@ -2345,7 +2540,7 @@ impl GitPmApp {
                 let output = Ok(git::GitOutput {
                     code: 1,
                     stdout: String::new(),
-                    stderr: "无法确定当前分支：rev-parse 输出为空".to_string(),
+                    stderr: i18n::t(lang, "err-no-current-branch").to_string(),
                 });
                 let _ = tx.send(GitResult {
                     project_id,
@@ -2384,7 +2579,10 @@ impl GitPmApp {
                 password: pass.clone(),
                 encoded_password: percent_encode_userinfo(&pass),
             };
-            let label = format!("git push {DEFAULT_PUSH_REMOTE} {branch}（凭据已注入）");
+            let label = format!(
+                "git push {DEFAULT_PUSH_REMOTE} {branch}{}",
+                i18n::t(lang, "cred-injected")
+            );
             let output = git::push(&path, &auth.url, &branch)
                 .map(|out| redact_output(out, &auth.redact_pairs()));
             let _ = tx.send(GitResult { project_id, kind: ResultKind::Push(label), output });
@@ -2432,6 +2630,7 @@ impl GitPmApp {
         if !self.show_push_dialog {
             return;
         }
+        let lang = self.lang;
         let Some(project_name) = self.selected_project().map(|p| p.name.clone()) else {
             self.show_push_dialog = false;
             return;
@@ -2439,62 +2638,70 @@ impl GitPmApp {
         let busy = self.busy.is_some();
         let no_remotes = self.push_remotes.is_empty();
         let mut open = self.show_push_dialog;
-        egui::Window::new(format!("推送到远程 — {project_name}"))
-            .collapsible(false)
-            .resizable(false)
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.label("选择远程仓库与分支进行推送；凭据注入与一键推送共用同一路径。");
+        egui::Window::new(tf(
+            lang,
+            "push-dialog-title",
+            &[("name", &project_name)],
+        ))
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.label(i18n::t(lang, "push-dialog-intro"));
+            ui.add_space(6.0);
+            if let Some(err) = &self.push_remotes_error {
+                ui.colored_label(egui::Color32::RED, err);
+            } else if no_remotes {
+                ui.label(i18n::t(lang, "push-no-remotes"));
+            } else {
+                egui::ComboBox::from_label(i18n::t(lang, "push-remote-label"))
+                    .selected_text(
+                        self.push_remotes
+                            .get(self.push_remote_sel)
+                            .map(String::as_str)
+                            .unwrap_or_default(),
+                    )
+                    .show_ui(ui, |ui| {
+                        for (idx, remote) in self.push_remotes.iter().enumerate() {
+                            ui.selectable_value(&mut self.push_remote_sel, idx, remote);
+                        }
+                    });
+            }
+            ui.add_space(6.0);
+            ui.add_sized(
+                [DIALOG_FIELD_WIDTH, 22.0],
+                egui::TextEdit::singleline(&mut self.push_branch)
+                    .hint_text(i18n::t(lang, "hint-push-branch")),
+            );
+            ui.checkbox(&mut self.push_set_upstream, i18n::t(lang, "push-set-upstream"));
+            if let Some(err) = &self.push_error {
                 ui.add_space(6.0);
-                if let Some(err) = &self.push_remotes_error {
-                    ui.colored_label(egui::Color32::RED, err);
-                } else if no_remotes {
-                    ui.label("无远程仓库，请先用命令行 git remote add");
-                } else {
-                    egui::ComboBox::from_label("远程：")
-                        .selected_text(
-                            self.push_remotes
-                                .get(self.push_remote_sel)
-                                .map(String::as_str)
-                                .unwrap_or_default(),
-                        )
-                        .show_ui(ui, |ui| {
-                            for (idx, remote) in self.push_remotes.iter().enumerate() {
-                                ui.selectable_value(&mut self.push_remote_sel, idx, remote);
-                            }
-                        });
+                ui.colored_label(egui::Color32::RED, err);
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button(i18n::t(lang, "btn-cancel")).clicked() {
+                    self.close_push_dialog();
                 }
-                ui.add_space(6.0);
-                ui.add_sized(
-                    [DIALOG_FIELD_WIDTH, 22.0],
-                    egui::TextEdit::singleline(&mut self.push_branch)
-                        .hint_text("分支名（如 main）"),
-                );
-                ui.checkbox(&mut self.push_set_upstream, "设置上游（-u）");
-                if let Some(err) = &self.push_error {
-                    ui.add_space(6.0);
-                    ui.colored_label(egui::Color32::RED, err);
+                let can_push = !busy
+                    && !no_remotes
+                    && !self.push_branch.trim().is_empty()
+                    && self.push_remotes_error.is_none();
+                if ui
+                    .add_enabled(
+                        can_push,
+                        egui::Button::new(format!(
+                            "{} {}",
+                            icons::ICON_PUSH,
+                            i18n::t(lang, "btn-push-go")
+                        )),
+                    )
+                    .clicked()
+                {
+                    self.submit_push_dialog();
                 }
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("取消").clicked() {
-                        self.close_push_dialog();
-                    }
-                    let can_push = !busy
-                        && !no_remotes
-                        && !self.push_branch.trim().is_empty()
-                        && self.push_remotes_error.is_none();
-                    if ui
-                        .add_enabled(
-                            can_push,
-                            egui::Button::new(format!("{} 推送", icons::ICON_PUSH)),
-                        )
-                        .clicked()
-                    {
-                        self.submit_push_dialog();
-                    }
-                });
             });
+        });
         // Closed via the window's X button.
         if !open {
             self.close_push_dialog();
@@ -2506,16 +2713,16 @@ impl GitPmApp {
     fn submit_push_dialog(&mut self) {
         self.push_error = None;
         let Some(project) = self.selected_project().cloned() else {
-            self.push_error = Some("未选择项目".into());
+            self.push_error = Some(i18n::t(self.lang, "err-no-project").into());
             return;
         };
         let Some(remote) = self.push_remotes.get(self.push_remote_sel).cloned() else {
-            self.push_error = Some("请选择远程仓库".into());
+            self.push_error = Some(i18n::t(self.lang, "err-select-remote").into());
             return;
         };
         let branch = self.push_branch.trim().to_string();
         if branch.is_empty() {
-            self.push_error = Some("请填写分支名".into());
+            self.push_error = Some(i18n::t(self.lang, "err-enter-branch").into());
             return;
         }
         let set_upstream = self.push_set_upstream;
@@ -2533,13 +2740,18 @@ impl GitPmApp {
         let auth_parts = self.load_credential_parts(project.id, remote);
         self.busy = Some(BusyOp {
             project_id: project.id,
-            label: format!("正在推送到 {remote}（{branch}）…"),
+            label: tf(
+                self.lang,
+                "busy-push-to",
+                &[("remote", remote), ("branch", branch)],
+            ),
         });
         let tx = self.result_tx.clone();
         let path = PathBuf::from(&project.path);
         let project_id = project.id;
         let remote = remote.to_string();
         let branch = branch.to_string();
+        let lang = self.lang;
         std::thread::spawn(move || {
             let Some((user, pass)) = auth_parts else {
                 send_plain_push_to(&tx, project_id, &path, &remote, &branch, set_upstream);
@@ -2573,7 +2785,10 @@ impl GitPmApp {
                 encoded_password: percent_encode_userinfo(&pass),
             };
             let flag = if set_upstream { " -u" } else { "" };
-            let label = format!("git push{flag} {remote} {branch}（凭据已注入）");
+            let label = format!(
+                "git push{flag} {remote} {branch}{}",
+                i18n::t(lang, "cred-injected")
+            );
             let args: Vec<&str> = if set_upstream {
                 vec!["push", "-u", &auth.url, &branch]
             } else {
@@ -2585,7 +2800,7 @@ impl GitPmApp {
             // 写入 `.git/config` 的 `branch.<branch>.remote`；必须在 send
             // 结果之前用真实 remote 名覆盖，缩短凭据落盘窗口。
             if push_needs_upstream_restore(true, set_upstream) {
-                output = restore_upstream_remote(output, &path, &remote, &branch, &auth);
+                output = restore_upstream_remote(output, &path, &remote, &branch, lang, &auth);
             }
             let _ = tx.send(GitResult { project_id, kind: ResultKind::PushTo(label), output });
         });
@@ -2647,41 +2862,46 @@ impl GitPmApp {
         if !self.show_history_window {
             return;
         }
+        let lang = self.lang;
         let Some(project_name) = self.selected_project().map(|p| p.name.clone()) else {
             self.show_history_window = false;
             return;
         };
         let exhausted = self.history_exhausted;
         let mut open = self.show_history_window;
-        egui::Window::new(format!("提交历史 — {project_name}"))
-            .collapsible(false)
-            .default_width(560.0)
-            .open(&mut open)
-            .show(ctx, |ui| {
-                if let Some(err) = &self.history_error {
-                    ui.colored_label(egui::Color32::RED, err);
-                    ui.add_space(4.0);
+        egui::Window::new(tf(
+            lang,
+            "history-title",
+            &[("name", &project_name)],
+        ))
+        .collapsible(false)
+        .default_width(560.0)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            if let Some(err) = &self.history_error {
+                ui.colored_label(egui::Color32::RED, err);
+                ui.add_space(4.0);
+            }
+            if self.history_commits.is_empty() {
+                if self.history_error.is_none() {
+                    ui.label(i18n::t(lang, "no-commits"));
                 }
-                if self.history_commits.is_empty() {
-                    if self.history_error.is_none() {
-                        ui.label("（无提交）");
-                    }
-                } else {
-                    egui::ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .max_height(360.0)
-                        .show(ui, |ui| {
-                            egui::Grid::new("history_grid")
-                                .striped(true)
-                                .num_columns(4)
-                                .spacing(egui::vec2(16.0, 4.0))
-                                .max_col_width(360.0)
-                                .show(ui, |ui| {
-                                    ui.strong("哈希");
-                                    ui.strong("作者");
-                                    ui.strong("日期");
-                                    ui.strong("说明");
-                                    ui.end_row();
+            } else {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .max_height(360.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("history_grid")
+                            .striped(true)
+                            .num_columns(4)
+                            .spacing(egui::vec2(16.0, 4.0))
+                            .max_col_width(360.0)
+                            .show(ui, |ui| {
+                                ui.strong(i18n::t(lang, "col-hash"));
+                                ui.strong(i18n::t(lang, "col-author"));
+                                ui.strong(i18n::t(lang, "col-date"));
+                                ui.strong(i18n::t(lang, "col-subject"));
+                                ui.end_row();
                                     for commit in &self.history_commits {
                                         let short = commit.hash.get(..8).unwrap_or(&commit.hash);
                                         ui.add(
@@ -2713,12 +2933,12 @@ impl GitPmApp {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
                     if ui
-                        .add_enabled(!exhausted, egui::Button::new("加载更多"))
+                        .add_enabled(!exhausted, egui::Button::new(i18n::t(lang, "btn-load-more")))
                         .clicked()
                     {
                         self.history_load_more();
                     }
-                    if ui.button("关闭").clicked() {
+                    if ui.button(i18n::t(lang, "btn-close")).clicked() {
                         self.close_history_window();
                     }
                 });
@@ -2744,7 +2964,7 @@ impl GitPmApp {
         }
         self.busy = Some(BusyOp {
             project_id: project.id,
-            label: format!("正在新建分支「{name}」…"),
+            label: tf(self.lang, "busy-new-branch", &[("name", &name)]),
         });
         let tx = self.result_tx.clone();
         let path = PathBuf::from(&project.path);
@@ -2791,13 +3011,13 @@ impl GitPmApp {
             Some(trimmed_msg.to_string())
         };
         let label = if message.is_some() {
-            format!("git tag -a {name} -m <说明>")
+            tf(self.lang, "label-tag-annotated", &[("name", &name)])
         } else {
             format!("git tag {name}")
         };
         self.busy = Some(BusyOp {
             project_id: project.id,
-            label: format!("正在打标签「{name}」…"),
+            label: tf(self.lang, "busy-tag", &[("name", &name)]),
         });
         let tx = self.result_tx.clone();
         let path = PathBuf::from(&project.path);
@@ -2812,25 +3032,26 @@ impl GitPmApp {
         if !self.confirm_remove {
             return;
         }
+        let lang = self.lang;
         let Some((name, id)) = self.selected_project().map(|p| (p.name.clone(), p.id)) else {
             self.confirm_remove = false;
             return;
         };
         let mut open = self.confirm_remove;
-        egui::Window::new("移除项目")
+        egui::Window::new(i18n::t(lang, "btn-remove-project"))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .open(&mut open)
             .show(ctx, |ui| {
-                ui.label(format!("确定要把「{name}」从列表中移除吗？"));
-                ui.label("仅从列表移除，不会删除磁盘上的文件。");
+                ui.label(tf(lang, "remove-confirm-body", &[("name", &name)]));
+                ui.label(i18n::t(lang, "remove-confirm-note"));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("取消").clicked() {
+                    if ui.button(i18n::t(lang, "btn-cancel")).clicked() {
                         self.confirm_remove = false;
                     }
-                    if ui.button("移除").clicked() {
+                    if ui.button(i18n::t(lang, "btn-remove")).clicked() {
                         self.remove_selected(id);
                     }
                 });
@@ -2848,7 +3069,7 @@ impl GitPmApp {
 
     fn reload_projects(&mut self) {
         let Some(conn) = self.conn.as_ref() else {
-            self.error = Some("数据库未打开".into());
+            self.error = Some(i18n::t(self.lang, "err-db-not-open").into());
             return;
         };
         match db::list_projects(conn) {
@@ -2860,25 +3081,31 @@ impl GitPmApp {
                 }
                 self.projects = projects;
             }
-            Err(e) => self.error = Some(format!("读取项目列表失败：{e}")),
+            Err(e) => {
+                self.error = Some(tf(self.lang, "err-list-projects", &[("err", &e.to_string())]))
+            }
         }
     }
 
     fn pick_and_add_project(&mut self) {
         self.error = None;
         let Some(conn) = self.conn.as_ref() else {
-            self.error = Some(self.open_error.clone().unwrap_or_else(|| "数据库未打开".into()));
+            self.error = Some(
+                self.open_error
+                    .clone()
+                    .unwrap_or_else(|| i18n::t(self.lang, "err-db-not-open").into()),
+            );
             return;
         };
         let Some(dir) = rfd::FileDialog::new()
-            .set_title("选择 git 仓库目录")
+            .set_title(i18n::t(self.lang, "fd-select-repo"))
             .pick_folder()
         else {
             return; // user cancelled the dialog; not an error
         };
         let path = dir.to_string_lossy().into_owned();
         if !git::is_repo(&dir) {
-            self.error = Some(format!("所选目录不是 git 仓库：{path}"));
+            self.error = Some(tf(self.lang, "err-not-repo", &[("path", &path)]));
             return;
         }
         let name = dir
@@ -2888,25 +3115,28 @@ impl GitPmApp {
         match db::list_projects(conn) {
             Ok(projects) => {
                 if projects.iter().any(|p| p.path == path) {
-                    self.error = Some(format!("该项目已在列表中：{path}"));
+                    self.error = Some(tf(self.lang, "err-project-exists", &[("path", &path)]));
                     return;
                 }
             }
             Err(e) => {
-                self.error = Some(format!("读取项目列表失败：{e}"));
+                self.error =
+                    Some(tf(self.lang, "err-list-projects", &[("err", &e.to_string())]));
                 return;
             }
         }
         match db::add_project(conn, &name, &path) {
             Ok(_) => self.reload_projects(),
-            Err(e) => self.error = Some(format!("添加项目失败：{e}")),
+            Err(e) => {
+                self.error = Some(tf(self.lang, "err-add-project", &[("err", &e.to_string())]))
+            }
         }
     }
 
     fn remove_selected(&mut self, id: i64) {
         self.confirm_remove = false;
         let Some(conn) = self.conn.as_ref() else {
-            self.error = Some("数据库未打开".into());
+            self.error = Some(i18n::t(self.lang, "err-db-not-open").into());
             return;
         };
         // Only the database row is deleted; the directory on disk is untouched.
@@ -2915,7 +3145,10 @@ impl GitPmApp {
                 self.error = None;
                 self.reload_projects();
             }
-            Err(e) => self.error = Some(format!("移除项目失败：{e}")),
+            Err(e) => {
+                self.error =
+                    Some(tf(self.lang, "err-remove-project", &[("err", &e.to_string())]));
+            }
         }
     }
 
@@ -2941,7 +3174,7 @@ impl GitPmApp {
 
     fn pick_clone_parent(&mut self) {
         if let Some(dir) = rfd::FileDialog::new()
-            .set_title("选择克隆父目录")
+            .set_title(i18n::t(self.lang, "fd-select-clone-parent"))
             .pick_folder()
         {
             self.clone_parent = Some(dir);
@@ -2952,34 +3185,35 @@ impl GitPmApp {
         if !self.show_clone_dialog {
             return;
         }
+        let lang = self.lang;
         let mut open = self.show_clone_dialog;
-        egui::Window::new("克隆仓库")
+        egui::Window::new(i18n::t(lang, "clone-dialog-title"))
             .collapsible(false)
             .resizable(false)
             .open(&mut open)
             .show(ctx, |ui| {
-                ui.label("克隆一个 git 仓库；成功后自动加入项目列表。");
+                ui.label(i18n::t(lang, "clone-intro"));
                 ui.add_space(6.0);
                 ui.add_sized(
                     [DIALOG_FIELD_WIDTH, 22.0],
                     egui::TextEdit::singleline(&mut self.clone_url)
-                        .hint_text("仓库 URL（https://… 或 git@…）"),
+                        .hint_text(i18n::t(lang, "hint-clone-url")),
                 );
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
-                    if ui.button("选择父目录…").clicked() {
+                    if ui.button(i18n::t(lang, "btn-select-parent")).clicked() {
                         self.pick_clone_parent();
                     }
                     match &self.clone_parent {
                         Some(dir) => ui.monospace(dir.display().to_string()),
-                        None => ui.label("（未选择父目录）"),
+                        None => ui.label(i18n::t(lang, "no-parent-chosen")),
                     }
                 });
                 ui.add_space(6.0);
                 ui.add_sized(
                     [DIALOG_FIELD_WIDTH, 22.0],
                     egui::TextEdit::singleline(&mut self.clone_subdir)
-                        .hint_text("子目录名（必填，不能含路径分隔符）"),
+                        .hint_text(i18n::t(lang, "hint-clone-subdir")),
                 );
                 if let Some(err) = &self.clone_error {
                     ui.add_space(6.0);
@@ -2987,13 +3221,16 @@ impl GitPmApp {
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("取消").clicked() {
+                    if ui.button(i18n::t(lang, "btn-cancel")).clicked() {
                         self.close_clone_dialog();
                     }
                     let ready = !self.clone_url.trim().is_empty()
                         && self.clone_parent.is_some()
                         && !self.clone_subdir.trim().is_empty();
-                    if ui.add_enabled(ready, egui::Button::new("克隆")).clicked() {
+                    if ui
+                        .add_enabled(ready, egui::Button::new(i18n::t(lang, "btn-clone")))
+                        .clicked()
+                    {
                         self.do_clone();
                     }
                 });
@@ -3010,15 +3247,15 @@ impl GitPmApp {
         let url = self.clone_url.trim().to_string();
         let subdir = self.clone_subdir.trim().to_string();
         if url.is_empty() || subdir.is_empty() {
-            self.clone_error = Some("请填写仓库 URL、父目录和子目录名".into());
+            self.clone_error = Some(i18n::t(self.lang, "err-clone-fields").into());
             return;
         }
         if subdir.contains('/') || subdir.contains('\\') || subdir == "." || subdir == ".." {
-            self.clone_error = Some("子目录名不能包含路径分隔符".into());
+            self.clone_error = Some(i18n::t(self.lang, "err-clone-subdir-sep").into());
             return;
         }
         let Some(parent) = self.clone_parent.clone() else {
-            self.clone_error = Some("请先选择克隆父目录".into());
+            self.clone_error = Some(i18n::t(self.lang, "err-clone-no-parent").into());
             return;
         };
         let target = parent.join(&subdir);
@@ -3026,23 +3263,29 @@ impl GitPmApp {
 
         // 查重：目标目录不存在，且不在项目列表中。
         if target.exists() {
-            self.clone_error = Some(format!("目标目录已存在：{target_str}"));
+            self.clone_error =
+                Some(tf(self.lang, "err-clone-target-exists", &[("path", &target_str)]));
             return;
         }
         {
             let Some(conn) = self.conn.as_ref() else {
-                self.clone_error = Some("数据库未打开".into());
+                self.clone_error = Some(i18n::t(self.lang, "err-db-not-open").into());
                 return;
             };
             match db::list_projects(conn) {
                 Ok(projects) => {
                     if projects.iter().any(|p| p.path == target_str) {
-                        self.clone_error = Some(format!("该项目已在列表中：{target_str}"));
+                        self.clone_error = Some(tf(
+                            self.lang,
+                            "err-project-exists",
+                            &[("path", &target_str)],
+                        ));
                         return;
                     }
                 }
                 Err(e) => {
-                    self.clone_error = Some(format!("读取项目列表失败：{e}"));
+                    self.clone_error =
+                        Some(tf(self.lang, "err-list-projects", &[("err", &e.to_string())]));
                     return;
                 }
             }
@@ -3052,13 +3295,18 @@ impl GitPmApp {
         match git::clone_repo(&url, &target) {
             Err(e) => {
                 self.log_git_error(&label, &e);
-                self.clone_error = Some(format!("无法运行 git：{e}"));
+                self.clone_error =
+                    Some(tf(self.lang, "err-git-run", &[("err", &e.to_string())]));
             }
             Ok(out) => {
                 self.log_git_output(&label, &out);
                 if !out.ok() {
-                    let detail = git_output_text(&out);
-                    self.clone_error = Some(format!("克隆失败（退出码 {}）：{detail}", out.code));
+                    let detail = git_output_text(self.lang, &out);
+                    self.clone_error = Some(tf(
+                        self.lang,
+                        "err-clone-failed",
+                        &[("code", &out.code.to_string()), ("detail", &detail)],
+                    ));
                     return;
                 }
                 let name = target
@@ -3066,12 +3314,15 @@ impl GitPmApp {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| subdir.clone());
                 let Some(conn) = self.conn.as_ref() else {
-                    self.clone_error = Some("数据库未打开".into());
+                    self.clone_error = Some(i18n::t(self.lang, "err-db-not-open").into());
                     return;
                 };
                 match db::add_project(conn, &name, &target_str) {
                     Ok(_) => self.close_clone_dialog(),
-                    Err(e) => self.clone_error = Some(format!("添加项目失败：{e}")),
+                    Err(e) => {
+                        self.clone_error =
+                            Some(tf(self.lang, "err-add-project", &[("err", &e.to_string())]))
+                    }
                 }
                 self.reload_projects();
             }
@@ -3100,56 +3351,63 @@ impl GitPmApp {
         if !self.show_cred_dialog {
             return;
         }
+        let lang = self.lang;
         let Some(project_name) = self.selected_project().map(|p| p.name.clone()) else {
             self.show_cred_dialog = false;
             return;
         };
         let mut open = self.show_cred_dialog;
-        egui::Window::new(format!("凭据 — {project_name}"))
-            .collapsible(false)
-            .resizable(false)
-            .open(&mut open)
-            .show(ctx, |ui| {
-                ui.label("凭据加密后保存在本机数据库；push/pull 到 origin 的 https 远端时自动注入。");
-                ui.add_space(6.0);
+        egui::Window::new(tf(
+            lang,
+            "cred-dialog-title",
+            &[("name", &project_name)],
+        ))
+        .collapsible(false)
+        .resizable(false)
+        .open(&mut open)
+        .show(ctx, |ui| {
+            ui.label(i18n::t(lang, "cred-intro"));
+            ui.add_space(6.0);
+            ui.add_sized(
+                [DIALOG_FIELD_WIDTH, 22.0],
+                egui::TextEdit::singleline(&mut self.cred_label)
+                    .hint_text(i18n::t(lang, "hint-cred-label")),
+            );
+            ui.add_space(6.0);
+            ui.add_sized(
+                [DIALOG_FIELD_WIDTH, 22.0],
+                egui::TextEdit::singleline(&mut self.cred_user)
+                    .hint_text(i18n::t(lang, "hint-username")),
+            );
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
                 ui.add_sized(
-                    [DIALOG_FIELD_WIDTH, 22.0],
-                    egui::TextEdit::singleline(&mut self.cred_label).hint_text("标签（如 origin）"),
+                    [DIALOG_FIELD_WIDTH - 80.0, 22.0],
+                    egui::TextEdit::singleline(&mut self.cred_pass)
+                        .password(true)
+                        .hint_text(i18n::t(lang, "hint-password")),
                 );
-                ui.add_space(6.0);
-                ui.add_sized(
-                    [DIALOG_FIELD_WIDTH, 22.0],
-                    egui::TextEdit::singleline(&mut self.cred_user).hint_text("用户名"),
-                );
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    ui.add_sized(
-                        [DIALOG_FIELD_WIDTH - 80.0, 22.0],
-                        egui::TextEdit::singleline(&mut self.cred_pass)
-                            .password(true)
-                            .hint_text("密码（掩码显示）"),
-                    );
-                    if ui.button("生成…").clicked() {
-                        self.open_gen_dialog();
-                    }
-                });
-                if let Some(err) = &self.cred_error {
-                    ui.add_space(6.0);
-                    ui.colored_label(egui::Color32::RED, err);
+                if ui.button(i18n::t(lang, "btn-generate")).clicked() {
+                    self.open_gen_dialog();
                 }
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    if ui.button("关闭").clicked() {
-                        self.close_cred_dialog();
-                    }
-                    if ui.button("删除凭据").clicked() {
-                        self.delete_credential();
-                    }
-                    if ui.button("保存").clicked() {
-                        self.save_credential();
-                    }
-                });
             });
+            if let Some(err) = &self.cred_error {
+                ui.add_space(6.0);
+                ui.colored_label(egui::Color32::RED, err);
+            }
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button(i18n::t(lang, "btn-close")).clicked() {
+                    self.close_cred_dialog();
+                }
+                if ui.button(i18n::t(lang, "btn-delete-credential")).clicked() {
+                    self.delete_credential();
+                }
+                if ui.button(i18n::t(lang, "btn-save")).clicked() {
+                    self.save_credential();
+                }
+            });
+        });
         // Closed via the window's X button.
         if !open {
             self.close_cred_dialog();
@@ -3163,25 +3421,28 @@ impl GitPmApp {
         let user = self.cred_user.trim().to_string();
         let pass = self.cred_pass.clone();
         if label.is_empty() || user.is_empty() || pass.is_empty() {
-            self.cred_error = Some("请填写标签、用户名和密码".into());
+            self.cred_error = Some(i18n::t(self.lang, "err-cred-fields").into());
             return;
         }
         let Some(project_id) = self.selected_project().map(|p| p.id) else {
-            self.cred_error = Some("未选择项目".into());
+            self.cred_error = Some(i18n::t(self.lang, "err-no-project").into());
             return;
         };
         let Some(keys) = self.keys.as_ref() else {
-            self.cred_error = Some("保险库未解锁".into());
+            self.cred_error = Some(i18n::t(self.lang, "err-vault-locked").into());
             return;
         };
         let Some(conn) = self.conn.as_ref() else {
-            self.cred_error = Some("数据库未打开".into());
+            self.cred_error = Some(i18n::t(self.lang, "err-db-not-open").into());
             return;
         };
         let secret = format!("{user}:{pass}");
         match db::store_credential(conn, keys, project_id, &label, &secret) {
             Ok(()) => self.close_cred_dialog(),
-            Err(e) => self.cred_error = Some(format!("保存凭据失败：{e}")),
+            Err(e) => {
+                self.cred_error =
+                    Some(tf(self.lang, "err-save-credential", &[("err", &e.to_string())]))
+            }
         }
     }
 
@@ -3190,20 +3451,26 @@ impl GitPmApp {
         self.cred_error = None;
         let label = self.cred_label.trim().to_string();
         if label.is_empty() {
-            self.cred_error = Some("请先填写要删除的标签".into());
+            self.cred_error = Some(i18n::t(self.lang, "err-cred-label-required").into());
             return;
         }
         let Some(project_id) = self.selected_project().map(|p| p.id) else {
-            self.cred_error = Some("未选择项目".into());
+            self.cred_error = Some(i18n::t(self.lang, "err-no-project").into());
             return;
         };
         let Some(conn) = self.conn.as_ref() else {
-            self.cred_error = Some("数据库未打开".into());
+            self.cred_error = Some(i18n::t(self.lang, "err-db-not-open").into());
             return;
         };
         match db::delete_credential(conn, project_id, &label) {
             Ok(_) => self.close_cred_dialog(),
-            Err(e) => self.cred_error = Some(format!("删除凭据失败：{e}")),
+            Err(e) => {
+                self.cred_error = Some(tf(
+                    self.lang,
+                    "err-delete-credential",
+                    &[("err", &e.to_string())],
+                ))
+            }
         }
     }
 
@@ -3232,34 +3499,35 @@ impl GitPmApp {
         if !self.show_pw_change {
             return;
         }
+        let lang = self.lang;
         let mut open = self.show_pw_change;
-        egui::Window::new("修改主密码")
+        egui::Window::new(i18n::t(lang, "pw-dialog-title"))
             .collapsible(false)
             .resizable(false)
             .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
             .open(&mut open)
             .show(ctx, |ui| {
-                ui.label("修改主密码后，所有已保存的凭据会立即用新密码重新加密。");
+                ui.label(i18n::t(lang, "pw-intro"));
                 ui.add_space(6.0);
                 ui.add_sized(
                     [DIALOG_FIELD_WIDTH, 22.0],
                     egui::TextEdit::singleline(&mut self.pw_old)
                         .password(true)
-                        .hint_text("旧主密码"),
+                        .hint_text(i18n::t(lang, "hint-old-master-password")),
                 );
                 ui.add_space(6.0);
                 ui.add_sized(
                     [DIALOG_FIELD_WIDTH, 22.0],
                     egui::TextEdit::singleline(&mut self.pw_new)
                         .password(true)
-                        .hint_text("新主密码"),
+                        .hint_text(i18n::t(lang, "hint-new-master-password")),
                 );
                 ui.add_space(6.0);
                 let confirm = ui.add_sized(
                     [DIALOG_FIELD_WIDTH, 22.0],
                     egui::TextEdit::singleline(&mut self.pw_new2)
                         .password(true)
-                        .hint_text("再次输入新主密码"),
+                        .hint_text(i18n::t(lang, "hint-repeat-new-master-password")),
                 );
                 let pressed_enter =
                     confirm.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
@@ -3269,10 +3537,10 @@ impl GitPmApp {
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if ui.button("取消").clicked() {
+                    if ui.button(i18n::t(lang, "btn-cancel")).clicked() {
                         self.close_pw_change_dialog();
                     }
-                    if ui.button("修改").clicked() || pressed_enter {
+                    if ui.button(i18n::t(lang, "btn-change")).clicked() || pressed_enter {
                         self.submit_master_password_change();
                     }
                 });
@@ -3290,16 +3558,20 @@ impl GitPmApp {
     fn submit_master_password_change(&mut self) {
         self.pw_error = None;
         if self.pw_old.is_empty() || self.pw_new.is_empty() || self.pw_new2.is_empty() {
-            self.pw_error = Some("请填写旧密码、新密码和确认密码".into());
+            self.pw_error = Some(i18n::t(self.lang, "err-pw-fields").into());
             return;
         }
         if self.pw_new != self.pw_new2 {
-            self.pw_error = Some("两次输入的新密码不一致，请重新输入".into());
+            self.pw_error = Some(i18n::t(self.lang, "err-pw-mismatch").into());
             self.pw_new2.clear();
             return;
         }
         let Some(conn) = self.conn.as_ref() else {
-            self.pw_error = Some(self.open_error.clone().unwrap_or_else(|| "数据库未打开".into()));
+            self.pw_error = Some(
+                self.open_error
+                    .clone()
+                    .unwrap_or_else(|| i18n::t(self.lang, "err-db-not-open").into()),
+            );
             return;
         };
         match db::change_master_password(conn, &self.pw_old, &self.pw_new) {
@@ -3311,8 +3583,8 @@ impl GitPmApp {
                         self.keys = Some(keys);
                         self.log.push(LogEntry {
                             ok: true,
-                            title: "主密码已修改".to_string(),
-                            text: "所有已保存凭据已用新主密码重新加密。".to_string(),
+                            title: i18n::t(self.lang, "log-master-changed").to_string(),
+                            text: i18n::t(self.lang, "log-master-changed-body").to_string(),
                         });
                         self.trim_log();
                         self.close_pw_change_dialog();
@@ -3323,15 +3595,22 @@ impl GitPmApp {
                         self.keys = None;
                         self.log.push(LogEntry {
                             ok: false,
-                            title: "主密码已修改，但刷新会话密钥失败".to_string(),
-                            text: format!("{e}；请重启程序并用新主密码解锁。"),
+                            title: i18n::t(self.lang, "log-master-changed-key-fail").to_string(),
+                            text: tf(
+                                self.lang,
+                                "log-restart-needed",
+                                &[("err", &e.to_string())],
+                            ),
                         });
                         self.trim_log();
                         self.close_pw_change_dialog();
                     }
                 }
             }
-            Err(e) => self.pw_error = Some(format!("修改主密码失败：{e}")),
+            Err(e) => {
+                self.pw_error =
+                    Some(tf(self.lang, "err-change-master-password", &[("err", &e.to_string())]))
+            }
         }
     }
 
@@ -3363,8 +3642,9 @@ impl GitPmApp {
         if !self.show_gen_dialog {
             return;
         }
+        let lang = self.lang;
         let mut open = self.show_gen_dialog;
-        egui::Window::new("密码生成器")
+        egui::Window::new(i18n::t(lang, "gen-title"))
             .id(egui::Id::new("cred_password_generator"))
             .collapsible(false)
             .resizable(false)
@@ -3384,8 +3664,9 @@ impl GitPmApp {
         if !self.show_tool_gen_window {
             return;
         }
+        let lang = self.lang;
         let mut open = self.show_tool_gen_window;
-        egui::Window::new("密码生成器")
+        egui::Window::new(i18n::t(lang, "gen-title"))
             .id(egui::Id::new("tool_password_generator"))
             .collapsible(false)
             .resizable(false)
@@ -3404,34 +3685,38 @@ impl GitPmApp {
     /// 可勾选「遮蔽显示」切换为 `•` 等宽掩码；仅凭据对话框内额外提供
     /// 「填入密码框」。
     fn show_generator_ui(&mut self, ui: &mut egui::Ui, window: GenWindow) {
-        ui.add(egui::Slider::new(&mut self.gen_opts.length, 8..=64).text("长度"));
+        let lang = self.lang;
+        ui.add(
+            egui::Slider::new(&mut self.gen_opts.length, 8..=64)
+                .text(i18n::t(lang, "gen-length")),
+        );
         // upper/lower/digits 固定启用（生成器要求至少一类字符）。
         let mut fixed_upper = true;
         ui.add_enabled(
             false,
-            egui::Checkbox::new(&mut fixed_upper, "大写字母（固定启用）"),
+            egui::Checkbox::new(&mut fixed_upper, i18n::t(lang, "gen-upper-fixed")),
         );
         let mut fixed_lower = true;
         ui.add_enabled(
             false,
-            egui::Checkbox::new(&mut fixed_lower, "小写字母（固定启用）"),
+            egui::Checkbox::new(&mut fixed_lower, i18n::t(lang, "gen-lower-fixed")),
         );
         let mut fixed_digits = true;
         ui.add_enabled(
             false,
-            egui::Checkbox::new(&mut fixed_digits, "数字（固定启用）"),
+            egui::Checkbox::new(&mut fixed_digits, i18n::t(lang, "gen-digits-fixed")),
         );
-        ui.checkbox(&mut self.gen_opts.special, "特殊字符");
-        if ui.button("生成").clicked() {
+        ui.checkbox(&mut self.gen_opts.special, i18n::t(lang, "gen-special"));
+        if ui.button(i18n::t(lang, "btn-generate-plain")).clicked() {
             self.generate_password();
         }
         // 明文（默认）用可编辑 TextEdit 显示（可选中复制）；遮蔽时以 `•`
         // 重复等宽显示，长度与明文一致。
-        ui.checkbox(&mut self.gen_masked, "遮蔽显示");
+        ui.checkbox(&mut self.gen_masked, i18n::t(lang, "gen-masked"));
         if self.gen_masked {
             let dots = "•".repeat(self.gen_result.chars().count());
             if dots.is_empty() {
-                ui.label("（点击「生成」后显示在此）");
+                ui.label(i18n::t(lang, "gen-result-empty"));
             } else {
                 ui.add_sized(
                     [DIALOG_FIELD_WIDTH, 22.0],
@@ -3442,7 +3727,7 @@ impl GitPmApp {
             ui.add_sized(
                 [DIALOG_FIELD_WIDTH, 22.0],
                 egui::TextEdit::singleline(&mut self.gen_result)
-                    .hint_text("（点击「生成」后显示在此，明文显示）"),
+                    .hint_text(i18n::t(lang, "gen-result-hint")),
             );
         }
         if let Some(err) = &self.gen_error {
@@ -3452,18 +3737,24 @@ impl GitPmApp {
         ui.add_space(8.0);
         ui.horizontal(|ui| {
             let has_result = !self.gen_result.is_empty();
-            if ui.add_enabled(has_result, egui::Button::new("复制")).clicked() {
+            if ui
+                .add_enabled(has_result, egui::Button::new(i18n::t(lang, "btn-copy")))
+                .clicked()
+            {
                 ui.ctx().copy_text(self.gen_result.clone());
             }
             if window == GenWindow::CredDialog
                 && ui
-                    .add_enabled(has_result, egui::Button::new("填入密码框"))
+                    .add_enabled(
+                        has_result,
+                        egui::Button::new(i18n::t(lang, "btn-fill-password")),
+                    )
                     .clicked()
             {
                 self.cred_pass = std::mem::take(&mut self.gen_result);
                 self.close_generator(window);
             }
-            if ui.button("关闭").clicked() {
+            if ui.button(i18n::t(lang, "btn-close")).clicked() {
                 self.close_generator(window);
             }
         });
@@ -3474,7 +3765,10 @@ impl GitPmApp {
         self.gen_error = None;
         match password::generate(&self.gen_opts) {
             Ok(pw) => self.gen_result = pw,
-            Err(e) => self.gen_error = Some(format!("生成密码失败：{e}")),
+            Err(e) => {
+                self.gen_error =
+                    Some(tf(self.lang, "err-generate", &[("err", &e.to_string())]))
+            }
         }
     }
 
@@ -3733,7 +4027,7 @@ mod tests {
     #[test]
     fn group_handles_ungroupable_paths() {
         // 空路径 / 纯根路径 / 单段相对路径推导不出父目录：归入单一的
-        // 「(未分组)」节点（排在最后），其余正常归组。
+        // 未分组节点（label 为稳定 key，排在最后），其余正常归组。
         let groups = group_projects_by_parent(
             &paths(&["", "C:\\", "relative-repo", "E:\\ws\\normal"]),
             true,
@@ -3741,7 +4035,7 @@ mod tests {
         assert_eq!(groups.len(), 2);
         assert_eq!(groups[0].label, "E:\\ws");
         assert_eq!(groups[0].members, vec![3]);
-        assert_eq!(groups[1].label, "(未分组)");
+        assert_eq!(groups[1].label, GROUP_UNGROUPED_KEY);
         assert_eq!(groups[1].members, vec![0, 1, 2]);
     }
 
@@ -3933,7 +4227,7 @@ mod tests {
         assert_eq!(FileStatus::Deleted.marker(), "−");
         assert_eq!(FileStatus::Conflict.marker(), "!");
         assert_eq!(FileStatus::Renamed.marker(), "R");
-        assert!(!status_legend_text(FileStatus::Added).is_empty());
+        assert!(!status_legend_text(Lang::Zh, FileStatus::Added).is_empty());
     }
 
     // -------------------------------------- injected -u push upstream restore
@@ -3971,7 +4265,7 @@ mod tests {
             encoded_password: "s3cret".to_string(),
         };
         let push_out = git::GitOutput { code: 0, stdout: String::new(), stderr: String::new() };
-        let out = restore_upstream_remote(Ok(push_out), &repo, "origin", "main", &auth)
+        let out = restore_upstream_remote(Ok(push_out), &repo, "origin", "main", Lang::Zh, &auth)
             .expect("restore returns the push output");
         assert!(out.ok(), "回写成功不得改判推送结果");
         assert!(!out.stdout.contains("s3cret"), "输出不得含凭据");
@@ -3999,11 +4293,16 @@ mod tests {
             stderr: String::new(),
         };
         let missing = std::env::temp_dir().join("git-pm-definitely-missing-repo");
-        let out = restore_upstream_remote(Ok(push_out), &missing, "origin", "main", &auth)
-            .expect("push result must stay Ok");
+        let out =
+            restore_upstream_remote(Ok(push_out), &missing, "origin", "main", Lang::Zh, &auth)
+                .expect("push result must stay Ok");
         assert!(out.ok(), "回写失败不得把推送改判为失败");
         assert!(out.stdout.contains("pushed"));
-        assert!(out.stderr.contains("上游回写失败"), "缺少警告：{}", out.stderr);
+        assert!(
+            out.stderr.contains(i18n::t(Lang::Zh, "warn-upstream-restore-failed")),
+            "缺少警告：{}",
+            out.stderr
+        );
         assert!(!out.stderr.contains("s3cret"), "输出不得含凭据");
     }
 }
