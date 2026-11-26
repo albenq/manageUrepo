@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 
+use crate::browser;
 use crate::crypto::{self, CryptoError, VaultKeys};
 use crate::db::{self, Project};
 use crate::git;
@@ -243,6 +244,14 @@ pub struct GitPmApp {
     /// Bottom read-only log, one entry per git invocation.
     log: Vec<LogEntry>,
 
+    // Central panel: file browser of the selected project.
+    /// The directory currently being browsed; `None` = not yet initialized (or no project selected).
+    browser_path: Option<PathBuf>,
+    /// Contents of the current directory, cached from `browser::list_dir`.
+    browser_entries: Vec<browser::Entry>,
+    /// The most recent directory read failure message, rendered inside the panel; never panics.
+    browser_err: Option<String>,
+
     // Clone dialog.
     show_clone_dialog: bool,
     clone_url: String,
@@ -294,6 +303,9 @@ impl GitPmApp {
             tag_name: String::new(),
             tag_msg: String::new(),
             log: Vec::new(),
+            browser_path: None,
+            browser_entries: Vec::new(),
+            browser_err: None,
             show_clone_dialog: false,
             clone_url: String::new(),
             clone_parent: None,
@@ -509,6 +521,12 @@ impl GitPmApp {
                     ui.heading(&project.name);
                     ui.label(format!("路径：{}", project.path));
                     ui.label(format!("添加时间：{}", project.added_at));
+                    ui.separator();
+                    // 防御性兜底：已选中项目但浏览器尚未初始化时，重置到项目根目录。
+                    if self.browser_path.is_none() {
+                        self.reset_browser_to(Path::new(&project.path));
+                    }
+                    self.show_browser(ui, Path::new(&project.path));
                 }
                 None => {
                     ui.heading("git-pm");
@@ -630,8 +648,10 @@ impl GitPmApp {
                             [ui.available_width(), 22.0],
                             egui::SelectableLabel::new(selected, name),
                         );
-                        if resp.clicked() {
+                        if resp.clicked() && self.selected != Some(id) {
+                            // 选中项目变化：浏览器重置为新项目的根目录。
                             self.selected = Some(id);
+                            self.reset_browser_to(Path::new(&path));
                         }
                         if !path.is_empty() {
                             resp.on_hover_text(path);
@@ -790,6 +810,166 @@ impl GitPmApp {
                             ui.colored_label(color, &entry.title);
                             ui.monospace(&entry.text);
                             ui.add_space(6.0);
+                        }
+                    });
+            });
+    }
+
+    // -------------------------------------------------------- file browser
+
+    /// 把浏览器重置到给定根目录（选中项目变化时调用）。
+    /// 根目录读取失败时仍指向该目录并清空条目，错误显示在面板内。
+    fn reset_browser_to(&mut self, root: &Path) {
+        self.browser_err = None;
+        match browser::list_dir(root) {
+            Ok(entries) => {
+                self.browser_path = Some(root.to_path_buf());
+                self.browser_entries = entries;
+            }
+            Err(e) => {
+                self.browser_path = Some(root.to_path_buf());
+                self.browser_entries = Vec::new();
+                self.browser_err = Some(format!("无法读取目录：{e}"));
+            }
+        }
+    }
+
+    /// 进入某个目录：成功则更新路径与条目；失败仅记录 `browser_err`
+    /// （保留当前视图，显示在面板内，不 panic）。
+    fn load_browser_dir(&mut self, path: PathBuf) {
+        match browser::list_dir(&path) {
+            Ok(entries) => {
+                self.browser_path = Some(path);
+                self.browser_entries = entries;
+                self.browser_err = None;
+            }
+            Err(e) => self.browser_err = Some(format!("无法进入目录：{e}")),
+        }
+    }
+
+    /// 中央文件浏览器：只读路径行 +「上一级」+ 多列条目列表。
+    fn show_browser(&mut self, ui: &mut egui::Ui, root: &Path) {
+        ui.horizontal(|ui| {
+            ui.strong("位置：");
+            let path_text = self
+                .browser_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "（未加载）".to_string());
+            // 只读文本（Label 不可编辑）；固定宽度截断，避免长路径把按钮挤出面板。
+            ui.add_sized(
+                [(ui.available_width() - 96.0).max(0.0), 18.0],
+                egui::Label::new(egui::RichText::new(&path_text).monospace())
+                    .wrap_mode(egui::TextWrapMode::Truncate),
+            );
+            let at_root = self.browser_path.as_ref().is_none_or(|p| p == root);
+            if ui
+                .add_enabled(!at_root, egui::Button::new("上一级"))
+                .clicked()
+            {
+                // 到达项目根时按钮禁用；这里只会在根目录之下被触发。
+                if let Some(parent) = self.browser_path.as_ref().and_then(|p| p.parent()) {
+                    self.load_browser_dir(parent.to_path_buf());
+                }
+            }
+        });
+        ui.separator();
+
+        if let Some(err) = &self.browser_err {
+            ui.colored_label(egui::Color32::RED, err);
+            ui.add_space(4.0);
+        }
+
+        // 先克隆条目快照，点击处理器即可再借用 self（与项目列表同理由）。
+        let rows: Vec<(String, bool, u64, Option<String>, bool)> = self
+            .browser_entries
+            .iter()
+            .map(|e| {
+                (
+                    e.name.clone(),
+                    e.is_dir,
+                    e.size,
+                    e.modified.clone(),
+                    e.is_hidden,
+                )
+            })
+            .collect();
+
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                if rows.is_empty() && self.browser_err.is_none() {
+                    ui.label("（空目录）");
+                }
+                egui::Grid::new("file_browser_grid")
+                    .striped(true)
+                    .num_columns(4)
+                    .spacing(egui::vec2(16.0, 6.0))
+                    .max_col_width(320.0)
+                    .show(ui, |ui| {
+                        ui.strong("名称");
+                        ui.strong("类型");
+                        ui.strong("大小");
+                        ui.strong("修改时间");
+                        ui.end_row();
+
+                        for (name, is_dir, size, modified, is_hidden) in rows {
+                            // 隐藏项（.git 等）正常显示但整行视觉弱化，仍可进入。
+                            let dim = |rt: egui::RichText| {
+                                if is_hidden {
+                                    rt.weak()
+                                } else {
+                                    rt
+                                }
+                            };
+                            // 目录行：四格均可点击（点击行内任意位置进入）；
+                            // 文件行：无动作（仅 hover 感应）。
+                            let sense = if is_dir {
+                                egui::Sense::click()
+                            } else {
+                                egui::Sense::hover()
+                            };
+                            let name_resp = ui.add(
+                                egui::Label::new(dim(egui::RichText::new(&name)))
+                                    .wrap_mode(egui::TextWrapMode::Truncate)
+                                    .sense(sense),
+                            );
+                            let type_resp = ui.add(
+                                egui::Label::new(dim(egui::RichText::new(if is_dir {
+                                    "目录"
+                                } else {
+                                    "文件"
+                                })))
+                                .sense(sense),
+                            );
+                            let size_text = if is_dir {
+                                "—".to_string()
+                            } else {
+                                browser::fmt_size(size)
+                            };
+                            let size_resp = ui
+                                .add(egui::Label::new(dim(egui::RichText::new(size_text))).sense(sense));
+                            let time_resp = ui.add(
+                                egui::Label::new(dim(egui::RichText::new(
+                                    modified.unwrap_or_else(|| "—".to_string()),
+                                )))
+                                .sense(sense),
+                            );
+                            ui.end_row();
+                            if is_dir {
+                                let row = name_resp
+                                    .union(type_resp)
+                                    .union(size_resp)
+                                    .union(time_resp);
+                                if row.clicked() {
+                                    if let Some(target) =
+                                        self.browser_path.as_ref().map(|p| p.join(&name))
+                                    {
+                                        self.load_browser_dir(target);
+                                    }
+                                }
+                                row.on_hover_cursor(egui::CursorIcon::PointingHand);
+                            }
                         }
                     });
             });
