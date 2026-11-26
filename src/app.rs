@@ -103,6 +103,10 @@ const COLOR_STATUS_CHANGED: egui::Color32 = egui::Color32::from_rgb(224, 176, 0)
 /// 新增/未跟踪状态标记的颜色（绿色）。
 const COLOR_STATUS_ADDED: egui::Color32 = egui::Color32::from_rgb(64, 200, 112);
 
+/// 注入凭据 + `-u` 推送成功但上游回写失败时，追加到输出区的警告文案。
+const WARN_UPSTREAM_RESTORE_FAILED: &str =
+    "⚠ 上游回写失败，.git/config 中可能残留含凭据的 URL，请手动检查";
+
 /// One rendered git invocation in the bottom read-only output area.
 struct LogEntry {
     /// False when the call failed (non-zero exit or git could not run).
@@ -269,6 +273,57 @@ fn send_plain_push_to(
         git::push(path, remote, branch)
     };
     let _ = tx.send(GitResult { project_id, kind: ResultKind::PushTo(label), output });
+}
+
+/// 判定一次推送是否需要「上游回写」：只有**注入凭据**且带 `-u` 的推送
+/// 才会让 git 在推送成功后把含明文凭据的注入 URL 持久化写入目标仓库
+/// `.git/config` 的 `branch.<branch>.remote`（凭据落盘）；其余组合
+/// （不注入，或不带 `-u`）没有凭据落盘问题，无需回写。
+fn push_needs_upstream_restore(injected: bool, set_upstream: bool) -> bool {
+    injected && set_upstream
+}
+
+/// 注入凭据 + `-u` 推送成功后的上游回写：git 已把含明文凭据的注入 URL
+/// 写入 `.git/config` 的 `branch.<branch>.remote`，这里立即用真实
+/// remote 名覆盖（`branch.<branch>.merge` 由 git 写入时即为正确的
+/// `refs/heads/<branch>`，无需改动）。
+///
+/// - 仅在推送成功时回写：推送失败时 git 不写配置，无可回写；
+/// - 回写失败**不改判**推送失败：在输出 stderr 追加
+///   [`WARN_UPSTREAM_RESTORE_FAILED`] 与回写失败详情；
+/// - 回写命令的输出并入后，合成结果整体再过一次 [`redact_output`]
+///   （双保险），任何凭据残留都不会进入输出区/日志。
+fn restore_upstream_remote(
+    output: std::io::Result<git::GitOutput>,
+    path: &Path,
+    remote: &str,
+    branch: &str,
+    auth: &InjectedAuth,
+) -> std::io::Result<git::GitOutput> {
+    // git 本就没运行（Err）：没有推送也没有配置写入，原样返回错误。
+    let push_out = output?;
+    if !push_out.ok() {
+        return Ok(push_out); // 推送失败：git 未写配置，无需回写
+    }
+    let pairs = auth.redact_pairs();
+    let key = format!("branch.{branch}.remote");
+    let detail = match git::run(path, &["config", &key, remote]) {
+        Ok(cfg) if cfg.ok() => return Ok(push_out),
+        Ok(cfg) => git_output_text(&cfg),
+        Err(e) => format!("无法运行 git：{e}"),
+    };
+    let mut stderr = push_out.stderr;
+    if !stderr.is_empty() {
+        stderr.push('\n');
+    }
+    stderr.push_str(WARN_UPSTREAM_RESTORE_FAILED);
+    stderr.push('\n');
+    stderr.push_str(&detail);
+    // 双保险：合成后的完整输出整体再脱敏一次。
+    Ok(redact_output(
+        git::GitOutput { code: push_out.code, stdout: push_out.stdout, stderr },
+        &pairs,
+    ))
 }
 
 /// Split a successful read-only output into trimmed non-empty lines.
@@ -2365,8 +2420,14 @@ impl GitPmApp {
             } else {
                 vec!["push", &auth.url, &branch]
             };
-            let output = git::run(&path, &args)
+            let mut output = git::run(&path, &args)
                 .map(|out| redact_output(out, &auth.redact_pairs()));
+            // 注入凭据 + `-u`：git 推送成功会把含明文凭据的注入 URL 持久化
+            // 写入 `.git/config` 的 `branch.<branch>.remote`；必须在 send
+            // 结果之前用真实 remote 名覆盖，缩短凭据落盘窗口。
+            if push_needs_upstream_restore(true, set_upstream) {
+                output = restore_upstream_remote(output, &path, &remote, &branch, &auth);
+            }
             let _ = tx.send(GitResult { project_id, kind: ResultKind::PushTo(label), output });
         });
     }
@@ -3300,6 +3361,7 @@ impl eframe::App for GitPmApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn should_apply_matches_selected_project() {
@@ -3569,5 +3631,76 @@ mod tests {
         assert_eq!(FileStatus::Conflict.marker(), "!");
         assert_eq!(FileStatus::Renamed.marker(), "R");
         assert!(!status_legend_text(FileStatus::Added).is_empty());
+    }
+
+    // -------------------------------------- injected -u push upstream restore
+
+    #[test]
+    fn push_needs_upstream_restore_only_for_injected_upstream() {
+        // 注入凭据 + `-u`：git 会把含明文凭据的 URL 持久化写入
+        // .git/config 的 branch.<branch>.remote → 推送成功后必须回写。
+        assert!(push_needs_upstream_restore(true, true));
+        // 其余组合均无凭据落盘问题：不回写。
+        assert!(!push_needs_upstream_restore(true, false));
+        assert!(!push_needs_upstream_restore(false, true));
+        assert!(!push_needs_upstream_restore(false, false));
+    }
+
+    #[test]
+    fn restore_upstream_remote_overwrites_config_with_real_remote() {
+        // 集成：模拟注入 -u 推送后的落盘状态（branch.main.remote 为含凭据
+        // 的 URL），回写后必须变回真实 remote 名，且输出中无凭据。
+        let guard = tempdir().expect("tempdir");
+        let repo = guard.path().to_path_buf();
+        let init = git::run(&repo, &["init"]).expect("git init in tempdir");
+        assert!(init.ok(), "git init failed: {}", init.stderr);
+        let set = git::run(
+            &repo,
+            &["config", "branch.main.remote", "https://u:s3cret@host/repo.git"],
+        )
+        .expect("git config set");
+        assert!(set.ok(), "git config failed: {}", set.stderr);
+
+        let auth = InjectedAuth {
+            url: "https://u:s3cret@host/repo.git".to_string(),
+            plain_url: "https://host/repo.git".to_string(),
+            password: "s3cret".to_string(),
+            encoded_password: "s3cret".to_string(),
+        };
+        let push_out = git::GitOutput { code: 0, stdout: String::new(), stderr: String::new() };
+        let out = restore_upstream_remote(Ok(push_out), &repo, "origin", "main", &auth)
+            .expect("restore returns the push output");
+        assert!(out.ok(), "回写成功不得改判推送结果");
+        assert!(!out.stdout.contains("s3cret"), "输出不得含凭据");
+        assert!(!out.stderr.contains("s3cret"), "输出不得含凭据");
+
+        let check = git::run(&repo, &["config", "--get", "branch.main.remote"])
+            .expect("git config get");
+        assert!(check.ok(), "git config --get failed: {}", check.stderr);
+        assert_eq!(check.stdout.trim(), "origin", "必须覆盖为真实 remote 名");
+    }
+
+    #[test]
+    fn restore_upstream_failure_keeps_push_ok_and_warns() {
+        // 回写失败（git 无法运行，如目录不存在）：推送仍记为成功，
+        // 仅追加警告文案；输出不得含凭据。
+        let auth = InjectedAuth {
+            url: "https://u:s3cret@host/repo.git".to_string(),
+            plain_url: "https://host/repo.git".to_string(),
+            password: "s3cret".to_string(),
+            encoded_password: "s3cret".to_string(),
+        };
+        let push_out = git::GitOutput {
+            code: 0,
+            stdout: "pushed".to_string(),
+            stderr: String::new(),
+        };
+        let missing = std::env::temp_dir().join("git-pm-definitely-missing-repo");
+        let out = restore_upstream_remote(Ok(push_out), &missing, "origin", "main", &auth)
+            .expect("push result must stay Ok");
+        assert!(out.ok(), "回写失败不得把推送改判为失败");
+        assert!(out.stdout.contains("pushed"));
+        assert!(out.stderr.contains("上游回写失败"), "缺少警告：{}", out.stderr);
+        assert!(!out.stderr.contains("s3cret"), "输出不得含凭据");
     }
 }
