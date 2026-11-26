@@ -1,5 +1,6 @@
 mod crypto;
 mod db;
+mod password;
 
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions::default();
