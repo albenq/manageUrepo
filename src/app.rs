@@ -463,6 +463,43 @@ fn status_section(lang: Lang, out: &git::GitOutput) -> StatusSection {
     }
 }
 
+/// 把 `git status --porcelain=v1 -b` 原始输出格式化为人类可读文字：
+/// `## ` 分支行译为「分支：…」，每个变更条目译为「[状态标签] 路径」，
+/// 条目零变更时显示「工作区干净」。无法解析的行原样保留。
+fn format_worktree_status(lang: Lang, porcelain: &str) -> String {
+    let mut lines_out: Vec<String> = Vec::new();
+    let mut has_entries = false;
+    for line in porcelain.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Some(branch) = line.strip_prefix("## ") {
+            lines_out.push(format!(
+                "{}{}",
+                i18n::t(lang, "worktree-branch"),
+                branch.trim()
+            ));
+            continue;
+        }
+        let bytes = line.as_bytes();
+        if bytes.len() < 4 {
+            lines_out.push(line.to_string());
+            continue;
+        }
+        let Some(path) = porcelain_entry_path(&line[3..]) else {
+            lines_out.push(line.to_string());
+            continue;
+        };
+        let status = status_from_xy(bytes[0], bytes[1]);
+        lines_out.push(format!("[{}] {}", status_legend_text(lang, status), path));
+        has_entries = true;
+    }
+    if !has_entries {
+        lines_out.push(i18n::t(lang, "worktree-clean").to_string());
+    }
+    lines_out.join("\n")
+}
+
 /// Render one status-area section: plain text on success, red on failure.
 fn show_section(
     ui: &mut egui::Ui,
@@ -1903,7 +1940,27 @@ impl GitPmApp {
             ui.add(egui::ProgressBar::new(0.0).animate(true));
             return;
         };
-        show_section(ui, lang, i18n::t(lang, "section-worktree"), snapshot.status.as_ref());
+        // 「工作区」区展示人类可读的状态文字（原始 porcelain 输出仍完整
+        // 记录在底部输出区，便于排障）；分支/标签区维持原样。
+        let worktree = snapshot.status.as_ref().map(|section| {
+            if section.ok {
+                StatusSection {
+                    ok: true,
+                    text: format_worktree_status(lang, &section.text),
+                }
+            } else {
+                StatusSection {
+                    ok: false,
+                    text: section.text.clone(),
+                }
+            }
+        });
+        show_section(
+            ui,
+            lang,
+            i18n::t(lang, "section-worktree"),
+            worktree.as_ref(),
+        );
         show_section(ui, lang, i18n::t(lang, "section-branches"), snapshot.branches.as_ref());
         show_section(ui, lang, i18n::t(lang, "section-tags"), snapshot.tags.as_ref());
     }
@@ -4232,6 +4289,26 @@ mod tests {
     }
 
     // ------------------------------------------------ porcelain parsing
+
+    #[test]
+    fn format_worktree_status_translates_entries() {
+        let text = format_worktree_status(
+            Lang::Zh,
+            "## main...origin/main\n M a.txt\n?? b.txt\nUU c.txt\n",
+        );
+        assert!(text.contains("分支：main...origin/main"));
+        assert!(text.contains("[已修改] a.txt"));
+        assert!(text.contains("[新增/未跟踪] b.txt"));
+        assert!(text.contains("[冲突] c.txt"));
+        assert!(!text.contains("?? b.txt"));
+    }
+
+    #[test]
+    fn format_worktree_status_clean_and_empty() {
+        let text = format_worktree_status(Lang::Zh, "## main\n");
+        assert!(text.contains("工作区干净"));
+        assert!(format_worktree_status(Lang::En, "").contains("clean"));
+    }
 
     #[test]
     fn status_from_xy_maps_pairs() {

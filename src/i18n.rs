@@ -105,6 +105,8 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("btn-refresh", "刷新", "Refresh"),
     ("loading", "加载中…", "Loading…"),
     ("section-worktree", "工作区（status）", "Worktree (status)"),
+    ("worktree-branch", "分支：", "Branch: "),
+    ("worktree-clean", "（工作区干净，无变更）", "(Working tree clean)"),
     ("section-branches", "分支（branch）", "Branches (branch)"),
     ("section-tags", "标签（tag）", "Tags (tag)"),
     ("not-loaded", "（尚未加载）", "(Not loaded yet)"),
