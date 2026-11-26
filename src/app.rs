@@ -116,11 +116,21 @@ const HISTORY_FIRST_PAGE: usize = 10;
 /// 提交历史窗口「加载更多」每次追加的条数。
 const HISTORY_PAGE_SIZE: usize = 20;
 
-/// 修改/重命名状态标记的颜色（金琥珀色：纯黄在明亮主题下不可读）。
-const COLOR_STATUS_CHANGED: egui::Color32 = egui::Color32::from_rgb(224, 176, 0);
-
-/// 新增/未跟踪状态标记的颜色（绿色）。
-const COLOR_STATUS_ADDED: egui::Color32 = egui::Color32::from_rgb(64, 200, 112);
+/// 文件状态的颜色（按主题调校，两种主题下都清晰）：
+/// 修改=红、新增/未跟踪=绿、删除=橙、重命名=蓝、冲突=亮红。
+fn status_color(status: FileStatus, dark: bool) -> egui::Color32 {
+    match (status, dark) {
+        (FileStatus::Conflict, _) => egui::Color32::from_rgb(255, 64, 64),
+        (FileStatus::Modified, true) => egui::Color32::from_rgb(255, 107, 107),
+        (FileStatus::Modified, false) => egui::Color32::from_rgb(200, 40, 40),
+        (FileStatus::Deleted, true) => egui::Color32::from_rgb(255, 169, 77),
+        (FileStatus::Deleted, false) => egui::Color32::from_rgb(191, 92, 0),
+        (FileStatus::Renamed, true) => egui::Color32::from_rgb(116, 169, 255),
+        (FileStatus::Renamed, false) => egui::Color32::from_rgb(28, 100, 210),
+        (FileStatus::Added, true) => egui::Color32::from_rgb(63, 185, 80),
+        (FileStatus::Added, false) => egui::Color32::from_rgb(26, 127, 55),
+    }
+}
 
 /// 主色（青绿，取自程序图标）：选中态、按钮激活态、悬停描边。
 const COLOR_ACCENT: egui::Color32 = egui::Color32::from_rgb(38, 166, 154);
@@ -204,8 +214,10 @@ fn custom_visuals(theme: Theme) -> egui::Visuals {
             v.widgets.active.bg_fill = COLOR_ACCENT_DARK;
             v.widgets.active.bg_stroke =
                 egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(16, 105, 96));
+            // 注：egui 的「强调文本」颜色取自 active 文字色；明亮主题必须是
+            // 深色，否则 `.strong()` 文本（如目录名）在浅底上不可见。
             v.widgets.active.fg_stroke =
-                egui::Stroke::new(1.5_f32, egui::Color32::WHITE);
+                egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(14, 30, 38));
         }
     }
     let rounding = egui::Rounding::same(6.0);
@@ -878,17 +890,14 @@ fn current_branch_from_porcelain(porcelain: &str) -> Option<String> {
     }
 }
 
-/// 浏览器条目名前的状态标记：着色字符；冲突为红底加粗白字。
-fn status_marker_rich(status: FileStatus) -> egui::RichText {
-    let (color, conflict) = match status {
-        FileStatus::Conflict => (egui::Color32::WHITE, true),
-        FileStatus::Deleted => (egui::Color32::RED, false),
-        FileStatus::Modified | FileStatus::Renamed => (COLOR_STATUS_CHANGED, false),
-        FileStatus::Added => (COLOR_STATUS_ADDED, false),
-    };
+/// 浏览器条目名前的状态标记：按状态着色的字符；冲突为红底加粗白字。
+fn status_marker_rich(status: FileStatus, dark: bool) -> egui::RichText {
+    let color = status_color(status, dark);
     let text = egui::RichText::new(status.marker()).color(color);
-    if conflict {
-        text.strong().background_color(egui::Color32::RED)
+    if status == FileStatus::Conflict {
+        text.strong()
+            .color(egui::Color32::WHITE)
+            .background_color(color)
     } else {
         text
     }
@@ -1788,9 +1797,13 @@ impl GitPmApp {
                 ui.allocate_exact_size(egui::vec2(2.0 * char_w, row_h), egui::Sense::click());
             paint_tree_arrow(ui, rect, open);
             let name_resp = ui.add(
-                egui::Label::new(egui::RichText::new(title).strong())
-                    .sense(egui::Sense::click())
-                    .truncate(),
+                egui::Label::new(
+                    egui::RichText::new(title)
+                        .strong()
+                        .color(ui.visuals().hyperlink_color),
+                )
+                .sense(egui::Sense::click())
+                .truncate(),
             );
             if arrow_resp.clicked() || name_resp.clicked() {
                 toggle = true;
@@ -2301,6 +2314,8 @@ impl GitPmApp {
             })
             .collect();
 
+        // 表格体闭包中无法再借用 ui，先取出主题态用于状态着色。
+        let dark_theme = ui.visuals().dark_mode;
         // 中央浏览器主体：egui_extras::TableBuilder。
         // 四列均可拖拽调宽（列宽由 egui memory 在会话内记忆，不落盘），
         // 表头常驻，纵向滚动 + 行虚拟化（rows() 只绘制视口内的行）。
@@ -2355,14 +2370,23 @@ impl GitPmApp {
                         egui::Sense::hover()
                     };
                     // 名称格：git 状态标记（着色）在前，名称随后；
-                    // 两者感应一致，目录行点标记也能进入。
+                    // 两者感应一致，目录行点标记也能进入。文件按状态给名称
+                    // 整名着色（修改=红、新增=绿…），一眼可辨；目录沿用弱化规则。
+                    let name_rich = match entry_status {
+                        Some(st) if !*is_dir => {
+                            egui::RichText::new(name).color(status_color(st, dark_theme))
+                        }
+                        _ => dim(egui::RichText::new(name)),
+                    };
                     let mut name_resp: Option<egui::Response> = None;
                     row.col(|ui| {
                         let marker = entry_status.map(|st| {
-                            ui.add(egui::Label::new(status_marker_rich(st)).sense(sense))
+                            ui.add(
+                                egui::Label::new(status_marker_rich(st, dark_theme)).sense(sense),
+                            )
                         });
                         let name_label = ui.add(
-                            egui::Label::new(dim(egui::RichText::new(name)))
+                            egui::Label::new(name_rich)
                                 .wrap_mode(egui::TextWrapMode::Truncate)
                                 .sense(sense),
                         );
@@ -2428,6 +2452,7 @@ impl GitPmApp {
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
                 ui.label(egui::RichText::new(i18n::t(lang, "legend-label")).weak());
+                let dark = ui.visuals().dark_mode;
                 for st in [
                     FileStatus::Conflict,
                     FileStatus::Deleted,
@@ -2435,8 +2460,11 @@ impl GitPmApp {
                     FileStatus::Renamed,
                     FileStatus::Added,
                 ] {
-                    ui.label(status_marker_rich(st));
-                    ui.label(egui::RichText::new(status_legend_text(lang, st)).weak());
+                    ui.label(status_marker_rich(st, dark));
+                    ui.label(
+                        egui::RichText::new(status_legend_text(lang, st))
+                            .color(status_color(st, dark)),
+                    );
                     ui.add_space(6.0);
                 }
             });
