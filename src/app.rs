@@ -122,6 +122,104 @@ const COLOR_STATUS_CHANGED: egui::Color32 = egui::Color32::from_rgb(224, 176, 0)
 /// 新增/未跟踪状态标记的颜色（绿色）。
 const COLOR_STATUS_ADDED: egui::Color32 = egui::Color32::from_rgb(64, 200, 112);
 
+/// 主色（青绿，取自程序图标）：选中态、按钮激活态、悬停描边。
+const COLOR_ACCENT: egui::Color32 = egui::Color32::from_rgb(38, 166, 154);
+
+/// 明亮主题下的主色（加深一档，保证浅底可读）。
+const COLOR_ACCENT_DARK: egui::Color32 = egui::Color32::from_rgb(24, 128, 118);
+
+/// 按主题生成定制配色：深色为蓝灰底 + 青绿主色，明亮为白底 + 淡蓝斑马纹。
+/// 文件浏览器斑马纹（`TableBuilder::striped`）取 `faint_bg_color`，故该
+/// 颜色按需求设为淡蓝色系；圆角与间距一并在此统一。
+fn custom_visuals(theme: Theme) -> egui::Visuals {
+    let mut v = match theme {
+        Theme::Dark => egui::Visuals::dark(),
+        Theme::Light => egui::Visuals::light(),
+    };
+    match theme {
+        Theme::Dark => {
+            v.panel_fill = egui::Color32::from_rgb(31, 37, 44);
+            v.window_fill = egui::Color32::from_rgb(37, 44, 52);
+            v.extreme_bg_color = egui::Color32::from_rgb(24, 29, 35);
+            // 斑马纹 / 弱底色：偏蓝的深灰，与蓝色系界面呼应。
+            v.faint_bg_color = egui::Color32::from_rgb(40, 53, 66);
+            v.window_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(58, 70, 82));
+            v.selection.bg_fill = COLOR_ACCENT;
+            v.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
+            v.hyperlink_color = egui::Color32::from_rgb(77, 208, 196);
+            v.warn_fg_color = egui::Color32::from_rgb(255, 179, 0);
+            v.error_fg_color = egui::Color32::from_rgb(255, 107, 107);
+            v.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(34, 41, 49);
+            v.widgets.noninteractive.bg_stroke =
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(52, 63, 75));
+            v.widgets.noninteractive.fg_stroke =
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(205, 214, 223));
+            v.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(46, 55, 65);
+            v.widgets.inactive.bg_fill = egui::Color32::from_rgb(46, 55, 65);
+            v.widgets.inactive.bg_stroke =
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(61, 74, 87));
+            v.widgets.inactive.fg_stroke =
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(216, 224, 232));
+            v.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(56, 69, 82);
+            v.widgets.hovered.bg_fill = egui::Color32::from_rgb(56, 69, 82);
+            v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, COLOR_ACCENT);
+            v.widgets.hovered.fg_stroke =
+                egui::Stroke::new(1.5_f32, egui::Color32::WHITE);
+            v.widgets.active.weak_bg_fill = egui::Color32::from_rgb(30, 118, 110);
+            v.widgets.active.bg_fill = COLOR_ACCENT;
+            v.widgets.active.bg_stroke =
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(77, 208, 196));
+            v.widgets.active.fg_stroke =
+                egui::Stroke::new(1.5_f32, egui::Color32::WHITE);
+        }
+        Theme::Light => {
+            v.panel_fill = egui::Color32::from_rgb(252, 253, 255);
+            v.window_fill = egui::Color32::WHITE;
+            v.extreme_bg_color = egui::Color32::from_rgb(242, 247, 252);
+            // 淡蓝色斑马纹（用户指定：文件窗口间隔底色）。
+            v.faint_bg_color = egui::Color32::from_rgb(228, 240, 252);
+            v.window_stroke = egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(206, 219, 232));
+            v.selection.bg_fill = COLOR_ACCENT_DARK;
+            v.selection.stroke = egui::Stroke::new(1.0_f32, egui::Color32::WHITE);
+            v.hyperlink_color = egui::Color32::from_rgb(20, 122, 112);
+            v.warn_fg_color = egui::Color32::from_rgb(170, 112, 0);
+            v.error_fg_color = egui::Color32::from_rgb(198, 48, 48);
+            v.widgets.noninteractive.bg_fill = egui::Color32::from_rgb(246, 250, 254);
+            v.widgets.noninteractive.bg_stroke =
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(213, 224, 235));
+            v.widgets.noninteractive.fg_stroke =
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(41, 54, 66));
+            v.widgets.inactive.weak_bg_fill = egui::Color32::from_rgb(242, 247, 252);
+            v.widgets.inactive.bg_fill = egui::Color32::from_rgb(242, 247, 252);
+            v.widgets.inactive.bg_stroke =
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(202, 215, 228));
+            v.widgets.inactive.fg_stroke =
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(41, 54, 66));
+            v.widgets.hovered.weak_bg_fill = egui::Color32::from_rgb(222, 237, 252);
+            v.widgets.hovered.bg_fill = egui::Color32::from_rgb(222, 237, 252);
+            v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, COLOR_ACCENT_DARK);
+            v.widgets.hovered.fg_stroke =
+                egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(14, 30, 38));
+            v.widgets.active.weak_bg_fill = egui::Color32::from_rgb(202, 233, 228);
+            v.widgets.active.bg_fill = COLOR_ACCENT_DARK;
+            v.widgets.active.bg_stroke =
+                egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(16, 105, 96));
+            v.widgets.active.fg_stroke =
+                egui::Stroke::new(1.5_f32, egui::Color32::WHITE);
+        }
+    }
+    let rounding = egui::Rounding::same(6.0);
+    v.widgets.noninteractive.rounding = rounding;
+    v.widgets.inactive.rounding = rounding;
+    v.widgets.hovered.rounding = rounding;
+    v.widgets.active.rounding = rounding;
+    v.widgets.open.rounding = rounding;
+    v.window_rounding = egui::Rounding::same(9.0);
+    v.menu_rounding = egui::Rounding::same(7.0);
+    v
+}
+
+
 /// One rendered git invocation in the bottom read-only output area.
 struct LogEntry {
     /// False when the call failed (non-zero exit or git could not run).
@@ -508,7 +606,12 @@ fn show_section(
     section: Option<&StatusSection>,
 ) {
     ui.add_space(4.0);
-    ui.strong(title);
+    // 小节标题用主色（hyperlink_color 在两个主题下都是青绿系），与正文区分。
+    ui.label(
+        egui::RichText::new(title)
+            .strong()
+            .color(ui.visuals().hyperlink_color),
+    );
     match section {
         Some(s) if s.ok => {
             ui.monospace(&s.text);
@@ -1466,7 +1569,10 @@ impl GitPmApp {
         let lang = self.lang;
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.heading("LocalRepoManager");
+                ui.heading(
+                    egui::RichText::new("LocalRepoManager")
+                        .color(ui.visuals().hyperlink_color),
+                );
                 ui.separator();
                 if ui
                     .button(format!(
@@ -1582,10 +1688,7 @@ impl GitPmApp {
     /// 不影响本次切换。
     fn switch_theme(&mut self, ctx: &egui::Context, theme: Theme) {
         self.theme = theme;
-        ctx.set_visuals(match theme {
-            Theme::Dark => egui::Visuals::dark(),
-            Theme::Light => egui::Visuals::light(),
-        });
+        self.apply_theme(ctx);
         let Some(conn) = self.conn.as_ref() else {
             let text = i18n::t(self.lang, "err-db-not-open").to_string();
             self.log_theme_save_error(&text);
@@ -3976,12 +4079,16 @@ impl GitPmApp {
     /// Apply the persisted theme every frame; a cheap no-op once applied, and
     /// it re-asserts the choice if anything else resets the style.
     fn apply_theme(&self, ctx: &egui::Context) {
-        let visuals = match self.theme {
-            Theme::Dark => egui::Visuals::dark(),
-            Theme::Light => egui::Visuals::light(),
-        };
+        let visuals = custom_visuals(self.theme);
         if ctx.style().visuals != visuals {
-            ctx.set_visuals(visuals);
+            let mut style = (*ctx.style()).clone();
+            style.visuals = visuals;
+            // 统一间距与控件内边距，让界面呼吸感更好（间距只随主题
+            // 一起设置一次；主题不变时不重复写 style）。
+            style.spacing.item_spacing = egui::vec2(8.0, 6.0);
+            style.spacing.button_padding = egui::vec2(8.0, 4.0);
+            style.spacing.interact_size.y = 24.0;
+            ctx.set_style(style);
         }
     }
 
