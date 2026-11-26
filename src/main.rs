@@ -1,5 +1,6 @@
 mod crypto;
 mod db;
+mod git;
 mod password;
 
 fn main() -> eframe::Result<()> {
