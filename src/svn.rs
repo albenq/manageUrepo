@@ -20,8 +20,10 @@ pub fn run(dir: &Path, args: &[&str]) -> std::io::Result<GitOutput> {
 
 /// Run `svn <args>` with credentials appended.
 ///
-/// The password travels only as a child-process argument; callers must
-/// redact the returned output before logging it (see `app::redact_output`).
+/// `--non-interactive` prevents prompts from hanging the UI; `--no-auth-cache`
+/// keeps svn from persisting the password into its on-disk auth cache. The
+/// password travels only as a child-process argument; callers must redact the
+/// returned output before logging it (see `app::redact_output`).
 pub fn run_with_credentials(
     dir: &Path,
     args: &[&str],
@@ -29,14 +31,22 @@ pub fn run_with_credentials(
     password: &str,
 ) -> std::io::Result<GitOutput> {
     let mut full: Vec<&str> = args.to_vec();
-    full.extend_from_slice(&[
-        "--username",
-        user,
-        "--password",
-        password,
-        "--non-interactive",
-    ]);
+    let auth: Vec<String> = auth_args(user, password);
+    let auth: Vec<&str> = auth.iter().map(String::as_str).collect();
+    full.extend_from_slice(&auth);
     run(dir, &full)
+}
+
+/// The auth-related trailing arguments for a credentialed svn call.
+fn auth_args(user: &str, password: &str) -> Vec<String> {
+    vec![
+        "--username".to_string(),
+        user.to_string(),
+        "--password".to_string(),
+        password.to_string(),
+        "--non-interactive".to_string(),
+        "--no-auth-cache".to_string(),
+    ]
 }
 
 /// Run `svn status` in `dir` (one line per changed/unversioned item).
@@ -58,15 +68,17 @@ pub fn update_with_credentials(
     run_with_credentials(dir, &["update", "--non-interactive"], user, password)
 }
 
-/// Stage unversioned items (`svn add --force . -q`) and commit
-/// (`svn commit -m <msg> --non-interactive`).
+/// Stage unversioned items (`svn add --force . -q`), schedule deletions of
+/// files missing from disk (`svn rm --force`, matching `git add -A`
+/// semantics), then commit (`svn commit -m <msg> --non-interactive`).
 ///
-/// Returns the `add` output when staging fails; otherwise the `commit`
-/// output. Mirrors `git::commit_all`'s "commit everything" semantics.
+/// Returns the first failing command's output when staging fails; otherwise
+/// the `commit` output. Mirrors `git::commit_all`'s "commit everything"
+/// semantics.
 pub fn commit_all(dir: &Path, message: &str) -> std::io::Result<GitOutput> {
-    let add = run(dir, &["add", "--force", ".", "-q"])?;
-    if !add.ok() {
-        return Ok(add);
+    let staged = stage_all(&|args| run(dir, args))?;
+    if !staged.ok() {
+        return Ok(staged);
     }
     run(dir, &["commit", "-m", message, "--non-interactive"])
 }
@@ -78,9 +90,9 @@ pub fn commit_all_with_credentials(
     user: &str,
     password: &str,
 ) -> std::io::Result<GitOutput> {
-    let add = run_with_credentials(dir, &["add", "--force", ".", "-q"], user, password)?;
-    if !add.ok() {
-        return Ok(add);
+    let staged = stage_all(&|args| run_with_credentials(dir, args, user, password))?;
+    if !staged.ok() {
+        return Ok(staged);
     }
     run_with_credentials(
         dir,
@@ -88,6 +100,68 @@ pub fn commit_all_with_credentials(
         user,
         password,
     )
+}
+
+/// Fetch one history page for a project of the given VCS kind
+/// (`"svn"` or anything else = git). The dispatch entry both history
+/// call sites in `app.rs` (first page + 加载更多) must go through, so an
+/// SVN project never runs `git log` and vice versa.
+pub fn fetch_history_page(
+    path: &Path,
+    skip: usize,
+    limit: usize,
+    vcs: &str,
+) -> Result<Vec<CommitInfo>, String> {
+    if vcs == "svn" {
+        log_recent(path, skip, limit)
+    } else {
+        git::log_recent(path, skip, limit)
+    }
+}
+
+/// Shared staging pipeline for the two `commit_all` variants: `svn add
+/// --force .` for unversioned items, then `svn rm --force` for every item
+/// svn reports as missing (`!` — deleted from disk without `svn rm`).
+/// `run_args` abstracts over the plain and credentialed runners.
+fn stage_all(run_args: &dyn Fn(&[&str]) -> std::io::Result<GitOutput>) -> std::io::Result<GitOutput> {
+    let add = run_args(&["add", "--force", ".", "-q"])?;
+    if !add.ok() {
+        return Ok(add);
+    }
+    let status = run_args(&["status"])?;
+    if !status.ok() {
+        return Ok(status);
+    }
+    for path in collect_missing_paths(&status.stdout) {
+        let rm = run_args(&["rm", "--force", &path])?;
+        if !rm.ok() {
+            return Ok(rm);
+        }
+    }
+    Ok(GitOutput { code: 0, stdout: String::new(), stderr: String::new() })
+}
+
+/// Paths reported by `svn status` as missing from disk (lines whose status
+/// column is `!`). These are versioned items deleted without `svn rm`; they
+/// must be scheduled for deletion before a commit, exactly like `git add -A`
+/// stages deletions.
+fn collect_missing_paths(stdout: &str) -> Vec<String> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut chars = line.chars();
+            let code = chars.next()?;
+            if code != '!' {
+                return None;
+            }
+            let path = chars.as_str().trim();
+            if path.is_empty() {
+                None
+            } else {
+                Some(path.to_string())
+            }
+        })
+        .collect()
 }
 
 /// The newest `limit` revisions, newest first; `skip` pages past them.
@@ -396,5 +470,95 @@ mod tests {
         let up = update(&trio.wc2).expect("svn update");
         assert!(up.ok(), "svn update failed: {}", up.stderr);
         assert!(trio.wc2.join("from-wc1.txt").exists(), "update must bring the new file");
+    }
+
+    #[test]
+    fn commit_all_stages_deletions() {
+        // git add -A parity: a versioned file deleted from disk must leave
+        // HEAD after commit_all. Regression for the review finding: plain
+        // `svn add --force .` never schedules deletions, so the commit used
+        // to report success while keeping the file in HEAD.
+        if !svn_available() {
+            eprintln!("skipping: svn CLI not available");
+            return;
+        }
+        let trio = svn_trio();
+        std::fs::write(trio.wc1.join("doomed.txt"), "bye").unwrap();
+        let c1 = commit_all(&trio.wc1, "add doomed").expect("commit 1");
+        assert!(c1.ok(), "commit 1 failed: {}", c1.stderr);
+        let up1 = update(&trio.wc2).expect("update wc2");
+        assert!(up1.ok(), "update wc2 failed: {}", up1.stderr);
+        assert!(trio.wc2.join("doomed.txt").exists(), "wc2 should have the file");
+
+        std::fs::remove_file(trio.wc1.join("doomed.txt")).expect("delete file");
+        let c2 = commit_all(&trio.wc1, "delete doomed").expect("commit 2");
+        assert!(c2.ok(), "commit 2 failed: {}", c2.stderr);
+
+        let st = status(&trio.wc1).expect("status after deletion commit");
+        assert!(st.ok(), "status failed: {}", st.stderr);
+        assert!(
+            !st.stdout.lines().any(|l| l.starts_with('!')),
+            "deletion must be committed, not left pending: {:?}",
+            st.stdout
+        );
+        let up2 = update(&trio.wc2).expect("update wc2 after deletion");
+        assert!(up2.ok(), "update wc2 failed: {}", up2.stderr);
+        assert!(
+            !trio.wc2.join("doomed.txt").exists(),
+            "the deleted file must be gone from HEAD (fresh working copy)"
+        );
+    }
+
+    #[test]
+    fn auth_args_are_non_interactive_and_uncached() {
+        // Credentials must not be persisted into svn's on-disk auth cache.
+        let args = auth_args("alice", "s3cret");
+        assert!(args.iter().any(|a| a == "--no-auth-cache"), "{args:?}");
+        assert!(
+            args.windows(2).any(|w| w[0] == "--username" && w[1] == "alice"),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2).any(|w| w[0] == "--password" && w[1] == "s3cret"),
+            "{args:?}"
+        );
+        assert!(args.iter().any(|a| a == "--non-interactive"), "{args:?}");
+    }
+
+    #[test]
+    fn fetch_history_page_dispatches_by_vcs() {
+        // An svn working copy queried as "svn" must return commits; the same
+        // directory queried as "git" must fail (git log cannot run there).
+        // Regression for the review finding: open_history_window always used
+        // git::log_recent, so the first History click on an svn project failed.
+        if !svn_available() {
+            eprintln!("skipping: svn CLI not available");
+            return;
+        }
+        let trio = svn_trio();
+        std::fs::write(trio.wc1.join("f.txt"), "x").unwrap();
+        let c = commit_all(&trio.wc1, "one commit").expect("commit");
+        assert!(c.ok(), "commit failed: {}", c.stderr);
+
+        let svn_page = fetch_history_page(&trio.wc1, 0, 10, "svn");
+        assert_eq!(svn_page.as_ref().expect("svn page").len(), 1, "{svn_page:?}");
+        assert!(
+            fetch_history_page(&trio.wc1, 0, 10, "git").is_err(),
+            "a git query inside an svn working copy must fail"
+        );
+    }
+
+    #[test]
+    fn collect_missing_paths_from_status() {
+        assert_eq!(collect_missing_paths(""), Vec::<String>::new());
+        assert_eq!(
+            collect_missing_paths("M       a.rs\n!       gone.txt\n?       b.txt\n"),
+            vec!["gone.txt".to_string()]
+        );
+        // 多个缺失项；含空格的路径按整段保留。
+        assert_eq!(
+            collect_missing_paths("!       dir with space/x.txt\n"),
+            vec!["dir with space/x.txt".to_string()]
+        );
     }
 }

@@ -3683,7 +3683,8 @@ impl GitPmApp {
         let Some(project) = self.selected_project().cloned() else {
             return; // 按钮仅在选中项目后可见；防御性兜底
         };
-        match git::log_recent(Path::new(&project.path), 0, HISTORY_FIRST_PAGE) {
+        match svn::fetch_history_page(Path::new(&project.path), 0, HISTORY_FIRST_PAGE, &project.vcs)
+        {
             Ok(commits) => {
                 if commits.len() < HISTORY_FIRST_PAGE {
                     self.history_exhausted = true;
@@ -3711,13 +3712,12 @@ impl GitPmApp {
             return;
         };
         let skip = self.history_commits.len();
-        let is_svn = project.vcs == "svn";
-        let page = if is_svn {
-            svn::log_recent(Path::new(&project.path), skip, HISTORY_PAGE_SIZE)
-        } else {
-            git::log_recent(Path::new(&project.path), skip, HISTORY_PAGE_SIZE)
-        };
-        match page {
+        match svn::fetch_history_page(
+            Path::new(&project.path),
+            skip,
+            HISTORY_PAGE_SIZE,
+            &project.vcs,
+        ) {
             Ok(mut commits) => {
                 if commits.len() < HISTORY_PAGE_SIZE {
                     self.history_exhausted = true;
