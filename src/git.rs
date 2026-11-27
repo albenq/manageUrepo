@@ -14,7 +14,7 @@ impl GitOutput {
     }
 }
 
-fn capture(output: std::process::Output) -> GitOutput {
+pub(crate) fn capture(output: std::process::Output) -> GitOutput {
     GitOutput {
         code: output.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
