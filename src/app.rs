@@ -1040,11 +1040,15 @@ fn parse_svn_status_map(out: &str) -> HashMap<String, FileStatus> {
     map
 }
 
-/// 浏览器条目的状态：文件按相对路径精确匹配；目录做前缀匹配，取其下
-/// 所有变更条目里优先级最高的状态（porcelain 路径恒以 `/` 分隔）。
-/// 未跟踪/已忽略不向父目录传播（对照 TortoiseGit：`?? electron/i18n/`
-/// 不应让 `electron` 目录显示未跟踪，目录图标只反映已版本控制内容
-/// 的变更）；未跟踪/忽略的目录自身（`?? dir/` / `!! dir/`）仍精确显示。
+/// 浏览器条目的状态：
+/// - 文件/目录先按相对路径精确匹配；
+/// - 折叠的未跟踪/忽略目录（`?? dir/`、`!! dir/`）向下覆盖：祖先链上
+///   出现未跟踪或忽略条目时，其下所有条目继承该状态（git 把整个未
+///   跟踪目录折叠成一行，子文件在表中无自己的条目）；
+/// - 目录再做前缀匹配，取其下所有变更条目里优先级最高的状态
+///   （porcelain 路径恒以 `/` 分隔）。未跟踪/已忽略不向父目录传播
+///   （对照 TortoiseGit：`?? electron/i18n/` 不应让 `electron` 目录
+///   显示未跟踪，目录图标只反映已版本控制内容的变更）。
 fn status_for_entry(
     map: &HashMap<String, FileStatus>,
     rel_path: &str,
@@ -1052,6 +1056,16 @@ fn status_for_entry(
 ) -> Option<FileStatus> {
     if let Some(status) = map.get(rel_path) {
         return Some(*status);
+    }
+    // 祖先链上的折叠未跟踪/忽略目录向下继承（由近及远，命中即返回）。
+    let mut ancestor = rel_path.to_string();
+    while let Some(pos) = ancestor.rfind('/') {
+        ancestor.truncate(pos);
+        if let Some(st) = map.get(ancestor.as_str()) {
+            if matches!(st, FileStatus::Untracked | FileStatus::Ignored) {
+                return Some(*st);
+            }
+        }
     }
     if !is_dir {
         return None;
@@ -6582,6 +6596,36 @@ mod tests {
         // 已跟踪内容的真实变更照常传播：删除 > 修改。
         let map = parse_status_map(" M src/keep.rs\nD  src/lib/dead.rs\n");
         assert_eq!(status_for_entry(&map, "src", true), Some(FileStatus::Deleted));
+    }
+
+    #[test]
+    fn status_for_entry_inside_collapsed_untracked_dir() {
+        // git 把整个未跟踪目录折叠成一行（`?? kimi3c.si4project/`）：
+        // 其下所有文件/子目录都应继承未跟踪，而不是误显示为无变更绿勾
+        // （kimi-k3-in-c 实测回归）。
+        let map = parse_status_map("## main\n?? kimi3c.si4project/\n M a.txt\n");
+        assert_eq!(
+            status_for_entry(&map, "kimi3c.si4project", true),
+            Some(FileStatus::Untracked)
+        );
+        assert_eq!(
+            status_for_entry(&map, "kimi3c.si4project/settings.db", false),
+            Some(FileStatus::Untracked)
+        );
+        assert_eq!(
+            status_for_entry(&map, "kimi3c.si4project/cache/tmp.dat", false),
+            Some(FileStatus::Untracked)
+        );
+        // 折叠的忽略目录（`!! node_modules/`）同理向下覆盖。
+        let map = parse_status_map("!! node_modules/\n");
+        assert_eq!(
+            status_for_entry(&map, "node_modules/pkg/index.js", false),
+            Some(FileStatus::Ignored)
+        );
+        // 其他状态不向下折叠传播：目录内的无关条目不受影响。
+        let map = parse_status_map(" M src/keep.rs\n");
+        assert_eq!(status_for_entry(&map, "src/keep.rs", false), Some(FileStatus::Modified));
+        assert_eq!(status_for_entry(&map, "src/other.rs", false), None);
     }
 
     #[test]
