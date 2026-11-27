@@ -37,6 +37,7 @@ cargo run --release
 
 - **项目树**：把本机已有的 git 仓库加入左侧项目列表，点击切换；移除只删列表记录，不动磁盘文件。项目按父目录层级分组为可折叠树，名称左对齐。树上方工具栏提供搜索：随输入逐字过滤项目与目录（英文不区分大小写、按子串匹配），命中目录时显示其整棵子树，并自动展开命中路径；`Esc` 或 `✕` 清空。
 - **状态总览**：选中项目后显示 `git status`、分支列表、标签列表，可手动刷新。
+- **代码行数统计**：操作面板一键统计当前项目工作区的代码行数，报告（文件数、总行数、总大小、耗时、按扩展名聚合，最多展示 20 项）打印到底部输出区；自动跳过 `.git` / `.svn` / `target` / `node_modules` 等目录与二进制、超大文件，后台线程执行，不阻塞界面。
 - **提交（commit）**：填写提交信息后一键 `git add -A` + `git commit`。
 - **拉取 / 推送（pull / push）**：对当前分支执行 `git pull` / `git push origin`。
 - **新建分支**：输入名称后创建分支并切换（`git branch` + `git checkout`）。
@@ -103,6 +104,7 @@ The window opens at 1440×900 by default (minimum 1200×800) and can be resized 
 
 - **Project tree**: add existing local git repositories to the list on the left and switch between them with a click; removing a project only deletes the list entry, never touches files on disk. Projects are grouped by parent directory into a collapsible tree, with names left-aligned. A toolbar above the tree searches projects and folders as you type (letter-by-letter substring match, case-insensitive for English); matching a folder keeps its whole subtree, and matching paths auto-expand; `Esc` or `✕` clears.
 - **Status overview**: selecting a project shows `git status`, branches, and tags, with manual refresh.
+- **Lines-of-code counter**: one click in the operations panel scans the project's working tree and prints a report (files scanned, total lines, total size, elapsed time, per-extension breakdown, top 20) to the output log. `.git` / `.svn` / `target` / `node_modules` and other build or dependency directories, binary and oversized files are skipped; scanning runs on a background thread so the UI stays responsive.
 - **Commit**: enter a message, then one click runs `git add -A` + `git commit`.
 - **Pull / push**: runs `git pull` / `git push origin` on the current branch.
 - **Create branch**: enter a name to create and switch to a branch (`git branch` + `git checkout`).

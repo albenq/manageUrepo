@@ -17,6 +17,7 @@ use crate::crypto::{self, CryptoError, VaultKeys};
 use crate::db::{self, Project};
 use crate::git;
 use crate::i18n::{self, Lang};
+use crate::loc;
 use crate::password::{self, GenOptions};
 
 /// t() + 占位符替换：把文案中的 `{name}` 依次替换为 pairs 的值，用于带
@@ -60,6 +61,8 @@ mod icons {
     pub const ICON_HISTORY: &str = "🕘";
     /// 搜索项目 / 目录
     pub const ICON_SEARCH: &str = "🔍";
+    /// 统计代码行数
+    pub const ICON_LOC: &str = "Σ";
 }
 
 /// `meta` key that marks an initialized vault (written by `crypto::setup_master`).
@@ -347,6 +350,16 @@ struct GitResult {
     output: std::io::Result<git::GitOutput>,
 }
 
+/// One finished line-count job from a worker thread (independent of git).
+struct LocResult {
+    /// Project the count belongs to.
+    project_id: i64,
+    /// Scan result, or the root read error.
+    result: std::io::Result<loc::LocStats>,
+    /// Wall-clock time spent scanning (shown in the report).
+    elapsed: std::time::Duration,
+}
+
 /// Whether a background result may update the on-screen status area: only
 /// when it belongs to the project that is currently selected. Regardless of
 /// the return value the caller still updates the per-project cache, so a
@@ -610,6 +623,66 @@ fn format_worktree_status(lang: Lang, porcelain: &str) -> String {
         lines_out.push(i18n::t(lang, "worktree-clean").to_string());
     }
     lines_out.join("\n")
+}
+
+/// 行数统计报告（写入底部输出区的多行文本）。
+/// 空结果显示单句空文案；扩展名聚合最多展示 20 行。
+fn format_loc_stats(
+    lang: Lang,
+    stats: &loc::LocStats,
+    elapsed: std::time::Duration,
+) -> String {
+    if stats.files == 0 {
+        return i18n::t(lang, "loc-empty").to_string();
+    }
+    let mut out = String::new();
+    out.push_str(&tf(
+        lang,
+        "loc-files",
+        &[("n", &loc::format_thousands(stats.files as u64))],
+    ));
+    out.push('\n');
+    out.push_str(&tf(
+        lang,
+        "loc-lines",
+        &[("n", &loc::format_thousands(stats.lines))],
+    ));
+    out.push('\n');
+    out.push_str(&tf(
+        lang,
+        "loc-size",
+        &[("size", &browser::fmt_size(stats.bytes))],
+    ));
+    out.push('\n');
+    out.push_str(&tf(
+        lang,
+        "loc-elapsed",
+        &[("secs", &format!("{:.1}", elapsed.as_secs_f64()))],
+    ));
+    const MAX_EXT_ROWS: usize = 20;
+    out.push('\n');
+    out.push_str(i18n::t(lang, "loc-by-ext"));
+    for ext in stats.by_ext.iter().take(MAX_EXT_ROWS) {
+        out.push('\n');
+        out.push_str(&tf(
+            lang,
+            "loc-ext-row",
+            &[
+                ("ext", &ext.ext),
+                ("files", &loc::format_thousands(ext.files as u64)),
+                ("lines", &loc::format_thousands(ext.lines)),
+            ],
+        ));
+    }
+    if stats.by_ext.len() > MAX_EXT_ROWS {
+        out.push('\n');
+        out.push_str(&tf(
+            lang,
+            "loc-more-ext",
+            &[("n", &(stats.by_ext.len() - MAX_EXT_ROWS).to_string())],
+        ));
+    }
+    out
 }
 
 /// Render one status-area section: plain text on success, red on failure.
@@ -1261,6 +1334,11 @@ pub struct GitPmApp {
     result_tx: mpsc::Sender<GitResult>,
     /// Worker results drained at the top of each frame.
     result_rx: mpsc::Receiver<GitResult>,
+    /// Background line-count results (separate from git operations).
+    loc_tx: mpsc::Sender<LocResult>,
+    loc_rx: mpsc::Receiver<LocResult>,
+    /// Project whose line count is currently running, if any (duplicate guard).
+    loc_inflight: Option<i64>,
     commit_msg: String,
     new_branch: String,
     tag_name: String,
@@ -1342,6 +1420,7 @@ pub struct GitPmApp {
 impl GitPmApp {
     pub fn new() -> Self {
         let (result_tx, result_rx) = mpsc::channel();
+        let (loc_tx, loc_rx) = mpsc::channel();
         let mut app = Self {
             conn: None,
             open_error: None,
@@ -1365,6 +1444,9 @@ impl GitPmApp {
             busy: None,
             result_tx,
             result_rx,
+            loc_tx,
+            loc_rx,
+            loc_inflight: None,
             commit_msg: String::new(),
             new_branch: String::new(),
             tag_name: String::new(),
@@ -1638,6 +1720,7 @@ impl GitPmApp {
 
     fn show_main(&mut self, ctx: &egui::Context) {
         self.drain_results();
+        self.drain_loc_results();
         self.show_top_bar(ctx);
         self.show_project_list(ctx);
         self.sync_status_for_selection();
@@ -1679,7 +1762,7 @@ impl GitPmApp {
         // change,「刷新」button, post-operation refresh), and the「加载中」
         // bar is gone as soon as the first segment lands, so only this
         // condition reliably keeps frames alive until the batch completes.
-        if self.busy.is_some() || !self.status_inflight.is_empty() {
+        if self.busy.is_some() || !self.status_inflight.is_empty() || self.loc_inflight.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(BUSY_REPAINT_MS));
         }
     }
@@ -2179,6 +2262,27 @@ impl GitPmApp {
                                 self.open_cred_dialog();
                             }
                         });
+                        ui.add_space(4.0);
+                        // 代码行数统计：后台扫描，完成后把报告写入底部输出区。
+                        ui.horizontal(|ui| {
+                            let counting = self.loc_inflight.is_some();
+                            if ui
+                                .add_enabled(
+                                    !busy.is_some() && !counting,
+                                    egui::Button::new(format!(
+                                        "{} {}",
+                                        icons::ICON_LOC,
+                                        i18n::t(lang, "btn-count-loc")
+                                    )),
+                                )
+                                .clicked()
+                            {
+                                self.start_loc_count();
+                            }
+                            if counting {
+                                ui.label(i18n::t(lang, "loc-running"));
+                            }
+                        });
                         ui.add_space(8.0);
                         ui.separator();
                         self.show_branch_area(ui, busy.is_some());
@@ -2667,6 +2771,56 @@ impl GitPmApp {
     fn drain_results(&mut self) {
         while let Ok(result) = self.result_rx.try_recv() {
             self.apply_result(result);
+        }
+    }
+
+    /// 在后台线程统计当前选中项目的代码行数（只读，不占用 git 操作状态）。
+    fn start_loc_count(&mut self) {
+        if self.loc_inflight.is_some() {
+            return;
+        }
+        let Some(project) = self.selected_project() else {
+            return;
+        };
+        let project_id = project.id;
+        let path = PathBuf::from(&project.path);
+        self.loc_inflight = Some(project_id);
+        let tx = self.loc_tx.clone();
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let result = loc::count_lines(&path);
+            let _ = tx.send(LocResult {
+                project_id,
+                result,
+                elapsed: started.elapsed(),
+            });
+        });
+    }
+
+    /// 收尾已完成的行数统计任务，每次在底部输出区打印一份报告。
+    fn drain_loc_results(&mut self) {
+        while let Ok(result) = self.loc_rx.try_recv() {
+            self.loc_inflight = None;
+            let project_name = self
+                .projects
+                .iter()
+                .find(|project| project.id == result.project_id)
+                .map(|project| project.name.clone())
+                .unwrap_or_default();
+            let title = tf(self.lang, "log-loc-title", &[("project", &project_name)]);
+            match result.result {
+                Ok(stats) => self.log.push(LogEntry {
+                    ok: true,
+                    title,
+                    text: format_loc_stats(self.lang, &stats, result.elapsed),
+                }),
+                Err(err) => self.log.push(LogEntry {
+                    ok: false,
+                    title,
+                    text: tf(self.lang, "err-loc", &[("err", &err.to_string())]),
+                }),
+            }
+            self.trim_log();
         }
     }
 
@@ -4676,6 +4830,45 @@ mod tests {
         let by_project = filter_project_tree(&tree, &names, "cargo");
         assert_eq!(count_tree_projects(&by_project), 1);
         assert_eq!(count_tree_projects(&tree), 3);
+    }
+
+    #[test]
+    fn format_loc_stats_renders_report() {
+        // 行数统计报告：千分位、人类可读大小、耗时与按扩展名聚合。
+        let stats = loc::LocStats {
+            files: 1234,
+            lines: 56789,
+            bytes: 2 * 1024 * 1024,
+            by_ext: vec![
+                loc::ExtStat {
+                    ext: "rs".into(),
+                    files: 300,
+                    lines: 50000,
+                },
+                loc::ExtStat {
+                    ext: "md".into(),
+                    files: 34,
+                    lines: 1789,
+                },
+            ],
+        };
+        let zh = format_loc_stats(Lang::Zh, &stats, std::time::Duration::from_millis(1500));
+        assert!(zh.contains("扫描文件：1,234 个"), "{zh}");
+        assert!(zh.contains("总行数：56,789"), "{zh}");
+        assert!(zh.contains("2.0 MB"), "{zh}");
+        assert!(zh.contains("耗时：1.5 秒"), "{zh}");
+        assert!(zh.contains("按扩展名："), "{zh}");
+        assert!(zh.contains("rs：300 个文件，50,000 行"), "{zh}");
+        assert!(zh.contains("md：34 个文件，1,789 行"), "{zh}");
+        let en = format_loc_stats(Lang::En, &stats, std::time::Duration::from_millis(1500));
+        assert!(en.contains("Files scanned: 1,234"), "{en}");
+        assert!(en.contains("Total lines: 56,789"), "{en}");
+        assert!(en.contains("rs: 300 files, 50,000 lines"), "{en}");
+
+        // 空结果：只显示一句空文案。
+        let empty = loc::LocStats::default();
+        let text = format_loc_stats(Lang::Zh, &empty, std::time::Duration::ZERO);
+        assert_eq!(text, "（没有可统计的文本文件）");
     }
 
     #[test]
