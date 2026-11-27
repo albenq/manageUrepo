@@ -2198,6 +2198,11 @@ impl GitPmApp {
     fn show_operations_panel(&mut self, ctx: &egui::Context) {
         let busy = self.busy.clone();
         let lang = self.lang;
+        // SVN 工作副本与 git 仓库共用这个面板，但按钮组不同：
+        // svn → 更新/提交；git → 拉取/推送/分支/标签。
+        let is_svn = self
+            .selected_project()
+            .is_some_and(|project| project.vcs == "svn");
         egui::SidePanel::right("operations_panel")
             .default_width(380.0)
             .resizable(true)
@@ -2233,53 +2238,70 @@ impl GitPmApp {
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        self.show_status_area(ui, busy.is_some());
+                        self.show_status_area(ui, busy.is_some(), is_svn);
                         ui.add_space(8.0);
                         ui.separator();
-                        self.show_commit_area(ui, busy.is_some());
+                        self.show_commit_area(ui, busy.is_some(), is_svn);
                         ui.add_space(8.0);
-                        ui.horizontal(|ui| {
+                        if is_svn {
+                            // SVN 没有 pull/push：写远端即 commit，下载远端即 update。
                             if ui
                                 .add_enabled(
                                     !busy.is_some(),
                                     egui::Button::new(format!(
                                         "{} {}",
                                         icons::ICON_PULL,
-                                        i18n::t(lang, "btn-pull")
+                                        i18n::t(lang, "btn-svn-update")
                                     )),
                                 )
                                 .clicked()
                             {
-                                self.do_pull();
+                                self.do_svn_update();
                             }
-                            if ui
-                                .add_enabled(
-                                    !busy.is_some(),
-                                    egui::Button::new(format!(
-                                        "{} {}",
-                                        icons::ICON_PUSH,
-                                        i18n::t(lang, "btn-push")
-                                    )),
-                                )
-                                .clicked()
-                            {
-                                self.do_push();
-                            }
-                            // 一键推送保持不变；「推送…」打开可选远程/分支的对话框。
-                            if ui
-                                .add_enabled(
-                                    !busy.is_some(),
-                                    egui::Button::new(format!(
-                                        "{} {}",
-                                        icons::ICON_PUSH,
-                                        i18n::t(lang, "btn-push-dialog")
-                                    )),
-                                )
-                                .clicked()
-                            {
-                                self.open_push_dialog();
-                            }
-                        });
+                        } else {
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add_enabled(
+                                        !busy.is_some(),
+                                        egui::Button::new(format!(
+                                            "{} {}",
+                                            icons::ICON_PULL,
+                                            i18n::t(lang, "btn-pull")
+                                        )),
+                                    )
+                                    .clicked()
+                                {
+                                    self.do_pull();
+                                }
+                                if ui
+                                    .add_enabled(
+                                        !busy.is_some(),
+                                        egui::Button::new(format!(
+                                            "{} {}",
+                                            icons::ICON_PUSH,
+                                            i18n::t(lang, "btn-push")
+                                        )),
+                                    )
+                                    .clicked()
+                                {
+                                    self.do_push();
+                                }
+                                // 一键推送保持不变；「推送…」打开可选远程/分支的对话框。
+                                if ui
+                                    .add_enabled(
+                                        !busy.is_some(),
+                                        egui::Button::new(format!(
+                                            "{} {}",
+                                            icons::ICON_PUSH,
+                                            i18n::t(lang, "btn-push-dialog")
+                                        )),
+                                    )
+                                    .clicked()
+                                {
+                                    self.open_push_dialog();
+                                }
+                            });
+                        }
                         ui.add_space(4.0);
                         ui.horizontal(|ui| {
                             if ui
@@ -2332,16 +2354,20 @@ impl GitPmApp {
                         });
                         ui.add_space(8.0);
                         ui.separator();
-                        self.show_branch_area(ui, busy.is_some());
-                        ui.add_space(8.0);
-                        self.show_tag_area(ui, busy.is_some());
+                        if !is_svn {
+                            self.show_branch_area(ui, busy.is_some());
+                            ui.add_space(8.0);
+                            self.show_tag_area(ui, busy.is_some());
+                        }
                     });
             });
     }
 
     /// 状态区：status --porcelain 输出 + 分支列表 + 标签列表。无快照且选中了
     /// 项目时显示「加载中…」+ 动态进度条（后台线程正在取数）。
-    fn show_status_area(&mut self, ui: &mut egui::Ui, busy: bool) {
+    /// SVN 项目：快照文字已是 format_svn_status 的译文，直接展示且不显示
+    /// 分支/标签区（SVN 没有这两个概念）。
+    fn show_status_area(&mut self, ui: &mut egui::Ui, busy: bool, is_svn: bool) {
         let lang = self.lang;
         ui.horizontal(|ui| {
             ui.strong(i18n::t(lang, "heading-status"));
@@ -2366,15 +2392,16 @@ impl GitPmApp {
         };
         // 「工作区」区展示人类可读的状态文字（原始 porcelain 输出仍完整
         // 记录在底部输出区，便于排障）；分支/标签区维持原样。
+        // SVN 的快照文字在 apply_svn_status 里已译好，这里原样透传。
         let worktree = snapshot.status.as_ref().map(|section| {
-            if section.ok {
+            if section.ok && !is_svn {
                 StatusSection {
                     ok: true,
                     text: format_worktree_status(lang, &section.text),
                 }
             } else {
                 StatusSection {
-                    ok: false,
+                    ok: section.ok,
                     text: section.text.clone(),
                 }
             }
@@ -2385,12 +2412,16 @@ impl GitPmApp {
             i18n::t(lang, "section-worktree"),
             worktree.as_ref(),
         );
+        if is_svn {
+            return;
+        }
         show_section(ui, lang, i18n::t(lang, "section-branches"), snapshot.branches.as_ref());
         show_section(ui, lang, i18n::t(lang, "section-tags"), snapshot.tags.as_ref());
     }
 
     /// Commit 消息输入框 + Commit 按钮（空消息禁用；busy 期间禁用）。
-    fn show_commit_area(&mut self, ui: &mut egui::Ui, busy: bool) {
+    /// SVN 项目提交走 do_svn_commit（svn add --force + svn commit）。
+    fn show_commit_area(&mut self, ui: &mut egui::Ui, busy: bool, is_svn: bool) {
         let lang = self.lang;
         ui.strong(i18n::t(lang, "heading-commit"));
         ui.add_sized(
@@ -2410,7 +2441,11 @@ impl GitPmApp {
             )
             .clicked()
         {
-            self.do_commit();
+            if is_svn {
+                self.do_svn_commit();
+            } else {
+                self.do_commit();
+            }
         }
     }
 
@@ -3185,6 +3220,78 @@ impl GitPmApp {
         });
     }
 
+    /// SVN「更新」按钮：`svn update` 后台执行；存有凭据（默认标签）时注入
+    /// `--username/--password --non-interactive`，输出在线程内脱敏。
+    fn do_svn_update(&mut self) {
+        if self.busy.is_some() {
+            return;
+        }
+        let Some(project) = self.selected_project().cloned() else {
+            return;
+        };
+        let auth_parts = self.load_credential_parts(project.id, DEFAULT_PUSH_REMOTE);
+        self.busy = Some(BusyOp {
+            project_id: project.id,
+            label: i18n::t(self.lang, "busy-svn-update").to_string(),
+        });
+        let tx = self.result_tx.clone();
+        let path = PathBuf::from(&project.path);
+        let project_id = project.id;
+        std::thread::spawn(move || {
+            let (label, output) = match auth_parts {
+                Some((user, pass)) => {
+                    let pairs = vec![(pass.clone(), "***".to_string())];
+                    (
+                        format!("svn update --username {user}"),
+                        svn::update_with_credentials(&path, &user, &pass)
+                            .map(|out| redact_output(out, &pairs)),
+                    )
+                }
+                None => ("svn update".to_string(), svn::update(&path)),
+            };
+            let _ = tx.send(GitResult {
+                project_id,
+                kind: ResultKind::SvnUpdate(label),
+                output,
+            });
+        });
+    }
+
+    /// SVN 提交按钮：`svn add --force .` + `svn commit -m`；凭据处理与
+    /// do_svn_update 相同。成功后清空提交框（复用 Commit 结果路径）。
+    fn do_svn_commit(&mut self) {
+        if self.busy.is_some() {
+            return;
+        }
+        let Some(project) = self.selected_project().cloned() else {
+            return;
+        };
+        let message = self.commit_msg.trim().to_string();
+        if message.is_empty() {
+            return; // the button is disabled; defensive only
+        }
+        let auth_parts = self.load_credential_parts(project.id, DEFAULT_PUSH_REMOTE);
+        self.busy = Some(BusyOp {
+            project_id: project.id,
+            label: i18n::t(self.lang, "busy-commit").to_string(),
+        });
+        let tx = self.result_tx.clone();
+        let path = PathBuf::from(&project.path);
+        let project_id = project.id;
+        let label = format!("svn add --force . + svn commit -m {message}");
+        std::thread::spawn(move || {
+            let output = match auth_parts {
+                Some((user, pass)) => {
+                    let pairs = vec![(pass.clone(), "***".to_string())];
+                    svn::commit_all_with_credentials(&path, &message, &user, &pass)
+                        .map(|out| redact_output(out, &pairs))
+                }
+                None => svn::commit_all(&path, &message),
+            };
+            let _ = tx.send(GitResult { project_id, kind: ResultKind::Commit(label), output });
+        });
+    }
+
     /// Pull 按钮：凭据存在且 origin 为 https 时在后台线程注入凭据拉取（URL
     /// 拼接与输出脱敏都在线程内完成，明文不回流 UI 线程）。
     fn do_pull(&mut self) {
@@ -3604,7 +3711,13 @@ impl GitPmApp {
             return;
         };
         let skip = self.history_commits.len();
-        match git::log_recent(Path::new(&project.path), skip, HISTORY_PAGE_SIZE) {
+        let is_svn = project.vcs == "svn";
+        let page = if is_svn {
+            svn::log_recent(Path::new(&project.path), skip, HISTORY_PAGE_SIZE)
+        } else {
+            git::log_recent(Path::new(&project.path), skip, HISTORY_PAGE_SIZE)
+        };
+        match page {
             Ok(mut commits) => {
                 if commits.len() < HISTORY_PAGE_SIZE {
                     self.history_exhausted = true;

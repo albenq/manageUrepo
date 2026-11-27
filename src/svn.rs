@@ -296,8 +296,9 @@ mod tests {
 
     struct SvnTrio {
         _guard: tempfile::TempDir,
-        /// file:/// URL of the freshly created repository.
-        url: String,
+        /// file:/// URL of the freshly created repository (kept for clarity;
+        /// checkout already consumed it).
+        _url: String,
         /// First working copy.
         wc1: std::path::PathBuf,
         /// Second working copy (used by the update test).
@@ -331,7 +332,7 @@ mod tests {
             .expect("svn checkout wc2");
         assert!(co2.status.success(), "checkout wc2 failed");
 
-        SvnTrio { _guard: guard, url, wc1, wc2 }
+        SvnTrio { _guard: guard, _url: url, wc1, wc2 }
     }
 
     #[test]
