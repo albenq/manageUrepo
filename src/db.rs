@@ -4,13 +4,15 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::crypto::{self, CryptoError, VaultKeys};
 
-/// A git project registered in the local database.
+/// A git or svn project registered in the local database.
 #[derive(Debug, Clone)]
 pub struct Project {
     pub id: i64,
     pub name: String,
     pub path: String,
     pub added_at: String,
+    /// Which version control system this project uses: `"git"` or `"svn"`.
+    pub vcs: String,
 }
 
 const SCHEMA: &str = r#"
@@ -18,7 +20,8 @@ CREATE TABLE IF NOT EXISTS projects (
     id INTEGER PRIMARY KEY,
     name TEXT NOT NULL,
     path TEXT NOT NULL UNIQUE,
-    added_at TEXT NOT NULL DEFAULT (datetime('now'))
+    added_at TEXT NOT NULL DEFAULT (datetime('now')),
+    vcs TEXT NOT NULL DEFAULT 'git'
 );
 CREATE TABLE IF NOT EXISTS credentials (
     id INTEGER PRIMARY KEY,
@@ -39,27 +42,64 @@ pub fn init_db(path: &Path) -> rusqlite::Result<Connection> {
     let conn = Connection::open(path)?;
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     conn.execute_batch(SCHEMA)?;
+    migrate(&conn)?;
     Ok(conn)
 }
 
+/// In-place schema migrations for databases created by older versions.
+fn migrate(conn: &Connection) -> rusqlite::Result<()> {
+    // v5: the `vcs` column. New databases already have it (SCHEMA); older
+    // databases get it with a 'git' default. Column existence is checked via
+    // PRAGMA table_info (the raw ALTER error is a generic SQLITE_ERROR with
+    // no dedicated error code), making this migration idempotent.
+    let has_vcs = {
+        let mut stmt = conn.prepare("PRAGMA table_info(projects)")?;
+        let mut rows = stmt.query([])?;
+        let mut found = false;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == "vcs" {
+                found = true;
+            }
+        }
+        found
+    };
+    if !has_vcs {
+        conn.execute(
+            "ALTER TABLE projects ADD COLUMN vcs TEXT NOT NULL DEFAULT 'git'",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
 /// Insert a project and return its row id. Fails if `path` already exists.
-pub fn add_project(conn: &Connection, name: &str, path: &str) -> rusqlite::Result<i64> {
+///
+/// `vcs` is `"git"` or `"svn"` (the string is stored verbatim).
+pub fn add_project(
+    conn: &Connection,
+    name: &str,
+    path: &str,
+    vcs: &str,
+) -> rusqlite::Result<i64> {
     conn.execute(
-        "INSERT INTO projects (name, path) VALUES (?1, ?2)",
-        params![name, path],
+        "INSERT INTO projects (name, path, vcs) VALUES (?1, ?2, ?3)",
+        params![name, path, vcs],
     )?;
     Ok(conn.last_insert_rowid())
 }
 
 /// List all projects, oldest first.
 pub fn list_projects(conn: &Connection) -> rusqlite::Result<Vec<Project>> {
-    let mut stmt = conn.prepare("SELECT id, name, path, added_at FROM projects ORDER BY id ASC")?;
+    let mut stmt =
+        conn.prepare("SELECT id, name, path, added_at, vcs FROM projects ORDER BY id ASC")?;
     let rows = stmt.query_map([], |row| {
         Ok(Project {
             id: row.get(0)?,
             name: row.get(1)?,
             path: row.get(2)?,
             added_at: row.get(3)?,
+            vcs: row.get(4)?,
         })
     })?;
     rows.collect()
@@ -254,7 +294,7 @@ mod tests {
         let keys = crypto::unlock(&conn, MASTER).unwrap();
         let repo = dir.path().join("repo");
         fs::create_dir(&repo).unwrap();
-        let id = add_project(&conn, "demo", repo.to_str().unwrap()).unwrap();
+        let id = add_project(&conn, "demo", repo.to_str().unwrap(), "git").unwrap();
         (conn, keys, id)
     }
 
@@ -267,7 +307,7 @@ mod tests {
         fs::create_dir(&repo).unwrap();
         let repo_path = repo.to_str().unwrap();
 
-        let id = add_project(&conn, "demo", repo_path).unwrap();
+        let id = add_project(&conn, "demo", repo_path, "git").unwrap();
         assert!(id > 0);
 
         let projects = list_projects(&conn).unwrap();
@@ -276,6 +316,69 @@ mod tests {
         assert_eq!(projects[0].name, "demo");
         assert_eq!(projects[0].path, repo_path);
         assert!(!projects[0].added_at.is_empty());
+        assert_eq!(projects[0].vcs, "git");
+    }
+
+    #[test]
+    fn add_and_list_round_trips_vcs() {
+        let dir = tempdir().unwrap();
+        let conn = init_db(&dir.path().join("test.db")).unwrap();
+        let repo = dir.path().join("svn-repo");
+        fs::create_dir(&repo).unwrap();
+
+        add_project(&conn, "svn-demo", repo.to_str().unwrap(), "svn").unwrap();
+        let projects = list_projects(&conn).unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].vcs, "svn", "the stored vcs type must round-trip");
+    }
+
+    #[test]
+    fn raw_rows_without_vcs_default_to_git() {
+        let dir = tempdir().unwrap();
+        let conn = init_db(&dir.path().join("test.db")).unwrap();
+        conn.execute(
+            "INSERT INTO projects (name, path) VALUES ('legacy', 'C:/x')",
+            [],
+        )
+        .unwrap();
+
+        let projects = list_projects(&conn).unwrap();
+        assert_eq!(projects[0].vcs, "git", "rows predating the vcs column are git");
+    }
+
+    #[test]
+    fn migrate_old_db_without_vcs_column() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("legacy.db");
+        // Simulate a v4-era database: the projects table without the vcs column.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE projects (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    path TEXT NOT NULL UNIQUE,
+                    added_at TEXT NOT NULL DEFAULT (datetime('now'))
+                );
+                INSERT INTO projects (name, path) VALUES ('old', 'C:/old');",
+            )
+            .unwrap();
+        }
+        // Re-opening through init_db must migrate in place and keep the row.
+        let conn = init_db(&db_path).unwrap();
+        let projects = list_projects(&conn).unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].name, "old");
+        assert_eq!(projects[0].vcs, "git");
+    }
+
+    #[test]
+    fn init_db_is_idempotent() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        init_db(&db_path).unwrap();
+        // Second open on an up-to-date schema must not fail on the migration.
+        init_db(&db_path).expect("re-init on migrated schema");
     }
 
     #[test]
@@ -287,8 +390,8 @@ mod tests {
         fs::create_dir(&repo).unwrap();
         let repo_path = repo.to_str().unwrap();
 
-        add_project(&conn, "demo", repo_path).unwrap();
-        assert!(add_project(&conn, "other", repo_path).is_err());
+        add_project(&conn, "demo", repo_path, "git").unwrap();
+        assert!(add_project(&conn, "other", repo_path, "git").is_err());
     }
 
     #[test]
@@ -302,7 +405,7 @@ mod tests {
         fs::write(&probe, b"probe").unwrap();
         let repo_path = repo.to_str().unwrap();
 
-        let id = add_project(&conn, "demo", repo_path).unwrap();
+        let id = add_project(&conn, "demo", repo_path, "git").unwrap();
         let removed = remove_project(&conn, id).unwrap();
         assert_eq!(removed, 1);
         assert!(list_projects(&conn).unwrap().is_empty());
@@ -348,7 +451,7 @@ mod tests {
         store_credential(&conn, &keys, project_id, "git_token", "s3cret!").unwrap();
         let repo = dir.path().join("other");
         fs::create_dir(&repo).unwrap();
-        let other_id = add_project(&conn, "other", repo.to_str().unwrap()).unwrap();
+        let other_id = add_project(&conn, "other", repo.to_str().unwrap(), "git").unwrap();
         assert!(get_credential(&conn, &keys, other_id, "git_token")
             .unwrap()
             .is_none());
@@ -424,7 +527,7 @@ mod tests {
         let old_keys = crypto::unlock(&conn, MASTER).unwrap();
         let repo = dir.path().join("repo");
         fs::create_dir(&repo).unwrap();
-        let project_id = add_project(&conn, "demo", repo.to_str().unwrap()).unwrap();
+        let project_id = add_project(&conn, "demo", repo.to_str().unwrap(), "git").unwrap();
         store_credential(&conn, &old_keys, project_id, "git_token", "s3cret!").unwrap();
         store_credential(
             &conn,
@@ -481,7 +584,7 @@ mod tests {
         let keys = crypto::unlock(&conn, MASTER).unwrap();
         let repo = dir.path().join("repo");
         fs::create_dir(&repo).unwrap();
-        let project_id = add_project(&conn, "demo", repo.to_str().unwrap()).unwrap();
+        let project_id = add_project(&conn, "demo", repo.to_str().unwrap(), "git").unwrap();
         store_credential(&conn, &keys, project_id, "git_token", "s3cret!").unwrap();
 
         let salt_before = get_meta(&conn, "kdf_salt").unwrap().unwrap();
@@ -526,7 +629,7 @@ mod tests {
         let keys = crypto::unlock(&conn, MASTER).unwrap();
         let repo = dir.path().join("repo");
         fs::create_dir(&repo).unwrap();
-        let project_id = add_project(&conn, "demo", repo.to_str().unwrap()).unwrap();
+        let project_id = add_project(&conn, "demo", repo.to_str().unwrap(), "git").unwrap();
         store_credential(&conn, &keys, project_id, "git_token", "s3cret!").unwrap();
 
         assert!(change_master_password(&conn, MASTER, "").is_err());

@@ -3766,7 +3766,7 @@ impl GitPmApp {
                 return;
             }
         }
-        match db::add_project(conn, &name, &path) {
+        match db::add_project(conn, &name, &path, "git") {
             Ok(_) => self.reload_projects(),
             Err(e) => {
                 self.error = Some(tf(self.lang, "err-add-project", &[("err", &e.to_string())]))
@@ -3958,7 +3958,7 @@ impl GitPmApp {
                     self.clone_error = Some(i18n::t(self.lang, "err-db-not-open").into());
                     return;
                 };
-                match db::add_project(conn, &name, &target_str) {
+                match db::add_project(conn, &name, &target_str, "git") {
                     Ok(_) => self.close_clone_dialog(),
                     Err(e) => {
                         self.clone_error =
