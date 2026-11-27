@@ -2876,10 +2876,9 @@ impl GitPmApp {
                         }
                     };
                     // 目录行：四格均可点击（点击行内任意位置进入）；
-                    // 文件行：配置了文本编辑器且扩展名是文本时也可点击
-                    // （点击用编辑器打开），否则仅 hover 感应。
-                    let clickable = *is_dir
-                        || (self.text_editor.is_some() && is_text_file(name));
+                    // 文件行：文本文件可点击（点击打开——配置了编辑器用
+                    // 编辑器，否则用系统默认关联程序），否则仅 hover 感应。
+                    let clickable = *is_dir || is_text_file(name);
                     let sense = if clickable {
                         egui::Sense::click()
                     } else {
@@ -4382,31 +4381,39 @@ impl GitPmApp {
     }
 
     /// 用配置的编辑器打开文件：解析命令行后异步启动（不等待编辑器退出）。
+    /// 未配置时兜底用系统默认关联程序（explorer / xdg-open）。
     /// 成功/失败都写入底部输出区。
     fn open_in_editor(&mut self, path: &Path) {
         let lang = self.lang;
         let title = tf(lang, "log-editor-title", &[("path", &path.display().to_string())]);
-        let Some(cmd) = self.text_editor.clone() else {
-            return;
-        };
-        match parse_editor_command(&cmd, &path.display().to_string()) {
-            Some((program, args)) => match std::process::Command::new(&program).args(&args).spawn()
-            {
-                Ok(_child) => self.log.push(LogEntry {
-                    ok: true,
-                    title,
-                    text: cmd.clone(),
-                }),
-                Err(e) => self.log.push(LogEntry {
-                    ok: false,
-                    title,
-                    text: tf(lang, "err-open-editor", &[("err", &e.to_string())]),
-                }),
+        let file = path.display().to_string();
+        let (program, args) = match self.text_editor.clone() {
+            Some(cmd) => match parse_editor_command(&cmd, &file) {
+                Some(parsed) => parsed,
+                None => {
+                    self.log.push(LogEntry {
+                        ok: false,
+                        title,
+                        text: i18n::t(lang, "err-editor-not-set").to_string(),
+                    });
+                    self.trim_log();
+                    return;
+                }
             },
-            None => self.log.push(LogEntry {
+            None => default_open_command(&file),
+        };
+        match std::process::Command::new(&program).args(&args).spawn() {
+            Ok(_child) => {
+                let text = match &self.text_editor {
+                    Some(cmd) => cmd.clone(),
+                    None => i18n::t(lang, "editor-default-used").to_string(),
+                };
+                self.log.push(LogEntry { ok: true, title, text });
+            }
+            Err(e) => self.log.push(LogEntry {
                 ok: false,
                 title,
-                text: i18n::t(lang, "err-editor-not-set").to_string(),
+                text: tf(lang, "err-open-editor", &[("err", &e.to_string())]),
             }),
         }
         self.trim_log();
@@ -5319,6 +5326,19 @@ fn parse_editor_command(cmd: &str, file: &str) -> Option<(String, Vec<String>)> 
     Some((program.clone(), args))
 }
 
+/// 未配置编辑器时的默认打开方式：Windows 上经 `explorer.exe` 按
+/// 系统文件关联打开（等同在资源管理器里双击），其他平台用 xdg-open。
+fn default_open_command(file: &str) -> (String, Vec<String>) {
+    #[cfg(windows)]
+    {
+        ("explorer.exe".to_string(), vec![file.to_string()])
+    }
+    #[cfg(not(windows))]
+    {
+        ("xdg-open".to_string(), vec![file.to_string()])
+    }
+}
+
 /// 按扩展名判断是否按文本文件处理（决定浏览器里能否点击用编辑器打开）。
 /// 常见文本/代码/配置扩展名，以及 `.gitignore`、`Makefile` 这类无扩展
 /// 名的约定文本文件；二进制格式（exe/dll/图片/压缩包等）明确排除。
@@ -5469,6 +5489,23 @@ mod tests {
         // 未配置 / 空命令 → None。
         assert!(parse_editor_command("", r"C:\x").is_none());
         assert!(parse_editor_command("   ", r"C:\x").is_none());
+    }
+
+    #[test]
+    fn default_open_command_uses_system_association() {
+        // 未配置编辑器时的兜底：Windows 经 explorer 按系统关联打开，
+        // 非 Windows 用 xdg-open。文件路径必须原样作为参数。
+        let (prog, args) = default_open_command(r"C:\a b.txt");
+        #[cfg(windows)]
+        {
+            assert_eq!(prog, "explorer.exe");
+            assert_eq!(args, vec![r"C:\a b.txt"]);
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(prog, "xdg-open");
+            assert_eq!(args, vec![r"C:\a b.txt"]);
+        }
     }
 
     #[test]
