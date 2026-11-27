@@ -1988,10 +1988,11 @@ impl GitPmApp {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     // Clone the row data so the click handler can mutate state.
-                    let rows: Vec<(i64, String, String)> = self
+                    // The 4th field marks SVN working copies (leaf tint).
+                    let rows: Vec<(i64, String, String, bool)> = self
                         .projects
                         .iter()
-                        .map(|p| (p.id, project_display_name(p), p.path.clone()))
+                        .map(|p| (p.id, project_display_name(p), p.path.clone(), p.vcs == "svn"))
                         .collect();
                     if rows.is_empty() {
                         ui.label(i18n::t(lang, "empty-project-list"));
@@ -2002,9 +2003,9 @@ impl GitPmApp {
                     // 缺省展开，折叠态在会话内按节点 key 记忆。「未分组」
                     // 节点的 label 是稳定 key，展示时经 t() 翻译。
                     let paths: Vec<String> =
-                        rows.iter().map(|(_, _, path)| path.clone()).collect();
+                        rows.iter().map(|(_, _, path, _)| path.clone()).collect();
                     let names: Vec<String> =
-                        rows.iter().map(|(_, name, _)| name.clone()).collect();
+                        rows.iter().map(|(_, name, _, _)| name.clone()).collect();
                     let searching = !self.tree_search.trim().is_empty();
                     let full_tree = build_project_tree(&paths, cfg!(windows));
                     let tree = if searching {
@@ -2045,7 +2046,7 @@ impl GitPmApp {
         ui: &mut egui::Ui,
         node: &DirNode,
         depth: usize,
-        rows: &[(i64, String, String)],
+        rows: &[(i64, String, String, bool)],
         lang: Lang,
         char_w: f32,
     ) {
@@ -2113,8 +2114,9 @@ impl GitPmApp {
         }
         let child_indent = (depth + 1) as f32 * 2.0 * char_w;
         for &idx in &node.projects {
-            let (id, name, path) = &rows[idx];
+            let (id, name, path, is_svn) = &rows[idx];
             let selected = self.selected == Some(*id);
+            let name_color = project_tree_color(*is_svn);
             let clicked = ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 ui.add_space(child_indent);
@@ -2141,11 +2143,11 @@ impl GitPmApp {
                     let galley = ui.painter().layout(
                         name.clone(),
                         egui::TextStyle::Button.resolve(ui.style()),
-                        visuals.text_color(),
+                        name_color,
                         wrap_width,
                     );
                     let pos = egui::pos2(text_x, rect.center().y - galley.size().y * 0.5);
-                    ui.painter().galley(pos, galley, visuals.text_color());
+                    ui.painter().galley(pos, galley, name_color);
                 }
                 let mut resp = resp;
                 if !path.is_empty() {
@@ -4690,13 +4692,26 @@ fn detect_vcs(dir: &Path) -> Option<&'static str> {
     }
 }
 
-/// The display name of a project: SVN working copies carry a `[SVN]` badge
-/// so the two kinds are distinguishable at a glance in the tree and heading.
+/// The display name of a project: the VCS kind is appended as a badge so the
+/// two kinds are distinguishable at a glance in the tree and heading.
 fn project_display_name(project: &Project) -> String {
     if project.vcs == "svn" {
         format!("{} [SVN]", project.name)
     } else {
-        project.name.clone()
+        format!("{} [Git]", project.name)
+    }
+}
+
+/// 项目树叶子的文字颜色：SVN 深蓝、git 深绿。取深色分量以保证明亮
+/// 主题下可读（深色主题下同样可辨）。
+const SVN_TREE_COLOR: egui::Color32 = egui::Color32::from_rgb(28, 78, 158);
+const GIT_TREE_COLOR: egui::Color32 = egui::Color32::from_rgb(15, 110, 60);
+
+fn project_tree_color(is_svn: bool) -> egui::Color32 {
+    if is_svn {
+        SVN_TREE_COLOR
+    } else {
+        GIT_TREE_COLOR
     }
 }
 
@@ -4721,6 +4736,30 @@ mod tests {
         let dir = tempdir().unwrap();
         std::fs::create_dir(dir.path().join(".svn")).unwrap();
         assert_eq!(detect_vcs(dir.path()), Some("svn"));
+    }
+
+    #[test]
+    fn project_display_name_badges_both_vcs_kinds() {
+        let mut project = Project {
+            id: 1,
+            name: "demo".to_string(),
+            path: "C:/demo".to_string(),
+            added_at: String::new(),
+            vcs: "git".to_string(),
+        };
+        assert_eq!(project_display_name(&project), "demo [Git]");
+        project.vcs = "svn".to_string();
+        assert_eq!(project_display_name(&project), "demo [SVN]");
+    }
+
+    #[test]
+    fn project_tree_color_distinguishes_vcs() {
+        // SVN 深蓝、git 深绿：钉住色值（深色分量，明亮主题可读）且互不相同。
+        let svn = project_tree_color(true);
+        let git = project_tree_color(false);
+        assert_ne!(svn, git);
+        assert_eq!(svn, egui::Color32::from_rgb(28, 78, 158));
+        assert_eq!(git, egui::Color32::from_rgb(15, 110, 60));
     }
 
     #[test]
