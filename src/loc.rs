@@ -9,7 +9,7 @@ use std::fs;
 use std::path::Path;
 
 /// 扫描时跳过的目录名（不区分大小写）。
-const SKIP_DIRS: &[&str] = &[
+pub(crate) const SKIP_DIRS: &[&str] = &[
     ".git",
     ".svn",
     ".hg",

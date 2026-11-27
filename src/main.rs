@@ -8,6 +8,7 @@ mod git;
 mod i18n;
 mod loc;
 mod password;
+mod scan;
 mod svn;
 
 use eframe::egui;
