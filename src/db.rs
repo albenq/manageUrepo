@@ -13,6 +13,9 @@ pub struct Project {
     pub added_at: String,
     /// Which version control system this project uses: `"git"` or `"svn"`.
     pub vcs: String,
+    /// Optional user-defined group name; empty string means ungrouped
+    /// (the project then hangs under the path hierarchy in the tree).
+    pub group_name: String,
 }
 
 const SCHEMA: &str = r#"
@@ -21,7 +24,8 @@ CREATE TABLE IF NOT EXISTS projects (
     name TEXT NOT NULL,
     path TEXT NOT NULL UNIQUE,
     added_at TEXT NOT NULL DEFAULT (datetime('now')),
-    vcs TEXT NOT NULL DEFAULT 'git'
+    vcs TEXT NOT NULL DEFAULT 'git',
+    group_name TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS credentials (
     id INTEGER PRIMARY KEY,
@@ -70,6 +74,26 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             [],
         )?;
     }
+    // v6: the `group_name` column ('' = ungrouped). Same idempotency
+    // strategy as the vcs migration above.
+    let has_group = {
+        let mut stmt = conn.prepare("PRAGMA table_info(projects)")?;
+        let mut rows = stmt.query([])?;
+        let mut found = false;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?;
+            if name == "group_name" {
+                found = true;
+            }
+        }
+        found
+    };
+    if !has_group {
+        conn.execute(
+            "ALTER TABLE projects ADD COLUMN group_name TEXT NOT NULL DEFAULT ''",
+            [],
+        )?;
+    }
     Ok(())
 }
 
@@ -91,8 +115,8 @@ pub fn add_project(
 
 /// List all projects, oldest first.
 pub fn list_projects(conn: &Connection) -> rusqlite::Result<Vec<Project>> {
-    let mut stmt =
-        conn.prepare("SELECT id, name, path, added_at, vcs FROM projects ORDER BY id ASC")?;
+    let mut stmt = conn
+        .prepare("SELECT id, name, path, added_at, vcs, group_name FROM projects ORDER BY id ASC")?;
     let rows = stmt.query_map([], |row| {
         Ok(Project {
             id: row.get(0)?,
@@ -100,9 +124,29 @@ pub fn list_projects(conn: &Connection) -> rusqlite::Result<Vec<Project>> {
             path: row.get(2)?,
             added_at: row.get(3)?,
             vcs: row.get(4)?,
+            group_name: row.get(5)?,
         })
     })?;
     rows.collect()
+}
+
+/// Assign a project to a user-defined group. An empty `group` removes the
+/// project from its group (it goes back under the path hierarchy).
+pub fn set_project_group(conn: &Connection, id: i64, group: &str) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE projects SET group_name = ?1 WHERE id = ?2",
+        params![group, id],
+    )
+}
+
+/// Rename a group in place: every member moves with it. Renaming onto an
+/// existing group name merges the two groups (all members end up under the
+/// new name). Returns the number of projects moved.
+pub fn rename_group(conn: &Connection, old: &str, new: &str) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE projects SET group_name = ?1 WHERE group_name = ?2",
+        params![new, old],
+    )
 }
 
 /// Delete the project row only; the working directory on disk is never touched.
@@ -379,6 +423,65 @@ mod tests {
         init_db(&db_path).unwrap();
         // Second open on an up-to-date schema must not fail on the migration.
         init_db(&db_path).expect("re-init on migrated schema");
+    }
+
+    #[test]
+    fn migrate_old_db_without_group_column() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("legacy.db");
+        // Simulate a v5-era database: has vcs but no group_name column.
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE projects (
+                    id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    path TEXT NOT NULL UNIQUE,
+                    added_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    vcs TEXT NOT NULL DEFAULT 'git'
+                );
+                INSERT INTO projects (name, path) VALUES ('old', 'C:/old');",
+            )
+            .unwrap();
+        }
+        let conn = init_db(&db_path).unwrap();
+        let projects = list_projects(&conn).unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].group_name, "", "pre-group rows are ungrouped");
+
+        // Re-init on the migrated schema stays idempotent.
+        init_db(&db_path).expect("re-init after group migration");
+    }
+
+    #[test]
+    fn set_and_rename_group_roundtrip() {
+        let dir = tempdir().unwrap();
+        let conn = init_db(&dir.path().join("test.db")).unwrap();
+        let a = add_project(&conn, "a", "C:/a", "git").unwrap();
+        let b = add_project(&conn, "b", "C:/b", "git").unwrap();
+
+        set_project_group(&conn, a, "work").unwrap();
+        set_project_group(&conn, b, "work").unwrap();
+        let names = list_projects(&conn).unwrap();
+        assert_eq!(names[0].group_name, "work");
+        assert_eq!(names[1].group_name, "work");
+
+        // Moving back out of a group.
+        set_project_group(&conn, b, "").unwrap();
+        let names = list_projects(&conn).unwrap();
+        assert_eq!(names[1].group_name, "");
+
+        // Renaming a group moves all members at once; renaming to an
+        // existing name merges the two groups.
+        set_project_group(&conn, b, "other").unwrap();
+        let changed = rename_group(&conn, "work", "company").unwrap();
+        assert_eq!(changed, 1, "only project a was in work");
+        set_project_group(&conn, a, "other").unwrap();
+        let changed = rename_group(&conn, "other", "company").unwrap();
+        assert_eq!(changed, 2, "rename onto an existing name merges");
+        let names = list_projects(&conn).unwrap();
+        assert_eq!(names[0].group_name, "company");
+        assert_eq!(names[1].group_name, "company");
     }
 
     #[test]

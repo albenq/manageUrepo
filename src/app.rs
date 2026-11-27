@@ -4895,6 +4895,7 @@ mod tests {
             path: "C:/demo".to_string(),
             added_at: String::new(),
             vcs: "git".to_string(),
+            group_name: String::new(),
         };
         assert_eq!(project_display_name(&project), "demo [Git]");
         project.vcs = "svn".to_string();
