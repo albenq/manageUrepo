@@ -2125,10 +2125,17 @@ impl GitPmApp {
         // 搜索期间强制展开全部命中路径；折叠记忆保留，清空搜索后恢复。
         let searching = !self.tree_search.trim().is_empty();
         let open = searching || !self.collapsed_tree_dirs.contains(&node.key);
+        let is_group = node.key.starts_with(GROUP_KEY_PREFIX);
         let title = if node.key.is_empty() {
             i18n::t(lang, GROUP_UNGROUPED_KEY)
         } else {
             node.label.as_str()
+        };
+        // 分组节点标题深橙色，目录/未分组节点维持链接色。
+        let title_color = if is_group {
+            group_tree_color()
+        } else {
+            ui.visuals().hyperlink_color
         };
         let row_h = ui.spacing().interact_size.y;
         let mut toggle = false;
@@ -2159,7 +2166,7 @@ impl GitPmApp {
                 egui::Label::new(
                     egui::RichText::new(title)
                         .strong()
-                        .color(ui.visuals().hyperlink_color),
+                        .color(title_color),
                 )
                 .sense(name_sense)
                 .truncate(),
@@ -5092,6 +5099,13 @@ fn project_tree_color(is_svn: bool) -> egui::Color32 {
     }
 }
 
+/// 分组节点标题的颜色：深橙色，区别于 git 绿 / svn 蓝 / 目录链接色。
+const GROUP_TREE_COLOR: egui::Color32 = egui::Color32::from_rgb(204, 85, 0);
+
+fn group_tree_color() -> egui::Color32 {
+    GROUP_TREE_COLOR
+}
+
 /// 项目树 rows 元组的分组字段：分组节点的 key 前缀（与目录节点区分）。
 const GROUP_KEY_PREFIX: &str = "group:";
 
@@ -5202,6 +5216,12 @@ mod tests {
         assert_ne!(svn, git);
         assert_eq!(svn, egui::Color32::from_rgb(28, 78, 158));
         assert_eq!(git, egui::Color32::from_rgb(15, 110, 60));
+    }
+
+    #[test]
+    fn group_tree_color_is_dark_orange() {
+        // 分组节点深橙色，区别于 git 绿 / svn 蓝 / 普通目录链接色。
+        assert_eq!(group_tree_color(), egui::Color32::from_rgb(204, 85, 0));
     }
 
     fn row(id: i64, group: &str) -> (i64, String, String, bool, String) {
