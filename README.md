@@ -37,6 +37,7 @@ cargo run --release
 
 - **项目树**：把本机已有的 git 仓库加入左侧项目列表，点击切换；移除只删列表记录，不动磁盘文件。项目按父目录层级分组为可折叠树，名称左对齐。树上方工具栏提供搜索：随输入逐字过滤项目与目录（英文不区分大小写、按子串匹配），命中目录时显示其整棵子树，并自动展开命中路径；`Esc` 或 `✕` 清空。
 - **SVN 项目支持**：添加项目时自动探测 `.svn` 目录（列表与标题中带 `[SVN]` 徽标）；SVN 工作副本提供 `svn status` 状态总览（图例译文）、`svn log` 提交历史（支持翻页）、`svn update` 更新与 `svn add --force . + svn commit` 提交，凭据可存入加密库并经 `--username/--password --non-interactive` 注入、输出脱敏；代码行数统计同样可用。SVN 项目不显示分支/标签/推送。需本机安装 `svn` 命令行工具。
+- **扫描项目**：工具栏「扫描项目...」选择一个根目录，后台线程递归查找其中的 git / svn 仓库并自动加入项目树；仓库内部嵌套的子仓库不再单独上报（仅添加父仓库），`node_modules` / `target` 等构建与依赖目录不进入；过程信息（新增、已存在跳过）写入输出窗口，扫描出错信息以红色条目显示。
 - **状态总览**：选中项目后显示 `git status`、分支列表、标签列表，可手动刷新。
 - **代码行数统计**：操作面板一键统计当前项目工作区的代码行数，报告（文件数、总行数、总大小、耗时、按扩展名聚合，最多展示 20 项）打印到底部输出区；自动跳过 `.git` / `.svn` / `target` / `node_modules` 等目录与二进制、超大文件，后台线程执行，不阻塞界面。
 - **提交（commit）**：填写提交信息后一键 `git add -A` + `git commit`。
@@ -105,6 +106,7 @@ The window opens at 1440×900 by default (minimum 1200×800) and can be resized 
 
 - **Project tree**: add existing local git repositories to the list on the left and switch between them with a click; removing a project only deletes the list entry, never touches files on disk. Projects are grouped by parent directory into a collapsible tree, with names left-aligned. A toolbar above the tree searches projects and folders as you type (letter-by-letter substring match, case-insensitive for English); matching a folder keeps its whole subtree, and matching paths auto-expand; `Esc` or `✕` clears.
 - **SVN project support**: adding a project auto-detects a `.svn` working copy (badged `[SVN]` in the list and heading); SVN projects get an `svn status` overview (translated legend), `svn log` history (paged), `svn update`, and `svn add --force . + svn commit`. Credentials can be stored in the encrypted vault and are injected via `--username/--password --non-interactive` with redacted output; the lines-of-code counter works as well. Branch/tag/push UI is hidden for SVN. Requires the `svn` command-line tools installed.
+- **Project scanner**: the toolbar's "Scan projects..." picks a root directory and recursively discovers git / svn repositories on a background thread, adding them to the project tree automatically. Repositories nested inside another repository are not reported separately (only the parent is added); build and dependency directories such as `node_modules` / `target` are skipped. Progress goes to the output log — added/skipped repos as normal entries, scan errors as red entries.
 - **Status overview**: selecting a project shows `git status`, branches, and tags, with manual refresh.
 - **Lines-of-code counter**: one click in the operations panel scans the project's working tree and prints a report (files scanned, total lines, total size, elapsed time, per-extension breakdown, top 20) to the output log. `.git` / `.svn` / `target` / `node_modules` and other build or dependency directories, binary and oversized files are skipped; scanning runs on a background thread so the UI stays responsive.
 - **Commit**: enter a message, then one click runs `git add -A` + `git commit`.

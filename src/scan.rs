@@ -88,7 +88,6 @@ fn walk(dir: &Path, outcome: &mut ScanOutcome) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::fs;
-    use tempfile::tempdir;
 
     fn temp_root(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(

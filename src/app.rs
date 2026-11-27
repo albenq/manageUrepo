@@ -19,6 +19,7 @@ use crate::git;
 use crate::i18n::{self, Lang};
 use crate::loc;
 use crate::password::{self, GenOptions};
+use crate::scan;
 use crate::svn;
 
 /// t() + 占位符替换：把文案中的 `{name}` 依次替换为 pairs 的值，用于带
@@ -1386,6 +1387,11 @@ pub struct GitPmApp {
     loc_rx: mpsc::Receiver<LocResult>,
     /// Project whose line count is currently running, if any (duplicate guard).
     loc_inflight: Option<i64>,
+    /// Background repo-scan results (found repos + per-dir errors).
+    scan_tx: mpsc::Sender<scan::ScanOutcome>,
+    scan_rx: mpsc::Receiver<scan::ScanOutcome>,
+    /// Root of the scan currently running, if any (duplicate guard + report).
+    scan_inflight: Option<PathBuf>,
     commit_msg: String,
     new_branch: String,
     tag_name: String,
@@ -1468,6 +1474,7 @@ impl GitPmApp {
     pub fn new() -> Self {
         let (result_tx, result_rx) = mpsc::channel();
         let (loc_tx, loc_rx) = mpsc::channel();
+        let (scan_tx, scan_rx) = mpsc::channel();
         let mut app = Self {
             conn: None,
             open_error: None,
@@ -1494,6 +1501,9 @@ impl GitPmApp {
             loc_tx,
             loc_rx,
             loc_inflight: None,
+            scan_tx,
+            scan_rx,
+            scan_inflight: None,
             commit_msg: String::new(),
             new_branch: String::new(),
             tag_name: String::new(),
@@ -1768,6 +1778,7 @@ impl GitPmApp {
     fn show_main(&mut self, ctx: &egui::Context) {
         self.drain_results();
         self.drain_loc_results();
+        self.drain_scan_results();
         self.show_top_bar(ctx);
         self.show_project_list(ctx);
         self.sync_status_for_selection();
@@ -1809,7 +1820,11 @@ impl GitPmApp {
         // change,「刷新」button, post-operation refresh), and the「加载中」
         // bar is gone as soon as the first segment lands, so only this
         // condition reliably keeps frames alive until the batch completes.
-        if self.busy.is_some() || !self.status_inflight.is_empty() || self.loc_inflight.is_some() {
+        if self.busy.is_some()
+            || !self.status_inflight.is_empty()
+            || self.loc_inflight.is_some()
+            || self.scan_inflight.is_some()
+        {
             ctx.request_repaint_after(std::time::Duration::from_millis(BUSY_REPAINT_MS));
         }
     }
@@ -1842,6 +1857,24 @@ impl GitPmApp {
                     .clicked()
                 {
                     self.open_clone_dialog();
+                }
+                // 扫描项目：选根目录递归查找 git / svn 仓库并入库。
+                let scanning = self.scan_inflight.is_some();
+                if ui
+                    .add_enabled(
+                        !scanning,
+                        egui::Button::new(format!(
+                            "{} {}",
+                            icons::ICON_SEARCH,
+                            i18n::t(lang, "btn-scan-projects")
+                        )),
+                    )
+                    .clicked()
+                {
+                    self.pick_and_scan_projects();
+                }
+                if scanning {
+                    ui.label(i18n::t(lang, "scan-running"));
                 }
                 let has_selection = self.selected.is_some();
                 if ui
@@ -2905,6 +2938,122 @@ impl GitPmApp {
                 }),
             }
             self.trim_log();
+        }
+    }
+
+    /// 工具栏「扫描项目...」：选择一个根目录，后台线程递归查找其中的
+    /// git / svn 仓库根；完成后把发现结果送回 UI 线程入库（rusqlite
+    /// 连接不跨线程）。
+    fn pick_and_scan_projects(&mut self) {
+        self.error = None;
+        if self.scan_inflight.is_some() {
+            return; // a scan is already running
+        }
+        let Some(dir) = rfd::FileDialog::new()
+            .set_title(i18n::t(self.lang, "btn-scan-projects"))
+            .pick_folder()
+        else {
+            return; // user cancelled the dialog; not an error
+        };
+        self.scan_inflight = Some(dir.clone());
+        let tx = self.scan_tx.clone();
+        std::thread::spawn(move || {
+            // 根目录不可读时也以一条 error 记录回流（而不是丢弃）。
+            let outcome = scan::scan_for_repos(&dir).unwrap_or_else(|e| scan::ScanOutcome {
+                found: Vec::new(),
+                errors: vec![(dir.clone(), e.to_string())],
+            });
+            let _ = tx.send(outcome);
+        });
+    }
+
+    /// 收尾已完成的扫描：逐个入库新仓库（已存在的跳过），过程信息写入
+    /// 底部输出区——新增/跳过为正常记录，出错记录单独一条红色条目。
+    fn drain_scan_results(&mut self) {
+        while let Ok(outcome) = self.scan_rx.try_recv() {
+            let root = self.scan_inflight.take();
+            let root_display = root
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let Some(conn) = self.conn.as_ref() else {
+                self.error = Some(i18n::t(self.lang, "err-db-not-open").into());
+                return;
+            };
+            let existing: std::collections::HashSet<String> =
+                self.projects.iter().map(|p| p.path.clone()).collect();
+            let mut lines: Vec<String> = Vec::new();
+            let mut added = 0usize;
+            let mut skipped = 0usize;
+            for repo in &outcome.found {
+                let path_str = repo.path.to_string_lossy().into_owned();
+                if existing.contains(&path_str) {
+                    skipped += 1;
+                    lines.push(tf(self.lang, "scan-exists", &[("path", &path_str)]));
+                    continue;
+                }
+                let name = repo
+                    .path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path_str.clone());
+                match db::add_project(conn, &name, &path_str, repo.vcs) {
+                    Ok(_) => {
+                        added += 1;
+                        lines.push(tf(self.lang, "scan-added", &[("path", &path_str)]));
+                    }
+                    Err(e) => lines.push(tf(
+                        self.lang,
+                        "err-add-project",
+                        &[("err", &e.to_string())],
+                    )),
+                }
+            }
+            if outcome.found.is_empty() {
+                lines.push(i18n::t(self.lang, "scan-none").to_string());
+            }
+            let summary = tf(
+                self.lang,
+                "scan-summary",
+                &[
+                    ("n", &outcome.found.len().to_string()),
+                    ("m", &added.to_string()),
+                    ("k", &skipped.to_string()),
+                ],
+            );
+            let mut text = summary;
+            for line in &lines {
+                text.push('\n');
+                text.push_str(line);
+            }
+            self.log.push(LogEntry {
+                ok: true,
+                title: tf(self.lang, "log-scan-title", &[("root", &root_display)]),
+                text,
+            });
+            if !outcome.errors.is_empty() {
+                let err_text = outcome
+                    .errors
+                    .iter()
+                    .map(|(path, err)| {
+                        tf(
+                            self.lang,
+                            "scan-error-line",
+                            &[("path", &path.to_string_lossy()), ("err", err)],
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                self.log.push(LogEntry {
+                    ok: false,
+                    title: tf(self.lang, "log-scan-error-title", &[("root", &root_display)]),
+                    text: err_text,
+                });
+            }
+            self.trim_log();
+            if added > 0 {
+                self.reload_projects();
+            }
         }
     }
 
