@@ -39,6 +39,7 @@ cargo run --release
 - **SVN 项目支持**：添加项目时自动探测 `.svn` 目录（列表与标题中带 `[SVN]` 徽标）；SVN 工作副本提供 `svn status` 状态总览（图例译文）、`svn log` 提交历史（支持翻页）、`svn update` 更新与 `svn add --force . + svn commit` 提交，凭据可存入加密库并经 `--username/--password --non-interactive` 注入、输出脱敏；代码行数统计同样可用。SVN 项目不显示分支/标签/推送。需本机安装 `svn` 命令行工具。
 - **项目分组**：右侧项目树顶部显示用户自定义分组节点；右键项目可「移动到分组」（含新建分组…）或「移出分组」，右键分组节点可重命名（全部成员随迁，改到既有名称即合并）或删除分组（成员移回未分组，项目本身不受影响）。分组归属持久化在数据库中，重启后保留；未分组项目仍按路径层级展示。分组标题以深橙色显示。
 - **输出编码**：git/svn 子进程输出先按 UTF-8 解码，失败时按系统 ANSI 代码页（如简体中文 GBK）还原，旧编码提交信息与 svn 输出不再乱码。
+- **文本编辑器**：菜单「设置 → 设置文本编辑器...」配置编辑器命令（支持 `{file}` 占位符与带引号的含空格路径，配置持久化保存）；配置后在文件浏览窗口点击文本文件（按扩展名识别：txt/md/源码/配置等及 .gitignore、Makefile 等无扩展名文本文件）即用该编辑器打开，启动结果写入底部输出区。
 - **扫描项目**：工具栏「扫描项目...」选择一个根目录，后台线程递归查找其中的 git / svn 仓库并自动加入项目树；仓库内部嵌套的子仓库不再单独上报（仅添加父仓库），`node_modules` / `target` 等构建与依赖目录不进入；过程信息（新增、已存在跳过）写入输出窗口，扫描出错信息以红色条目显示。
 - **状态总览**：选中项目后显示 `git status`、分支列表、标签列表，可手动刷新。
 - **代码行数统计**：操作面板一键统计当前项目工作区的代码行数，报告（文件数、总行数、总大小、耗时、按扩展名聚合，最多展示 20 项）打印到底部输出区；自动跳过 `.git` / `.svn` / `target` / `node_modules` 等目录与二进制、超大文件，后台线程执行，不阻塞界面。
@@ -111,6 +112,7 @@ The window opens at 1440×900 by default (minimum 1200×800) and can be resized 
 - **Project groups**: user-defined group nodes appear at the top of the project tree. Right-click a project to "Move to group" (including "New group…") or "Remove from group"; right-click a group node to rename it (all members follow; renaming onto an existing name merges the groups) or delete it (members return to ungrouped, projects themselves are untouched). Group membership is persisted in the database and survives restarts; ungrouped projects still hang under the path hierarchy. Group titles are dark orange.
 - **Project scanner**: the toolbar's "Scan projects..." picks a root directory and recursively discovers git / svn repositories on a background thread, adding them to the project tree automatically. Repositories nested inside another repository are not reported separately (only the parent is added); build and dependency directories such as `node_modules` / `target` are skipped. Progress goes to the output log — added/skipped repos as normal entries, scan errors as red entries.
 - **Output encoding**: git/svn child-process output is decoded as UTF-8 first and falls back to the system ANSI codepage (e.g. GBK on zh-CN systems), so legacy-encoded commit messages and svn output no longer show mojibake.
+- **Text editor**: configure the editor via "Settings → Set text editor..." (supports a `{file}` placeholder and quoted paths with spaces; the setting is persisted). Once configured, clicking a text file in the file browser (recognized by extension: txt/md/source/config files, plus extensionless text files like `.gitignore` / `Makefile`) opens it in that editor; launch results go to the output log.
 
 ## Windows 7 build
 

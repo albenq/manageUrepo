@@ -73,6 +73,9 @@ const VERIFIER_KEY: &str = "verifier";
 /// `meta` key storing the persisted UI theme.
 const THEME_KEY: &str = "theme";
 
+/// db meta 表里存文本编辑器命令的 key（空值 = 未配置）。
+const TEXT_EDITOR_KEY: &str = "text_editor";
+
 /// Bytes stored under `meta[THEME_KEY]` for the light theme. Anything else
 /// (missing key, other value, read failure) falls back to the dark default.
 const THEME_LIGHT: &[u8] = b"light";
@@ -1396,6 +1399,10 @@ pub struct GitPmApp {
     group_dialog: Option<GroupDialogAction>,
     group_dialog_text: String,
     group_dialog_error: Option<String>,
+    /// 用户配置的文本编辑器命令行（None/空 = 未配置）。存 db meta 表。
+    text_editor: Option<String>,
+    show_editor_dialog: bool,
+    editor_text: String,
     commit_msg: String,
     new_branch: String,
     tag_name: String,
@@ -1511,6 +1518,9 @@ impl GitPmApp {
             group_dialog: None,
             group_dialog_text: String::new(),
             group_dialog_error: None,
+            text_editor: None,
+            show_editor_dialog: false,
+            editor_text: String::new(),
             commit_msg: String::new(),
             new_branch: String::new(),
             tag_name: String::new(),
@@ -1601,6 +1611,17 @@ impl GitPmApp {
                             ));
                         }
                     }
+                }
+                // 文本编辑器命令（可选项，读失败不阻塞启动）。
+                match db::get_meta(&conn, TEXT_EDITOR_KEY) {
+                    Ok(Some(value)) => {
+                        let cmd = String::from_utf8_lossy(&value).trim().to_string();
+                        if !cmd.is_empty() {
+                            app.text_editor = Some(cmd);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => {}
                 }
                 app.conn = Some(conn);
             }
@@ -1815,6 +1836,7 @@ impl GitPmApp {
         self.show_remove_confirm(ctx);
         self.show_clone_dialog(ctx);
         self.show_group_dialog(ctx);
+        self.show_editor_dialog(ctx);
         self.show_cred_dialog(ctx);
         self.show_pw_change_dialog(ctx);
         self.show_push_dialog(ctx);
@@ -1913,6 +1935,7 @@ impl GitPmApp {
         let mut chosen_lang: Option<Lang> = None;
         let mut open_generator = false;
         let mut open_pw_change = false;
+        let mut open_editor_settings = false;
         egui::menu::bar(ui, |ui| {
             ui.menu_button(i18n::t(lang, "menu-theme"), |ui| {
                 if ui.button(i18n::t(lang, "theme-dark")).clicked() {
@@ -1944,6 +1967,9 @@ impl GitPmApp {
                 {
                     open_pw_change = true;
                 }
+                if ui.button(i18n::t(lang, "menu-set-editor")).clicked() {
+                    open_editor_settings = true;
+                }
             });
         });
         if let Some(theme) = chosen_theme {
@@ -1957,6 +1983,9 @@ impl GitPmApp {
         }
         if open_pw_change {
             self.open_pw_change_dialog();
+        }
+        if open_editor_settings {
+            self.open_editor_settings_dialog();
         }
     }
 
@@ -2847,8 +2876,11 @@ impl GitPmApp {
                         }
                     };
                     // 目录行：四格均可点击（点击行内任意位置进入）；
-                    // 文件行：无动作（仅 hover 感应）。
-                    let sense = if *is_dir {
+                    // 文件行：配置了文本编辑器且扩展名是文本时也可点击
+                    // （点击用编辑器打开），否则仅 hover 感应。
+                    let clickable = *is_dir
+                        || (self.text_editor.is_some() && is_text_file(name));
+                    let sense = if clickable {
                         egui::Sense::click()
                     } else {
                         egui::Sense::hover()
@@ -2919,6 +2951,18 @@ impl GitPmApp {
                                     self.browser_path.as_ref().map(|p| p.join(name))
                                 {
                                     self.load_browser_dir(target);
+                                }
+                            }
+                            row_resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                        }
+                    } else if clickable {
+                        // 文本文件行：点击用配置的编辑器打开。
+                        if let Some(row_resp) = name_resp {
+                            if row_resp.clicked() {
+                                if let Some(target) =
+                                    self.browser_path.as_ref().map(|p| p.join(name))
+                                {
+                                    self.open_in_editor(&target);
                                 }
                             }
                             row_resp.on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -4271,6 +4315,103 @@ impl GitPmApp {
         self.group_dialog_error = None;
     }
 
+    // ----------------------------------------------------- text editor config
+
+    /// 菜单「设置文本编辑器...」：预填当前配置，弹出输入对话框。
+    fn open_editor_settings_dialog(&mut self) {
+        self.editor_text = self.text_editor.clone().unwrap_or_default();
+        self.show_editor_dialog = true;
+    }
+
+    fn show_editor_dialog(&mut self, ctx: &egui::Context) {
+        if !self.show_editor_dialog {
+            return;
+        }
+        let lang = self.lang;
+        let mut open = self.show_editor_dialog;
+        egui::Window::new(i18n::t(lang, "editor-dialog-title"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(i18n::t(lang, "editor-intro"));
+                ui.add_space(6.0);
+                ui.add_sized(
+                    [DIALOG_FIELD_WIDTH, 22.0],
+                    egui::TextEdit::singleline(&mut self.editor_text)
+                        .hint_text(i18n::t(lang, "hint-editor-cmd")),
+                );
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(i18n::t(lang, "editor-hint")).weak());
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button(i18n::t(lang, "btn-cancel")).clicked() {
+                        self.show_editor_dialog = false;
+                    }
+                    if ui.button(i18n::t(lang, "btn-clear-editor")).clicked() {
+                        self.save_editor_setting(None);
+                        self.show_editor_dialog = false;
+                    }
+                    let ready = !self.editor_text.trim().is_empty();
+                    if ui
+                        .add_enabled(ready, egui::Button::new(i18n::t(lang, "btn-ok")))
+                        .clicked()
+                    {
+                        self.save_editor_setting(Some(self.editor_text.trim().to_string()));
+                        self.show_editor_dialog = false;
+                    }
+                });
+            });
+        if !open {
+            self.show_editor_dialog = false;
+        }
+    }
+
+    /// 保存/清除编辑器配置：写 meta 表并同步内存副本（失败仅报错，不改内存）。
+    fn save_editor_setting(&mut self, cmd: Option<String>) {
+        let Some(conn) = self.conn.as_ref() else {
+            self.error = Some(i18n::t(self.lang, "err-db-not-open").into());
+            return;
+        };
+        let value = cmd.clone().unwrap_or_default();
+        if let Err(e) = db::set_meta(conn, TEXT_EDITOR_KEY, value.as_bytes()) {
+            self.error = Some(tf(self.lang, "err-save-editor", &[("err", &e.to_string())]));
+            return;
+        }
+        self.text_editor = cmd.filter(|c| !c.trim().is_empty());
+    }
+
+    /// 用配置的编辑器打开文件：解析命令行后异步启动（不等待编辑器退出）。
+    /// 成功/失败都写入底部输出区。
+    fn open_in_editor(&mut self, path: &Path) {
+        let lang = self.lang;
+        let title = tf(lang, "log-editor-title", &[("path", &path.display().to_string())]);
+        let Some(cmd) = self.text_editor.clone() else {
+            return;
+        };
+        match parse_editor_command(&cmd, &path.display().to_string()) {
+            Some((program, args)) => match std::process::Command::new(&program).args(&args).spawn()
+            {
+                Ok(_child) => self.log.push(LogEntry {
+                    ok: true,
+                    title,
+                    text: cmd.clone(),
+                }),
+                Err(e) => self.log.push(LogEntry {
+                    ok: false,
+                    title,
+                    text: tf(lang, "err-open-editor", &[("err", &e.to_string())]),
+                }),
+            },
+            None => self.log.push(LogEntry {
+                ok: false,
+                title,
+                text: i18n::t(lang, "err-editor-not-set").to_string(),
+            }),
+        }
+        self.trim_log();
+    }
+
     fn show_group_dialog(&mut self, ctx: &egui::Context) {
         let Some(action) = self.group_dialog.clone() else {
             return;
@@ -5128,6 +5269,82 @@ struct TreeCtx<'a> {
     char_w: f32,
 }
 
+/// 把用户配置的编辑器命令行拆为 (程序, 参数)。
+///
+/// - 程序段：以引号开头时取到闭引号（支持含空格路径），否则取首个
+///   空白分隔的 token；
+/// - 参数段：引号感知地按空白拆分，`{file}` 占位符替换为目标文件路径；
+/// - 未出现 `{file}` 时，文件路径作为最后一个参数追加（notepad 风格）；
+/// - 命令为空返回 None。
+fn parse_editor_command(cmd: &str, file: &str) -> Option<(String, Vec<String>)> {
+    let cmd = cmd.trim();
+    if cmd.is_empty() {
+        return None;
+    }
+    let mut tokens: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_quotes = false;
+    let mut has_current = false;
+    for ch in cmd.chars() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+                has_current = true;
+            }
+            c if c.is_whitespace() && !in_quotes => {
+                if has_current {
+                    tokens.push(std::mem::take(&mut current));
+                    has_current = false;
+                }
+            }
+            c => {
+                current.push(c);
+                has_current = true;
+            }
+        }
+    }
+    if has_current {
+        tokens.push(current);
+    }
+    let (program, args) = tokens.split_first()?;
+    let file_used = args.iter().any(|a| a.contains("{file}"));
+    let args: Vec<String> = args
+        .iter()
+        .map(|a| a.replace("{file}", file))
+        .collect();
+    let mut args = args;
+    if !file_used {
+        args.push(file.to_string());
+    }
+    Some((program.clone(), args))
+}
+
+/// 按扩展名判断是否按文本文件处理（决定浏览器里能否点击用编辑器打开）。
+/// 常见文本/代码/配置扩展名，以及 `.gitignore`、`Makefile` 这类无扩展
+/// 名的约定文本文件；二进制格式（exe/dll/图片/压缩包等）明确排除。
+fn is_text_file(name: &str) -> bool {
+    const TEXT_EXTS: &[&str] = &[
+        "txt", "md", "markdown", "rst", "rs", "py", "toml", "json", "yml", "yaml",
+        "xml", "html", "htm", "css", "scss", "js", "mjs", "cjs", "ts", "tsx",
+        "jsx", "bat", "cmd", "ps1", "sh", "bash", "ini", "cfg", "conf", "java",
+        "go", "c", "h", "cpp", "hpp", "cc", "cs", "sql", "log", "csv", "tsv",
+        "properties", "gradle", "lock", "mod", "sum", "sln", "csproj", "gradlew",
+        "svg",
+    ];
+    const TEXT_NAMES: &[&str] = &[
+        ".gitignore", ".gitattributes", ".gitmodules", ".editorconfig",
+        "makefile", "dockerfile", "license", "readme", "changelog",
+    ];
+    let lower = name.to_lowercase();
+    if TEXT_NAMES.contains(&lower.as_str()) {
+        return true;
+    }
+    match std::path::Path::new(&lower).extension().and_then(|e| e.to_str()) {
+        Some(ext) => TEXT_EXTS.contains(&ext),
+        None => true, // 无扩展名：默认按文本处理（二进制文件几乎都带扩展名）
+    }
+}
+
 /// 树顶部的用户分组名：去空、去重、按名称排序（大小写不敏感，本地化
 /// 顺序由逐字符比较近似）。
 fn collect_group_names(rows: &[ProjectRow]) -> Vec<String> {
@@ -5222,6 +5439,55 @@ mod tests {
     fn group_tree_color_is_dark_orange() {
         // 分组节点深橙色，区别于 git 绿 / svn 蓝 / 普通目录链接色。
         assert_eq!(group_tree_color(), egui::Color32::from_rgb(204, 85, 0));
+    }
+
+    #[test]
+    fn parse_editor_command_simple_and_quoted() {
+        // 简单命令：程序 + 参数，文件路径追加在末尾。
+        let (prog, args) = parse_editor_command("notepad", r"C:\a b.txt").unwrap();
+        assert_eq!(prog, "notepad");
+        assert_eq!(args, vec![r"C:\a b.txt"]);
+
+        // 带引号的程序路径（含空格）+ 自带参数。
+        let (prog, args) =
+            parse_editor_command(r#""C:\Program Files\editor\ed.exe" -n"#, r"C:\x.txt").unwrap();
+        assert_eq!(prog, r"C:\Program Files\editor\ed.exe");
+        assert_eq!(args, vec!["-n", r"C:\x.txt"]);
+    }
+
+    #[test]
+    fn parse_editor_command_file_placeholder() {
+        // {file} 占位符可出现在任意参数位；出现时不再追加末尾。
+        let (prog, args) = parse_editor_command("code --goto {file}:1", r"C:\a.txt").unwrap();
+        assert_eq!(prog, "code");
+        assert_eq!(args, vec!["--goto", r"C:\a.txt:1"]);
+
+        let (_, args) =
+            parse_editor_command(r#""C:\my ed\ed.exe" "{file}" -w"#, r"C:\a b.txt").unwrap();
+        assert_eq!(args, vec![r"C:\a b.txt", "-w"]);
+
+        // 未配置 / 空命令 → None。
+        assert!(parse_editor_command("", r"C:\x").is_none());
+        assert!(parse_editor_command("   ", r"C:\x").is_none());
+    }
+
+    #[test]
+    fn is_text_file_by_extension() {
+        for name in [
+            "a.txt", "b.md", "c.rs", "d.py", "e.toml", "f.json", "g.yml", "h.xml",
+            "i.html", "j.css", "k.js", "l.ts", "m.bat", "n.ps1", "o.sh", "p.ini",
+            "q.cfg", "r.conf", "s.java", "t.go", "u.c", "v.cpp", "w.h", "x.sql",
+            "y.yaml", "z.log", "csv.csv",
+        ] {
+            assert!(is_text_file(name), "{name} should be text");
+        }
+        for name in ["a.exe", "b.dll", "c.png", "d.zip", "e.bin", "f.msi", "g.pdb"] {
+            assert!(!is_text_file(name), "{name} should not be text");
+        }
+        // 无扩展名的常见文本文件（.gitignore、Makefile 等）按文本处理。
+        assert!(is_text_file(".gitignore"));
+        assert!(is_text_file("Makefile"));
+        assert!(is_text_file("LICENSE"));
     }
 
     fn row(id: i64, group: &str) -> (i64, String, String, bool, String) {
