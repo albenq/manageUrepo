@@ -127,6 +127,10 @@ cargo +nightly build --release --target x86_64-win7-windows-msvc -Z build-std=st
 
 The `-L native` path works around `windows_x86_64_msvc`'s build script not recognizing the win7 target; `<registry>` is the cargo registry src directory (e.g. `%USERPROFILE%\.cargo\registry\src\<mirror-or-index>`).
 
+### Windows 7 in a VM without OpenGL 2.0+
+
+`egui_glow` needs OpenGL 2.0+; VMs without 3D acceleration (or machines without a GPU driver) only offer GL 1.1, and the app exits with `egui_glow requires opengl 2.0+` (see `git-pm.log`). The fix is a software renderer: download Mesa llvmpipe from [mmozeiko/build-mesa](https://github.com/mmozeiko/build-mesa/releases) — **use version ≤ 21.3.x**; newer builds import `WaitOnAddress`/`GetSystemTimePreciseAsFileTime`, which don't exist on Win7 (21.3.7 was verified clean: PE header 6.00, all imports Vista-era). Drop its `opengl32.dll` (x64) next to `git-pm.exe` and the app picks it up automatically, rendering on the CPU. The 21.3.7 build was verified to load and drive the app's GL context successfully.
+
 - **Status overview**: selecting a project shows `git status`, branches, and tags, with manual refresh.
 - **Lines-of-code counter**: one click in the operations panel scans the project's working tree and prints a report (files scanned, total lines, total size, elapsed time, per-extension breakdown, top 20) to the output log. `.git` / `.svn` / `target` / `node_modules` and other build or dependency directories, binary and oversized files are skipped; scanning runs on a background thread so the UI stays responsive.
 - **Commit**: enter a message, then one click runs `git add -A` + `git commit`.
