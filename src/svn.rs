@@ -279,4 +279,121 @@ mod tests {
         assert_eq!(parse_info_url("Path: x\n"), None);
         assert_eq!(parse_info_url(""), None);
     }
+
+    // ------------------------------------------------ integration tests
+    //
+    // 这些测试需要本机安装 `svn` / `svnadmin` CLI；缺失时打印提示并跳过
+    //（程序功能本身在无 svn 环境下是「调用失败记日志」，不依赖这些测试）。
+
+    /// True when the svn CLI family is available on PATH.
+    fn svn_available() -> bool {
+        Command::new("svn")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+    }
+
+    struct SvnTrio {
+        _guard: tempfile::TempDir,
+        /// file:/// URL of the freshly created repository.
+        url: String,
+        /// First working copy.
+        wc1: std::path::PathBuf,
+        /// Second working copy (used by the update test).
+        wc2: std::path::PathBuf,
+    }
+
+    /// Create a local repository with `svnadmin` and check out two working
+    /// copies from it, with one initial commit in wc1.
+    fn svn_trio() -> SvnTrio {
+        let guard = tempfile::tempdir().expect("tempdir");
+        let repo = guard.path().join("repo");
+        let create = Command::new("svnadmin")
+            .arg("create")
+            .arg(&repo)
+            .output()
+            .expect("svnadmin create");
+        assert!(create.status.success(), "svnadmin create failed");
+        let url = format!("file:///{}", repo.to_str().unwrap().replace('\\', "/"));
+
+        let wc1 = guard.path().join("wc1");
+        let co1 = Command::new("svn")
+            .args(["checkout", &url, wc1.to_str().unwrap()])
+            .output()
+            .expect("svn checkout wc1");
+        assert!(co1.status.success(), "checkout wc1 failed");
+
+        let wc2 = guard.path().join("wc2");
+        let co2 = Command::new("svn")
+            .args(["checkout", &url, wc2.to_str().unwrap()])
+            .output()
+            .expect("svn checkout wc2");
+        assert!(co2.status.success(), "checkout wc2 failed");
+
+        SvnTrio { _guard: guard, url, wc1, wc2 }
+    }
+
+    #[test]
+    fn status_reports_unversioned_file() {
+        if !svn_available() {
+            eprintln!("skipping: svn CLI not available");
+            return;
+        }
+        let trio = svn_trio();
+        std::fs::write(trio.wc1.join("new.txt"), "hello").expect("create file");
+
+        let out = status(&trio.wc1).expect("svn status");
+        assert!(out.ok(), "svn status failed: {}", out.stderr);
+        assert!(
+            out.stdout.contains("new.txt"),
+            "unversioned file missing from status: {:?}",
+            out.stdout
+        );
+    }
+
+    #[test]
+    fn log_recent_after_two_commits() {
+        if !svn_available() {
+            eprintln!("skipping: svn CLI not available");
+            return;
+        }
+        let trio = svn_trio();
+        std::fs::write(trio.wc1.join("a.txt"), "one").unwrap();
+        let c1 = commit_all(&trio.wc1, "first commit").expect("commit 1");
+        assert!(c1.ok(), "commit 1 failed: {}", c1.stderr);
+        std::fs::write(trio.wc1.join("b.txt"), "two").unwrap();
+        let c2 = commit_all(&trio.wc1, "second commit").expect("commit 2");
+        assert!(c2.ok(), "commit 2 failed: {}", c2.stderr);
+
+        let commits = log_recent(&trio.wc1, 0, 10).expect("log_recent");
+        assert_eq!(commits.len(), 2, "two commits expected: {commits:?}");
+        // Newest first.
+        assert_eq!(commits[0].subject, "second commit");
+        assert_eq!(commits[1].subject, "first commit");
+        assert!(commits[0].hash.starts_with('r'), "hash must be a revision: {commits:?}");
+        assert_eq!(commits[0].date.len(), 16, "date must be YYYY-MM-DD HH:MM");
+
+        // skip=1 limit=1 returns the older commit only.
+        let page = log_recent(&trio.wc1, 1, 1).expect("log_recent page");
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].subject, "first commit");
+    }
+
+    #[test]
+    fn update_pulls_other_working_copy_commit() {
+        if !svn_available() {
+            eprintln!("skipping: svn CLI not available");
+            return;
+        }
+        let trio = svn_trio();
+        std::fs::write(trio.wc1.join("from-wc1.txt"), "hi").unwrap();
+        let c = commit_all(&trio.wc1, "add from wc1").expect("commit in wc1");
+        assert!(c.ok(), "commit in wc1 failed: {}", c.stderr);
+
+        assert!(!trio.wc2.join("from-wc1.txt").exists(), "wc2 is stale before update");
+        let up = update(&trio.wc2).expect("svn update");
+        assert!(up.ok(), "svn update failed: {}", up.stderr);
+        assert!(trio.wc2.join("from-wc1.txt").exists(), "update must bring the new file");
+    }
 }
