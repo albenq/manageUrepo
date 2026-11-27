@@ -814,6 +814,12 @@ impl FileStatus {
             FileStatus::Ignored => 0,
         }
     }
+
+    /// 是否向父目录聚合传播：未跟踪/已忽略不传播（TortoiseGit 惯例，
+    /// 目录内新增文件不改变目录本身的图标），其余变更传播。
+    fn propagates(self) -> bool {
+        !matches!(self, FileStatus::Untracked | FileStatus::Ignored)
+    }
 }
 
 /// 一对 porcelain XY 状态字符 → 文件状态。
@@ -1036,6 +1042,9 @@ fn parse_svn_status_map(out: &str) -> HashMap<String, FileStatus> {
 
 /// 浏览器条目的状态：文件按相对路径精确匹配；目录做前缀匹配，取其下
 /// 所有变更条目里优先级最高的状态（porcelain 路径恒以 `/` 分隔）。
+/// 未跟踪/已忽略不向父目录传播（对照 TortoiseGit：`?? electron/i18n/`
+/// 不应让 `electron` 目录显示未跟踪，目录图标只反映已版本控制内容
+/// 的变更）；未跟踪/忽略的目录自身（`?? dir/` / `!! dir/`）仍精确显示。
 fn status_for_entry(
     map: &HashMap<String, FileStatus>,
     rel_path: &str,
@@ -1051,6 +1060,7 @@ fn status_for_entry(
     map.iter()
         .filter(|(path, _)| path.starts_with(&prefix))
         .map(|(_, status)| *status)
+        .filter(|st| st.propagates())
         .max_by_key(|status| status.rank())
 }
 
@@ -6546,6 +6556,32 @@ mod tests {
             status_for_entry(&map, "newdir", true),
             Some(FileStatus::Untracked)
         );
+    }
+
+    #[test]
+    fn status_for_entry_untracked_ignored_do_not_propagate() {
+        // 对照 TortoiseGit：目录图标只反映已版本控制内容的变更，
+        // 子项的 未跟踪/忽略 不向父目录传播（electron/ 目录内有
+        // ?? electron/i18n/ 时目录仍显示无变更绿勾）。
+        let map = parse_status_map(
+            "## main\n?? src/components/new.ts\n!! build/\n M a.txt\n",
+        );
+        // 子项是未跟踪 → 祖先目录不显示未跟踪。
+        assert_eq!(status_for_entry(&map, "src", true), None);
+        assert_eq!(status_for_entry(&map, "src/components", true), None);
+        // 文件本身仍精确显示未跟踪。
+        assert_eq!(
+            status_for_entry(&map, "src/components/new.ts", false),
+            Some(FileStatus::Untracked)
+        );
+        // 忽略目录自身（精确匹配 `!! build/`）仍显示忽略。
+        assert_eq!(
+            status_for_entry(&map, "build", true),
+            Some(FileStatus::Ignored)
+        );
+        // 已跟踪内容的真实变更照常传播：删除 > 修改。
+        let map = parse_status_map(" M src/keep.rs\nD  src/lib/dead.rs\n");
+        assert_eq!(status_for_entry(&map, "src", true), Some(FileStatus::Deleted));
     }
 
     #[test]

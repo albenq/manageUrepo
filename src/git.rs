@@ -99,9 +99,13 @@ pub fn is_repo(dir: &Path) -> bool {
     }
 }
 
-/// Run `git status --porcelain=v1 -b` in `dir`.
+/// Run `git status --porcelain=v1 -b --ignored` in `dir`. `--ignored`
+/// (traditional mode, also understood by old git versions without the
+/// explicit `=traditional` spelling) lists fully-ignored directories as
+/// `!! dir/` (collapsed, cheap even for big dependency dirs) so the browser
+/// can tell「无变更」(green check) from「已忽略」(gray minus).
 pub fn status_porcelain(dir: &Path) -> std::io::Result<GitOutput> {
-    run(dir, &["status", "--porcelain=v1", "-b"])
+    run(dir, &["status", "--porcelain=v1", "-b", "--ignored"])
 }
 
 /// Run `git branch --format=%(refname:short)` in `dir`.
@@ -337,9 +341,19 @@ mod tests {
     fn status_porcelain_lists_changes() {
         let (_guard, repo) = temp_repo();
         std::fs::write(repo.join("new.txt"), "hello").expect("create untracked file");
+        // 忽略项也须出现在输出中（--ignored=traditional）：目录浏览器
+        // 需要区分「无变更」绿勾与「已忽略」灰−。
+        std::fs::write(repo.join(".gitignore"), "ignored-dir/\n").expect("write gitignore");
+        std::fs::create_dir(repo.join("ignored-dir")).expect("mkdir");
+        std::fs::write(repo.join("ignored-dir/x.bin"), "x").expect("create ignored file");
         let out = status_porcelain(&repo).expect("status --porcelain");
         assert!(out.ok(), "status failed: {}", out.stderr);
         assert!(out.stdout.contains("??"), "untracked file missing: {}", out.stdout);
+        assert!(
+            out.stdout.contains("!! ignored-dir/"),
+            "ignored entry missing: {}",
+            out.stdout
+        );
     }
 
     #[test]

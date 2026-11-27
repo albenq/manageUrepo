@@ -49,9 +49,10 @@ fn auth_args(user: &str, password: &str) -> Vec<String> {
     ]
 }
 
-/// Run `svn status` in `dir` (one line per changed/unversioned item).
+/// Run `svn status --no-ignore` in `dir` (one line per changed/unversioned/
+/// ignored item; `--no-ignore` surfaces ignored items with an `I` column).
 pub fn status(dir: &Path) -> std::io::Result<GitOutput> {
-    run(dir, &["status"])
+    run(dir, &["status", "--no-ignore"])
 }
 
 /// Run `svn update` in `dir`.
@@ -423,6 +424,38 @@ mod tests {
         assert!(
             out.stdout.contains("new.txt"),
             "unversioned file missing from status: {:?}",
+            out.stdout
+        );
+    }
+
+    #[test]
+    fn status_lists_ignored_items() {
+        if !svn_available() {
+            eprintln!("skipping: svn CLI not available");
+            return;
+        }
+        let trio = svn_trio();
+        // svn:ignore 属性未提交也对 status 生效；--no-ignore 时忽略项
+        // 以 I 列出现（目录浏览器需要区分「无变更」与「已忽略」）。
+        let prop = std::process::Command::new("svn")
+            .args(["propset", "svn:ignore", "ignored-dir", "."])
+            .current_dir(&trio.wc1)
+            .output()
+            .expect("svn propset");
+        assert!(prop.status.success(), "propset failed: {:?}", prop.stderr);
+        std::fs::create_dir(trio.wc1.join("ignored-dir")).expect("mkdir");
+        std::fs::write(trio.wc1.join("ignored-dir/x.bin"), "x").expect("create ignored file");
+
+        let out = status(&trio.wc1).expect("svn status");
+        assert!(out.ok(), "svn status failed: {}", out.stderr);
+        assert!(
+            out.stdout.contains("I"),
+            "ignored entry missing from status: {:?}",
+            out.stdout
+        );
+        assert!(
+            out.stdout.contains("ignored-dir"),
+            "ignored dir missing from status: {:?}",
             out.stdout
         );
     }
