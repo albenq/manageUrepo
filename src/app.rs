@@ -1730,7 +1730,7 @@ impl GitPmApp {
             let lang = self.lang;
             match self.selected_project().cloned() {
                 Some(project) => {
-                    ui.heading(&project.name);
+                    ui.heading(project_display_name(&project));
                     ui.label(tf(lang, "project-path", &[("path", &project.path)]));
                     ui.label(tf(lang, "project-added-at", &[("time", &project.added_at)]));
                     ui.separator();
@@ -1944,7 +1944,7 @@ impl GitPmApp {
                     let rows: Vec<(i64, String, String)> = self
                         .projects
                         .iter()
-                        .map(|p| (p.id, p.name.clone(), p.path.clone()))
+                        .map(|p| (p.id, project_display_name(p), p.path.clone()))
                         .collect();
                     if rows.is_empty() {
                         ui.label(i18n::t(lang, "empty-project-list"));
@@ -3745,10 +3745,10 @@ impl GitPmApp {
             return; // user cancelled the dialog; not an error
         };
         let path = dir.to_string_lossy().into_owned();
-        if !git::is_repo(&dir) {
+        let Some(vcs) = detect_vcs(&dir) else {
             self.error = Some(tf(self.lang, "err-not-repo", &[("path", &path)]));
             return;
-        }
+        };
         let name = dir
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -3766,7 +3766,7 @@ impl GitPmApp {
                 return;
             }
         }
-        match db::add_project(conn, &name, &path, "git") {
+        match db::add_project(conn, &name, &path, vcs) {
             Ok(_) => self.reload_projects(),
             Err(e) => {
                 self.error = Some(tf(self.lang, "err-add-project", &[("err", &e.to_string())]))
@@ -4445,6 +4445,31 @@ impl Default for GitPmApp {
     }
 }
 
+/// Detect which version control system a directory belongs to.
+///
+/// `.svn` at the root means a working copy (SVN 1.7+ keeps it only at the
+/// top); otherwise git's own verdict decides. `None` = neither → callers
+/// show the「不是仓库」error.
+fn detect_vcs(dir: &Path) -> Option<&'static str> {
+    if dir.join(".svn").is_dir() {
+        Some("svn")
+    } else if git::is_repo(dir) {
+        Some("git")
+    } else {
+        None
+    }
+}
+
+/// The display name of a project: SVN working copies carry a `[SVN]` badge
+/// so the two kinds are distinguishable at a glance in the tree and heading.
+fn project_display_name(project: &Project) -> String {
+    if project.vcs == "svn" {
+        format!("{} [SVN]", project.name)
+    } else {
+        project.name.clone()
+    }
+}
+
 impl eframe::App for GitPmApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.apply_theme(ctx);
@@ -4460,6 +4485,31 @@ impl eframe::App for GitPmApp {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn detect_vcs_identifies_svn_working_copy() {
+        let dir = tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(".svn")).unwrap();
+        assert_eq!(detect_vcs(dir.path()), Some("svn"));
+    }
+
+    #[test]
+    fn detect_vcs_identifies_git_repo() {
+        let dir = tempdir().unwrap();
+        let out = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .output()
+            .expect("git init");
+        assert!(out.status.success(), "git init failed");
+        assert_eq!(detect_vcs(dir.path()), Some("git"));
+    }
+
+    #[test]
+    fn detect_vcs_none_for_plain_directory() {
+        let dir = tempdir().unwrap();
+        assert_eq!(detect_vcs(dir.path()), None);
+    }
 
     #[test]
     fn should_apply_matches_selected_project() {
