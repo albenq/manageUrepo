@@ -158,6 +158,9 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("err-open-editor", "启动编辑器失败：{err}", "Failed to launch editor: {err}"),
     ("err-editor-not-set", "未配置文本编辑器（菜单：设置 → 设置文本编辑器...）", "No text editor configured (menu: Settings → Set text editor...)"),
     ("editor-default-used", "使用系统默认关联程序打开", "Opened with the system's default program"),
+    ("menu-show-in-explorer", "在资源管理器中显示", "Show in Explorer"),
+    ("log-reveal-title", "打开位置（{path}）", "Reveal location ({path})"),
+    ("err-reveal", "打开资源管理器失败：{err}", "Failed to open Explorer: {err}"),
     // ------------------------------------------------ 状态区
     ("heading-status", "状态", "Status"),
     ("btn-refresh", "刷新", "Refresh"),
@@ -205,6 +208,7 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("placeholder-dash", "—", "—"),
     ("empty-dir", "（空目录）", "(Empty directory)"),
     ("legend-label", "图例：", "Legend: "),
+    ("legend-clean", "无变更", "No changes"),
     ("legend-conflict", "冲突", "Conflict"),
     ("legend-deleted", "已删除", "Deleted"),
     ("legend-modified", "已修改", "Modified"),

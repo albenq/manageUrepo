@@ -282,6 +282,10 @@ enum StatusPart {
 struct CachedStatus {
     /// `git status --porcelain=v1 -b` output text.
     porcelain: String,
+    /// Raw `svn status` stdout (SVN projects only; git projects keep it
+    /// empty). The `porcelain` field holds translated human text for SVN,
+    /// which cannot be re-parsed, so the browser icons parse this instead.
+    svn_raw: String,
     /// Branch names from `git branch --format=%(refname:short)`.
     branches: Vec<String>,
     /// Tag names from `git tag --list`.
@@ -294,6 +298,7 @@ impl CachedStatus {
     fn empty() -> Self {
         Self {
             porcelain: String::new(),
+            svn_raw: String::new(),
             branches: Vec::new(),
             tags: Vec::new(),
             loaded_at: std::time::Instant::now(),
@@ -794,17 +799,6 @@ impl FileStatus {
             FileStatus::Added => 1,
         }
     }
-
-    /// 名称前显示的标记字符。
-    fn marker(self) -> &'static str {
-        match self {
-            FileStatus::Conflict => "!",
-            FileStatus::Deleted => "−",
-            FileStatus::Modified => "M",
-            FileStatus::Renamed => "R",
-            FileStatus::Added => "+",
-        }
-    }
 }
 
 /// 一对 porcelain XY 状态字符 → 文件状态。
@@ -972,6 +966,51 @@ fn parse_status_map(porcelain: &str) -> HashMap<String, FileStatus> {
     map
 }
 
+/// 解析非详细 `svn status` 输出 → 工作副本相对路径 → 状态。
+///
+/// - 状态列在前 7 列内（属性修改在第二列 ` M`、树冲突在第六列等），
+///   取其中最左的状态字符；路径从第 8 列开始（svn 固定列宽）；
+/// - 状态映射：C=冲突；!、D=删除；A、?=新增；M、G、R、~=修改；
+///   X（外部）、I（忽略）与 svn 的提示行（如 "Performing status…"）
+///   不含状态字符，跳过；
+/// - 同一路径多行按 冲突 > 删除 > 修改 > 重命名 > 新增 取最高优先级
+///   （与 [`parse_status_map`] 一致）；路径分隔符统一为 `/`。
+fn parse_svn_status_map(out: &str) -> HashMap<String, FileStatus> {
+    let mut map: HashMap<String, FileStatus> = HashMap::new();
+    for line in out.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let bytes = line.as_bytes();
+        let Some(&sc) = bytes
+            .iter()
+            .take(7)
+            .find(|b| matches!(**b, b'A' | b'M' | b'D' | b'R' | b'C' | b'G' | b'!' | b'?' | b'~'))
+        else {
+            continue;
+        };
+        // 前 8 列均为 ASCII（状态字符或空格），按字节切到第 8 列是安全边界；
+        // 行长不足 9 列时退回取状态字符之后的剩余部分。
+        let field = if bytes.len() > 8 { &line[8..] } else { &line[1..] };
+        let path = field.trim();
+        if path.is_empty() {
+            continue;
+        }
+        let status = match sc {
+            b'C' => FileStatus::Conflict,
+            b'!' | b'D' => FileStatus::Deleted,
+            b'A' | b'?' => FileStatus::Added,
+            _ => FileStatus::Modified, // M / G / R / ~
+        };
+        let path = path.replace('\\', "/");
+        let entry = map.entry(path).or_insert(status);
+        if status.rank() > entry.rank() {
+            *entry = status;
+        }
+    }
+    map
+}
+
 /// 浏览器条目的状态：文件按相对路径精确匹配；目录做前缀匹配，取其下
 /// 所有变更条目里优先级最高的状态（porcelain 路径恒以 `/` 分隔）。
 fn status_for_entry(
@@ -1016,16 +1055,84 @@ fn current_branch_from_porcelain(porcelain: &str) -> Option<String> {
     }
 }
 
-/// 浏览器条目名前的状态标记：按状态着色的字符；冲突为红底加粗白字。
-fn status_marker_rich(status: FileStatus, dark: bool) -> egui::RichText {
-    let color = status_color(status, dark);
-    let text = egui::RichText::new(status.marker()).color(color);
-    if status == FileStatus::Conflict {
-        text.strong()
-            .color(egui::Color32::WHITE)
-            .background_color(color)
-    } else {
-        text
+/// 状态图标的圆底色（参考 TortoiseGit 风格，2.png）：
+/// 干净=绿勾、修改=琥珀、新增=绿加号、删除=橙叉、重命名=蓝、冲突=亮红。
+/// 干净与新增同为绿色系但深浅不同；六种视觉态两两可辨。
+fn status_icon_color(status: Option<FileStatus>, dark: bool) -> egui::Color32 {
+    match status {
+        None => {
+            if dark {
+                egui::Color32::from_rgb(35, 134, 54)
+            } else {
+                egui::Color32::from_rgb(40, 140, 60)
+            }
+        }
+        Some(st) => match st {
+            FileStatus::Modified => {
+                if dark {
+                    egui::Color32::from_rgb(210, 153, 34)
+                } else {
+                    egui::Color32::from_rgb(191, 124, 0)
+                }
+            }
+            other => status_color(other, dark),
+        },
+    }
+}
+
+/// 画一个圆形文件状态图标（文件名之前，参考 2.png）：
+/// `None` = 无变更（绿底白勾）；字形用笔画绘制（重命名除外，用 ASCII
+/// 字符 `R`），不依赖系统字体，避免 Win7 缺字形出豆腐块。
+fn paint_file_status_icon(
+    ui: &mut egui::Ui,
+    rect: egui::Rect,
+    status: Option<FileStatus>,
+    dark: bool,
+) {
+    let painter = ui.painter();
+    let c = rect.center();
+    let r = (rect.height() * 0.5).min(7.0);
+    let fill = status_icon_color(status, dark);
+    painter.circle_filled(c, r, fill);
+    let stroke = egui::Stroke::new(1.5_f32, egui::Color32::WHITE);
+    match status {
+        None | Some(FileStatus::Added) => {
+            // ✓（无变更）与 +（新增）都是两笔。
+            if status.is_none() {
+                let a = egui::pos2(c.x - r * 0.45, c.y + r * 0.05);
+                let b = egui::pos2(c.x - r * 0.1, c.y + r * 0.4);
+                let d = egui::pos2(c.x + r * 0.5, c.y - r * 0.35);
+                painter.line_segment([a, b], stroke);
+                painter.line_segment([b, d], stroke);
+            } else {
+                let o = r * 0.45;
+                painter.line_segment([c - egui::vec2(o, 0.0), c + egui::vec2(o, 0.0)], stroke);
+                painter.line_segment([c - egui::vec2(0.0, o), c + egui::vec2(0.0, o)], stroke);
+            }
+        }
+        Some(FileStatus::Modified) | Some(FileStatus::Conflict) => {
+            // !：竖笔 + 底部圆点。
+            painter.line_segment(
+                [egui::pos2(c.x, c.y - r * 0.45), egui::pos2(c.x, c.y + r * 0.1)],
+                stroke,
+            );
+            painter.circle_filled(egui::pos2(c.x, c.y + r * 0.42), r * 0.13, egui::Color32::WHITE);
+        }
+        Some(FileStatus::Deleted) => {
+            // ×：两笔交叉。
+            let o = r * 0.4;
+            painter.line_segment([c - egui::vec2(o, o), c + egui::vec2(o, o)], stroke);
+            painter.line_segment([c - egui::vec2(o, -o), c + egui::vec2(o, -o)], stroke);
+        }
+        Some(FileStatus::Renamed) => {
+            painter.text(
+                c,
+                egui::Align2::CENTER_CENTER,
+                "R",
+                egui::FontId::proportional(r * 1.5),
+                egui::Color32::WHITE,
+            );
+        }
     }
 }
 
@@ -1038,6 +1145,32 @@ fn status_legend_text(lang: Lang, status: FileStatus) -> &'static str {
         FileStatus::Renamed => i18n::t(lang, "legend-renamed"),
         FileStatus::Added => i18n::t(lang, "legend-added"),
     }
+}
+
+/// 各状态的图例 i18n key（图例行用图标 + 文字）。
+fn legend_key(status: FileStatus) -> &'static str {
+    match status {
+        FileStatus::Conflict => "legend-conflict",
+        FileStatus::Deleted => "legend-deleted",
+        FileStatus::Modified => "legend-modified",
+        FileStatus::Renamed => "legend-renamed",
+        FileStatus::Added => "legend-added",
+    }
+}
+
+/// 图例的单个条目：状态图标 + 着色文字。
+fn legend_item(
+    ui: &mut egui::Ui,
+    dark: bool,
+    lang: Lang,
+    status: Option<FileStatus>,
+    key: &'static str,
+) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+    paint_file_status_icon(ui, rect, status, dark);
+    let color = status_icon_color(status, dark);
+    ui.label(egui::RichText::new(i18n::t(lang, key)).color(color));
+    ui.add_space(6.0);
 }
 
 // ------------------------------------------------- project tree grouping
@@ -2794,13 +2927,20 @@ impl GitPmApp {
             })
             .collect();
 
-        // 文件状态标记：数据源是选中项目的 porcelain 缓存；未选中项目或
-        // 无缓存时为空映射（不显示标记，不报错）。
-        let status_map = self
+        // 文件状态标记：数据源是选中项目的状态缓存（git 用 porcelain，
+        // svn 用原始 svn status 输出）。None = 尚无数据（不画图标，不报错）；
+        // Some(空映射) = 已确认全部无变更（每行画绿勾）。
+        let status_map: Option<HashMap<String, FileStatus>> = self
             .selected_project()
             .and_then(|p| self.status_cache.get(&p.id))
-            .map(|cache| parse_status_map(&cache.porcelain))
-            .unwrap_or_default();
+            .map(|cache| {
+                if cache.svn_raw.is_empty() {
+                    parse_status_map(&cache.porcelain)
+                } else {
+                    parse_svn_status_map(&cache.svn_raw)
+                }
+            });
+        let has_status_data = status_map.is_some();
         // 当前浏览目录相对仓库根的路径（porcelain 路径恒以 `/` 分隔）。
         let rel_prefix: String = self
             .browser_path
@@ -2823,7 +2963,9 @@ impl GitPmApp {
                 } else {
                     format!("{rel_prefix}/{}", e.name)
                 };
-                status_for_entry(&status_map, &rel, e.is_dir)
+                status_map
+                    .as_ref()
+                    .and_then(|m| status_for_entry(m, &rel, e.is_dir))
             })
             .collect();
 
@@ -2877,13 +3019,10 @@ impl GitPmApp {
                     };
                     // 目录行：四格均可点击（点击行内任意位置进入）；
                     // 文件行：文本文件可点击（点击打开——配置了编辑器用
-                    // 编辑器，否则用系统默认关联程序），否则仅 hover 感应。
+                    // 编辑器，否则用系统默认关联程序）。所有行都用 click
+                    // 感应：右键菜单（在资源管理器中显示）对任意行可用。
                     let clickable = *is_dir || is_text_file(name);
-                    let sense = if clickable {
-                        egui::Sense::click()
-                    } else {
-                        egui::Sense::hover()
-                    };
+                    let sense = egui::Sense::click();
                     // 名称格：git 状态标记（着色）在前，名称随后；
                     // 两者感应一致，目录行点标记也能进入。文件按状态给名称
                     // 整名着色（修改=红、新增=绿…），一眼可辨；目录沿用弱化规则。
@@ -2895,18 +3034,30 @@ impl GitPmApp {
                     };
                     let mut name_resp: Option<egui::Response> = None;
                     row.col(|ui| {
-                        let marker = entry_status.map(|st| {
-                            ui.add(
-                                egui::Label::new(status_marker_rich(st, dark_theme)).sense(sense),
-                            )
-                        });
+                        // 状态图标：有状态数据时每行都画（无变更 = 绿勾）；
+                        // 无数据（状态尚未加载）时不画，避免误导。
+                        let icon_resp = if has_status_data {
+                            let (icon_rect, icon_r) = ui.allocate_exact_size(
+                                egui::vec2(16.0, BROWSER_ROW_HEIGHT),
+                                sense,
+                            );
+                            paint_file_status_icon(ui, icon_rect, entry_status, dark_theme);
+                            let icon_r = if let Some(st) = entry_status {
+                                icon_r.on_hover_text(status_legend_text(lang, st))
+                            } else {
+                                icon_r.on_hover_text(i18n::t(lang, "legend-clean"))
+                            };
+                            Some(icon_r)
+                        } else {
+                            None
+                        };
                         let name_label = ui.add(
                             egui::Label::new(name_rich)
                                 .wrap_mode(egui::TextWrapMode::Truncate)
                                 .sense(sense),
                         );
-                        name_resp = Some(match marker {
-                            Some(marker_resp) => name_label.union(marker_resp),
+                        name_resp = Some(match icon_resp {
+                            Some(icon_r) => name_label.union(icon_r),
                             None => name_label,
                         });
                     });
@@ -2937,6 +3088,9 @@ impl GitPmApp {
                         );
                     });
 
+                    // 右键菜单动作（在闭包内置位，闭包外执行，避免借用冲突）。
+                    let mut reveal_target: Option<PathBuf> = None;
+
                     if *is_dir {
                         // 表格整格响应默认只有 hover 感应，因此沿用各格内
                         // Label 的响应并集来判定「点击行内任意位置进入」。
@@ -2952,20 +3106,44 @@ impl GitPmApp {
                                     self.load_browser_dir(target);
                                 }
                             }
+                            row_resp.context_menu(|ui| {
+                                if ui.button(i18n::t(lang, "menu-show-in-explorer")).clicked() {
+                                    reveal_target =
+                                        self.browser_path.as_ref().map(|p| p.join(name));
+                                    ui.close_menu();
+                                }
+                            });
                             row_resp.on_hover_cursor(egui::CursorIcon::PointingHand);
                         }
-                    } else if clickable {
-                        // 文本文件行：点击用配置的编辑器打开。
-                        if let Some(row_resp) = name_resp {
-                            if row_resp.clicked() {
+                    } else {
+                        // 文件行：点击（文本文件）用编辑器/默认程序打开；
+                        // 右键菜单对任意文件可用。
+                        let cells =
+                            [name_resp, Some(type_resp), Some(size_resp), Some(time_resp)];
+                        if let Some(row_resp) =
+                            cells.into_iter().flatten().reduce(|acc, r| acc.union(r))
+                        {
+                            if clickable && row_resp.clicked() {
                                 if let Some(target) =
                                     self.browser_path.as_ref().map(|p| p.join(name))
                                 {
                                     self.open_in_editor(&target);
                                 }
                             }
-                            row_resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                            row_resp.context_menu(|ui| {
+                                if ui.button(i18n::t(lang, "menu-show-in-explorer")).clicked() {
+                                    reveal_target =
+                                        self.browser_path.as_ref().map(|p| p.join(name));
+                                    ui.close_menu();
+                                }
+                            });
+                            if clickable {
+                                row_resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+                            }
                         }
+                    }
+                    if let Some(target) = reveal_target {
+                        self.reveal_in_explorer(&target);
                     }
                 });
             });
@@ -2974,25 +3152,21 @@ impl GitPmApp {
             ui.label(i18n::t(lang, "empty-dir"));
         }
 
-        // 行尾图例：porcelain 有数据（存在状态标记）时显示一次。
-        if !status_map.is_empty() {
+        // 行尾图例：状态数据可用（存在图标）时显示一次。
+        if has_status_data {
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new(i18n::t(lang, "legend-label")).weak());
                 let dark = ui.visuals().dark_mode;
+                ui.label(egui::RichText::new(i18n::t(lang, "legend-label")).weak());
+                legend_item(ui, dark, lang, None, "legend-clean");
                 for st in [
-                    FileStatus::Conflict,
-                    FileStatus::Deleted,
                     FileStatus::Modified,
-                    FileStatus::Renamed,
                     FileStatus::Added,
+                    FileStatus::Deleted,
+                    FileStatus::Renamed,
+                    FileStatus::Conflict,
                 ] {
-                    ui.label(status_marker_rich(st, dark));
-                    ui.label(
-                        egui::RichText::new(status_legend_text(lang, st))
-                            .color(status_color(st, dark)),
-                    );
-                    ui.add_space(6.0);
+                    legend_item(ui, dark, lang, Some(st), legend_key(st));
                 }
             });
         }
@@ -3369,6 +3543,7 @@ impl GitPmApp {
                     .entry(project_id)
                     .or_insert_with(CachedStatus::empty);
                 entry.porcelain = format_svn_status(self.lang, &out.stdout);
+                entry.svn_raw = out.stdout.clone();
                 entry.loaded_at = std::time::Instant::now();
             }
         }
@@ -4419,6 +4594,27 @@ impl GitPmApp {
         self.trim_log();
     }
 
+    /// 「在资源管理器中显示」：打开文件/文件夹所在位置并选中
+    /// （explorer /select）；结果写入底部输出区。
+    fn reveal_in_explorer(&mut self, path: &Path) {
+        let lang = self.lang;
+        let title = tf(lang, "log-reveal-title", &[("path", &path.display().to_string())]);
+        let (program, args) = explorer_reveal_command(path);
+        match std::process::Command::new(&program).args(&args).spawn() {
+            Ok(_child) => self.log.push(LogEntry {
+                ok: true,
+                title,
+                text: program,
+            }),
+            Err(e) => self.log.push(LogEntry {
+                ok: false,
+                title,
+                text: tf(lang, "err-reveal", &[("err", &e.to_string())]),
+            }),
+        }
+        self.trim_log();
+    }
+
     fn show_group_dialog(&mut self, ctx: &egui::Context) {
         let Some(action) = self.group_dialog.clone() else {
             return;
@@ -5339,6 +5535,27 @@ fn default_open_command(file: &str) -> (String, Vec<String>) {
     }
 }
 
+/// 「在资源管理器中显示」的命令：Windows 用 `explorer /select,<path>`
+/// 打开父目录并选中该条目（文件、文件夹通用）；其他平台用 xdg-open
+/// 打开父目录。
+fn explorer_reveal_command(path: &Path) -> (String, Vec<String>) {
+    #[cfg(windows)]
+    {
+        (
+            "explorer.exe".to_string(),
+            vec![format!("/select,{}", path.display())],
+        )
+    }
+    #[cfg(not(windows))]
+    {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(path);
+        ("xdg-open".to_string(), vec![parent.display().to_string()])
+    }
+}
+
 /// 按扩展名判断是否按文本文件处理（决定浏览器里能否点击用编辑器打开）。
 /// 常见文本/代码/配置扩展名，以及 `.gitignore`、`Makefile` 这类无扩展
 /// 名的约定文本文件；二进制格式（exe/dll/图片/压缩包等）明确排除。
@@ -5459,6 +5676,77 @@ mod tests {
     fn group_tree_color_is_dark_orange() {
         // 分组节点深橙色，区别于 git 绿 / svn 蓝 / 普通目录链接色。
         assert_eq!(group_tree_color(), egui::Color32::from_rgb(204, 85, 0));
+    }
+
+    #[test]
+    fn explorer_reveal_command_selects_path() {
+        let (prog, args) = explorer_reveal_command(Path::new(r"C:\repo\src\a.txt"));
+        #[cfg(windows)]
+        {
+            // explorer /select,<path>：定位到父目录并选中该条目。
+            assert_eq!(prog, "explorer.exe");
+            assert_eq!(args, vec!["/select,C:\\repo\\src\\a.txt"]);
+        }
+        #[cfg(not(windows))]
+        {
+            assert_eq!(prog, "xdg-open");
+            assert_eq!(args, vec!["C:\\repo\\src"]);
+        }
+    }
+
+    #[test]
+    fn parse_svn_status_map_columns_and_kinds() {
+        // 非详细 svn status：状态列 + 空格填充 + 路径（第 8 列起）。
+        let map = parse_svn_status_map("M       a.c\n?       build\nA       new.c\n");
+        assert_eq!(map.get("a.c"), Some(&FileStatus::Modified));
+        assert_eq!(map.get("build"), Some(&FileStatus::Added));
+        assert_eq!(map.get("new.c"), Some(&FileStatus::Added));
+
+        // 冲突 / 丢失 / 替换。
+        let map = parse_svn_status_map("C       conf.c\n!       gone.c\nR       rep.c\n");
+        assert_eq!(map.get("conf.c"), Some(&FileStatus::Conflict));
+        assert_eq!(map.get("gone.c"), Some(&FileStatus::Deleted));
+        assert_eq!(map.get("rep.c"), Some(&FileStatus::Modified));
+
+        // 属性修改在第二列（" M"）。
+        let map = parse_svn_status_map(" M      prop.c\n");
+        assert_eq!(map.get("prop.c"), Some(&FileStatus::Modified));
+
+        // 外部 / 忽略 / 提示行不入表。
+        let map = parse_svn_status_map(
+            "X       ext\nI       ign\n\nPerforming status on external repo at '.':\n",
+        );
+        assert!(map.is_empty());
+
+        // 同路径取高优先级（冲突 > …）。
+        let map = parse_svn_status_map("M       x\nC       x\n");
+        assert_eq!(map.get("x"), Some(&FileStatus::Conflict));
+    }
+
+    #[test]
+    fn status_icon_colors_all_distinct() {
+        // 六种视觉态（干净 + 5 种变更）两两不同色，一眼可辨。
+        let statuses = [
+            None,
+            Some(FileStatus::Modified),
+            Some(FileStatus::Added),
+            Some(FileStatus::Deleted),
+            Some(FileStatus::Renamed),
+            Some(FileStatus::Conflict),
+        ];
+        for dark in [true, false] {
+            for i in 0..statuses.len() {
+                for j in (i + 1)..statuses.len() {
+                    assert_ne!(
+                        status_icon_color(statuses[i], dark),
+                        status_icon_color(statuses[j], dark),
+                        "dark={dark} statuses {:?} vs {:?}",
+                        statuses[i],
+                        statuses[j]
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -6233,13 +6521,11 @@ mod tests {
         assert!(FileStatus::Deleted.rank() > FileStatus::Modified.rank());
         assert!(FileStatus::Modified.rank() > FileStatus::Renamed.rank());
         assert!(FileStatus::Renamed.rank() > FileStatus::Added.rank());
-        // 标记字符与图例一一对应。
-        assert_eq!(FileStatus::Modified.marker(), "M");
-        assert_eq!(FileStatus::Added.marker(), "+");
-        assert_eq!(FileStatus::Deleted.marker(), "−");
-        assert_eq!(FileStatus::Conflict.marker(), "!");
-        assert_eq!(FileStatus::Renamed.marker(), "R");
+        // 图例文字存在（状态 → i18n key 映射完整）。
         assert!(!status_legend_text(Lang::Zh, FileStatus::Added).is_empty());
+        assert!(!status_legend_text(Lang::En, FileStatus::Conflict).is_empty());
+        assert!(!legend_key(FileStatus::Renamed).starts_with("legend-undef"));
+        assert_eq!(legend_key(FileStatus::Deleted), "legend-deleted");
     }
 
     // -------------------------------------- injected -u push upstream restore
