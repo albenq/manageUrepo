@@ -213,7 +213,9 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("legend-deleted", "已删除", "Deleted"),
     ("legend-modified", "已修改", "Modified"),
     ("legend-renamed", "重命名/复制", "Renamed/copied"),
-    ("legend-added", "新增/未跟踪", "Added/untracked"),
+    ("legend-added", "新增", "Added"),
+    ("legend-untracked", "未版本控制", "Unversioned"),
+    ("legend-ignored", "已忽略", "Ignored"),
     // ------------------------------------------------ 凭据读取（日志区）
     ("err-load-credential", "读取凭据（{label}）失败", "Failed to load credential ({label})"),
     // ------------------------------------------------ 忙碌标签 / 后台合成文案

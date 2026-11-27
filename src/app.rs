@@ -128,19 +128,26 @@ const HISTORY_FIRST_PAGE: usize = 10;
 /// 提交历史窗口「加载更多」每次追加的条数。
 const HISTORY_PAGE_SIZE: usize = 20;
 
-/// 文件状态的颜色（按主题调校，两种主题下都清晰）：
-/// 修改=红、新增/未跟踪=绿、删除=橙、重命名=蓝、冲突=亮红。
+/// 文件状态的颜色（按主题调校，两种主题下都清晰）。
+/// 对照 TortoiseSVN/TortoiseGit 官方覆盖图标配色：
+/// 修改=红!、冲突=黄!、删除=橙红×、新增/重命名=蓝、
+/// 未版本控制=灰蓝?、忽略=灰−。
 fn status_color(status: FileStatus, dark: bool) -> egui::Color32 {
     match (status, dark) {
-        (FileStatus::Conflict, _) => egui::Color32::from_rgb(255, 64, 64),
+        (FileStatus::Conflict, true) => egui::Color32::from_rgb(234, 179, 8),
+        (FileStatus::Conflict, false) => egui::Color32::from_rgb(176, 128, 0),
         (FileStatus::Modified, true) => egui::Color32::from_rgb(255, 107, 107),
         (FileStatus::Modified, false) => egui::Color32::from_rgb(200, 40, 40),
         (FileStatus::Deleted, true) => egui::Color32::from_rgb(255, 169, 77),
         (FileStatus::Deleted, false) => egui::Color32::from_rgb(191, 92, 0),
         (FileStatus::Renamed, true) => egui::Color32::from_rgb(116, 169, 255),
         (FileStatus::Renamed, false) => egui::Color32::from_rgb(28, 100, 210),
-        (FileStatus::Added, true) => egui::Color32::from_rgb(63, 185, 80),
-        (FileStatus::Added, false) => egui::Color32::from_rgb(26, 127, 55),
+        (FileStatus::Added, true) => egui::Color32::from_rgb(116, 169, 255),
+        (FileStatus::Added, false) => egui::Color32::from_rgb(28, 100, 210),
+        (FileStatus::Untracked, true) => egui::Color32::from_rgb(138, 152, 173),
+        (FileStatus::Untracked, false) => egui::Color32::from_rgb(100, 116, 139),
+        (FileStatus::Ignored, true) => egui::Color32::from_rgb(170, 170, 170),
+        (FileStatus::Ignored, false) => egui::Color32::from_rgb(128, 128, 128),
     }
 }
 
@@ -774,37 +781,46 @@ fn show_section(
 // 浏览器文件状态标记的数据源是 `status_cache` 里的 porcelain 缓存文本。
 
 /// 浏览器条目的工作区文件状态（由 porcelain 的 XY 状态对推导）。
+/// 语义对照 TortoiseSVN/TortoiseGit 官方覆盖图标。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileStatus {
     /// 未合并冲突（UU/AA/DD/AU/UA/DU/UD）。
     Conflict,
-    /// 已删除（XY 中含 D）。
+    /// 已删除（XY 中含 D；svn 的 `!` 丢失同样按删除处理）。
     Deleted,
-    /// 已修改（XY 中含 M 或 T）。
+    /// 已修改（XY 中含 M 或 T；svn 的 R=replaced、~ 同此）。
     Modified,
     /// 重命名/复制（XY 中含 R 或 C）。
     Renamed,
-    /// 新增或未跟踪（A / ??）。
+    /// 新增（A，已加入版本控制）。
     Added,
+    /// 未版本控制（git `??` / svn `?`），尚未加入版本控制。
+    Untracked,
+    /// 已忽略（git `!!` / svn `I`），被忽略规则排除。
+    Ignored,
 }
 
 impl FileStatus {
-    /// 同一路径多个状态的取舍优先级：冲突 > 删除 > 修改 > 重命名 > 新增。
+    /// 同一路径多个状态的取舍优先级：
+    /// 冲突 > 删除 > 修改 > 重命名 > 新增 > 未版本控制 > 已忽略。
     fn rank(self) -> u8 {
         match self {
-            FileStatus::Conflict => 5,
-            FileStatus::Deleted => 4,
-            FileStatus::Modified => 3,
-            FileStatus::Renamed => 2,
-            FileStatus::Added => 1,
+            FileStatus::Conflict => 6,
+            FileStatus::Deleted => 5,
+            FileStatus::Modified => 4,
+            FileStatus::Renamed => 3,
+            FileStatus::Added => 2,
+            FileStatus::Untracked => 1,
+            FileStatus::Ignored => 0,
         }
     }
 }
 
 /// 一对 porcelain XY 状态字符 → 文件状态。
 ///
-/// 冲突对（git status 文档）优先；`??` 未跟踪视为新增；其余按
-/// 冲突 > 删除 > 修改 > 重命名 > 新增 在 XY 两个字母之间取舍。
+/// 冲突对（git status 文档）优先；`??` 未跟踪与 `!!` 已忽略单独成态
+/// （Tortoise 语义：未版本控制 ≠ 新增）；其余按 冲突 > 删除 > 修改 >
+/// 重命名 > 新增 在 XY 两个字母之间取舍。
 fn status_from_xy(x: u8, y: u8) -> FileStatus {
     if matches!(
         [x, y],
@@ -819,7 +835,10 @@ fn status_from_xy(x: u8, y: u8) -> FileStatus {
         return FileStatus::Conflict;
     }
     if x == b'?' && y == b'?' {
-        return FileStatus::Added; // 未跟踪
+        return FileStatus::Untracked; // 未版本控制
+    }
+    if x == b'!' && y == b'!' {
+        return FileStatus::Ignored; // 已忽略（--ignored 场景）
     }
     let letters = [x, y];
     if letters.contains(&b'D') {
@@ -932,7 +951,7 @@ fn porcelain_entry_path(field: &str) -> Option<String> {
 
 /// 解析 `git status --porcelain=v1 [-b]` 输出 → 仓库相对路径 → 状态。
 ///
-/// - 跳过 `## <branch>` 头行、空行与已忽略条目（`!!`）；
+/// - 跳过 `## <branch>` 头行与空行；`!!` 已忽略条目正常入表；
 /// - `R  old -> new` 取新路径（见 [`porcelain_entry_path`]）；
 /// - 引号路径去引号并解码转义（含 UTF-8 八进制转义）；
 /// - 未跟踪目录 `?? dir/` 去掉尾部 `/`，使目录条目可精确匹配；
@@ -940,10 +959,7 @@ fn porcelain_entry_path(field: &str) -> Option<String> {
 fn parse_status_map(porcelain: &str) -> HashMap<String, FileStatus> {
     let mut map: HashMap<String, FileStatus> = HashMap::new();
     for line in porcelain.lines() {
-        if line.starts_with("## ")
-            || line.starts_with("!!")
-            || line.trim().is_empty()
-        {
+        if line.starts_with("## ") || line.trim().is_empty() {
             continue;
         }
         let bytes = line.as_bytes();
@@ -970,8 +986,8 @@ fn parse_status_map(porcelain: &str) -> HashMap<String, FileStatus> {
 ///
 /// - 状态列在前 7 列内（属性修改在第二列 ` M`、树冲突在第六列等），
 ///   取其中最左的状态字符；路径从第 8 列开始（svn 固定列宽）；
-/// - 状态映射：C=冲突；!、D=删除；A、?=新增；M、G、R、~=修改；
-///   X（外部）、I（忽略）与 svn 的提示行（如 "Performing status…"）
+/// - 状态映射：C=冲突；!、D=删除；A=新增；?=未版本控制；I=已忽略；
+///   M、G、R、~=修改；X（外部）与 svn 的提示行（如 "Performing status…"）
 ///   不含状态字符，跳过；
 /// - 同一路径多行按 冲突 > 删除 > 修改 > 重命名 > 新增 取最高优先级
 ///   （与 [`parse_status_map`] 一致）；路径分隔符统一为 `/`。
@@ -985,7 +1001,12 @@ fn parse_svn_status_map(out: &str) -> HashMap<String, FileStatus> {
         let Some(&sc) = bytes
             .iter()
             .take(7)
-            .find(|b| matches!(**b, b'A' | b'M' | b'D' | b'R' | b'C' | b'G' | b'!' | b'?' | b'~'))
+            .find(|b| {
+                matches!(
+                    **b,
+                    b'A' | b'M' | b'D' | b'R' | b'C' | b'G' | b'!' | b'?' | b'~' | b'I'
+                )
+            })
         else {
             continue;
         };
@@ -999,7 +1020,9 @@ fn parse_svn_status_map(out: &str) -> HashMap<String, FileStatus> {
         let status = match sc {
             b'C' => FileStatus::Conflict,
             b'!' | b'D' => FileStatus::Deleted,
-            b'A' | b'?' => FileStatus::Added,
+            b'A' => FileStatus::Added,
+            b'?' => FileStatus::Untracked,
+            b'I' => FileStatus::Ignored,
             _ => FileStatus::Modified, // M / G / R / ~
         };
         let path = path.replace('\\', "/");
@@ -1055,9 +1078,9 @@ fn current_branch_from_porcelain(porcelain: &str) -> Option<String> {
     }
 }
 
-/// 状态图标的圆底色（参考 TortoiseGit 风格，2.png）：
-/// 干净=绿勾、修改=琥珀、新增=绿加号、删除=橙叉、重命名=蓝、冲突=亮红。
-/// 干净与新增同为绿色系但深浅不同；六种视觉态两两可辨。
+/// 状态图标的圆底色（对照 TortoiseSVN/TortoiseGit 官方覆盖图标）：
+/// 无变更=绿✓、修改=红!、冲突=黄!、删除=橙红×、新增/重命名=蓝、
+/// 未版本控制=灰蓝?、忽略=灰−。各视觉态两两可辨。
 fn status_icon_color(status: Option<FileStatus>, dark: bool) -> egui::Color32 {
     match status {
         None => {
@@ -1067,22 +1090,13 @@ fn status_icon_color(status: Option<FileStatus>, dark: bool) -> egui::Color32 {
                 egui::Color32::from_rgb(40, 140, 60)
             }
         }
-        Some(st) => match st {
-            FileStatus::Modified => {
-                if dark {
-                    egui::Color32::from_rgb(210, 153, 34)
-                } else {
-                    egui::Color32::from_rgb(191, 124, 0)
-                }
-            }
-            other => status_color(other, dark),
-        },
+        Some(st) => status_color(st, dark),
     }
 }
 
-/// 画一个圆形文件状态图标（文件名之前，参考 2.png）：
-/// `None` = 无变更（绿底白勾）；字形用笔画绘制（重命名除外，用 ASCII
-/// 字符 `R`），不依赖系统字体，避免 Win7 缺字形出豆腐块。
+/// 画一个圆形文件状态图标（文件名之前，Tortoise 风格）：
+/// `None` = 无变更（绿底白勾）；字形用笔画绘制（重命名/未版本控制用
+/// ASCII 字符 `R`/`?`），不依赖系统字体，避免 Win7 缺字形出豆腐块。
 fn paint_file_status_icon(
     ui: &mut egui::Ui,
     rect: egui::Rect,
@@ -1133,6 +1147,20 @@ fn paint_file_status_icon(
                 egui::Color32::WHITE,
             );
         }
+        Some(FileStatus::Untracked) => {
+            painter.text(
+                c,
+                egui::Align2::CENTER_CENTER,
+                "?",
+                egui::FontId::proportional(r * 1.4),
+                egui::Color32::WHITE,
+            );
+        }
+        Some(FileStatus::Ignored) => {
+            // −：一条横线。
+            let o = r * 0.45;
+            painter.line_segment([c - egui::vec2(o, 0.0), c + egui::vec2(o, 0.0)], stroke);
+        }
     }
 }
 
@@ -1144,6 +1172,8 @@ fn status_legend_text(lang: Lang, status: FileStatus) -> &'static str {
         FileStatus::Modified => i18n::t(lang, "legend-modified"),
         FileStatus::Renamed => i18n::t(lang, "legend-renamed"),
         FileStatus::Added => i18n::t(lang, "legend-added"),
+        FileStatus::Untracked => i18n::t(lang, "legend-untracked"),
+        FileStatus::Ignored => i18n::t(lang, "legend-ignored"),
     }
 }
 
@@ -1155,6 +1185,8 @@ fn legend_key(status: FileStatus) -> &'static str {
         FileStatus::Modified => "legend-modified",
         FileStatus::Renamed => "legend-renamed",
         FileStatus::Added => "legend-added",
+        FileStatus::Untracked => "legend-untracked",
+        FileStatus::Ignored => "legend-ignored",
     }
 }
 
@@ -3165,6 +3197,8 @@ impl GitPmApp {
                     FileStatus::Deleted,
                     FileStatus::Renamed,
                     FileStatus::Conflict,
+                    FileStatus::Untracked,
+                    FileStatus::Ignored,
                 ] {
                     legend_item(ui, dark, lang, Some(st), legend_key(st));
                 }
@@ -5699,24 +5733,27 @@ mod tests {
         // 非详细 svn status：状态列 + 空格填充 + 路径（第 8 列起）。
         let map = parse_svn_status_map("M       a.c\n?       build\nA       new.c\n");
         assert_eq!(map.get("a.c"), Some(&FileStatus::Modified));
-        assert_eq!(map.get("build"), Some(&FileStatus::Added));
+        // 未版本控制（?）≠ 已加入（A）：TortoiseSVN 分别用 ? 与蓝 + 表示。
+        assert_eq!(map.get("build"), Some(&FileStatus::Untracked));
         assert_eq!(map.get("new.c"), Some(&FileStatus::Added));
 
         // 冲突 / 丢失 / 替换。
         let map = parse_svn_status_map("C       conf.c\n!       gone.c\nR       rep.c\n");
         assert_eq!(map.get("conf.c"), Some(&FileStatus::Conflict));
         assert_eq!(map.get("gone.c"), Some(&FileStatus::Deleted));
+        // R（replaced）按 TortoiseSVN 归入「已修改」（红色！）。
         assert_eq!(map.get("rep.c"), Some(&FileStatus::Modified));
 
         // 属性修改在第二列（" M"）。
         let map = parse_svn_status_map(" M      prop.c\n");
         assert_eq!(map.get("prop.c"), Some(&FileStatus::Modified));
 
-        // 外部 / 忽略 / 提示行不入表。
+        // 忽略（I）单独成态；外部（X）与提示行不入表。
         let map = parse_svn_status_map(
             "X       ext\nI       ign\n\nPerforming status on external repo at '.':\n",
         );
-        assert!(map.is_empty());
+        assert_eq!(map.get("ign"), Some(&FileStatus::Ignored));
+        assert_eq!(map.len(), 1);
 
         // 同路径取高优先级（冲突 > …）。
         let map = parse_svn_status_map("M       x\nC       x\n");
@@ -5724,29 +5761,41 @@ mod tests {
     }
 
     #[test]
-    fn status_icon_colors_all_distinct() {
-        // 六种视觉态（干净 + 5 种变更）两两不同色，一眼可辨。
-        let statuses = [
-            None,
-            Some(FileStatus::Modified),
-            Some(FileStatus::Added),
-            Some(FileStatus::Deleted),
-            Some(FileStatus::Renamed),
-            Some(FileStatus::Conflict),
+    fn status_icon_colors_follow_tortoise_palette() {
+        // 对照 TortoiseSVN/TortoiseGit 官方覆盖图标配色：
+        // 无变更=绿✓、修改=红!、冲突=黄!、删除=红×、新增=蓝+、
+        // 重命名=蓝R、未版本控制=灰蓝?、忽略=灰−。
+        let cases = [
+            (None, (40, 140, 60), (35, 134, 54)),         // clean 绿
+            (Some(FileStatus::Modified), (200, 40, 40), (255, 107, 107)), // 红
+            (Some(FileStatus::Conflict), (176, 128, 0), (234, 179, 8)),   // 黄
+            (Some(FileStatus::Deleted), (191, 92, 0), (255, 169, 77)),    // 橙红 ×
+            (Some(FileStatus::Added), (28, 100, 210), (116, 169, 255)),   // 蓝
+            (Some(FileStatus::Renamed), (28, 100, 210), (116, 169, 255)), // 蓝
+            (Some(FileStatus::Untracked), (100, 116, 139), (138, 152, 173)), // 灰蓝 ?
+            (Some(FileStatus::Ignored), (128, 128, 128), (170, 170, 170)),   // 灰 −
         ];
-        for dark in [true, false] {
-            for i in 0..statuses.len() {
-                for j in (i + 1)..statuses.len() {
-                    assert_ne!(
-                        status_icon_color(statuses[i], dark),
-                        status_icon_color(statuses[j], dark),
-                        "dark={dark} statuses {:?} vs {:?}",
-                        statuses[i],
-                        statuses[j]
-                    );
-                }
-            }
+        for (status, light, dark) in cases {
+            assert_eq!(
+                status_icon_color(status, false),
+                egui::Color32::from_rgb(light.0, light.1, light.2),
+                "{status:?} light"
+            );
+            assert_eq!(
+                status_icon_color(status, true),
+                egui::Color32::from_rgb(dark.0, dark.1, dark.2),
+                "{status:?} dark"
+            );
         }
+        // 关键区分：修改(红) ≠ 冲突(黄)；新增(蓝) ≠ 未版本控制(灰蓝)。
+        assert_ne!(
+            status_icon_color(Some(FileStatus::Modified), true),
+            status_icon_color(Some(FileStatus::Conflict), true)
+        );
+        assert_ne!(
+            status_icon_color(Some(FileStatus::Added), true),
+            status_icon_color(Some(FileStatus::Untracked), true)
+        );
     }
 
     #[test]
@@ -6352,7 +6401,7 @@ mod tests {
         );
         assert!(text.contains("分支：main...origin/main"));
         assert!(text.contains("[已修改] a.txt"));
-        assert!(text.contains("[新增/未跟踪] b.txt"));
+        assert!(text.contains("[未版本控制] b.txt"));
         assert!(text.contains("[冲突] c.txt"));
         assert!(!text.contains("?? b.txt"));
     }
@@ -6369,7 +6418,8 @@ mod tests {
         assert_eq!(status_from_xy(b'M', b' '), FileStatus::Modified);
         assert_eq!(status_from_xy(b'M', b'M'), FileStatus::Modified);
         assert_eq!(status_from_xy(b' ', b'T'), FileStatus::Modified);
-        assert_eq!(status_from_xy(b'?', b'?'), FileStatus::Added);
+        // 未跟踪（??）单独成态，不与已加入（A）混同（Tortoise 语义）。
+        assert_eq!(status_from_xy(b'?', b'?'), FileStatus::Untracked);
         assert_eq!(status_from_xy(b'A', b' '), FileStatus::Added);
         assert_eq!(status_from_xy(b' ', b'D'), FileStatus::Deleted);
         assert_eq!(status_from_xy(b'R', b' '), FileStatus::Renamed);
@@ -6392,12 +6442,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_status_map_marks_ignored() {
+        // !! = 已忽略（git status --ignored 场景）：单独成态，不得当作无变更。
+        let map = parse_status_map("## main\n!! ignored.log\n M a.txt\n");
+        assert_eq!(map.get("ignored.log"), Some(&FileStatus::Ignored));
+        assert_eq!(map.get("a.txt"), Some(&FileStatus::Modified));
+    }
+
+    #[test]
     fn parse_status_map_basic() {
         let map = parse_status_map(
             "## main...origin/main [ahead 1]\n M a.txt\n?? b.txt\nD  c.txt\nMM d.txt\n T e.txt\nR  f.txt -> g.txt\n",
         );
         assert_eq!(map.get("a.txt"), Some(&FileStatus::Modified));
-        assert_eq!(map.get("b.txt"), Some(&FileStatus::Added));
+        assert_eq!(map.get("b.txt"), Some(&FileStatus::Untracked));
         assert_eq!(map.get("c.txt"), Some(&FileStatus::Deleted));
         assert_eq!(map.get("d.txt"), Some(&FileStatus::Modified));
         assert_eq!(map.get("e.txt"), Some(&FileStatus::Modified));
@@ -6414,10 +6472,10 @@ mod tests {
         assert_eq!(map.get("with space.txt"), Some(&FileStatus::Modified));
         // UTF-8 八进制转义（core.quotePath 默认对非 ASCII 字节转义）。
         let map = parse_status_map("?? \"\\346\\226\\207\\346\\241\\243.txt\"\n");
-        assert_eq!(map.get("文档.txt"), Some(&FileStatus::Added));
+        assert_eq!(map.get("文档.txt"), Some(&FileStatus::Untracked));
         // 转义的引号与反斜杠。
         let map = parse_status_map("?? \"quo\\\"te\\\\dir.txt\"\n");
-        assert_eq!(map.get("quo\"te\\dir.txt"), Some(&FileStatus::Added));
+        assert_eq!(map.get("quo\"te\\dir.txt"), Some(&FileStatus::Untracked));
     }
 
     #[test]
@@ -6453,7 +6511,7 @@ mod tests {
     #[test]
     fn parse_status_map_untracked_dir_strips_slash() {
         let map = parse_status_map("?? newdir/\n");
-        assert_eq!(map.get("newdir"), Some(&FileStatus::Added));
+        assert_eq!(map.get("newdir"), Some(&FileStatus::Untracked));
         assert!(!map.contains_key("newdir/"));
     }
 
@@ -6486,7 +6544,7 @@ mod tests {
         let map = parse_status_map("?? newdir/\n");
         assert_eq!(
             status_for_entry(&map, "newdir", true),
-            Some(FileStatus::Added)
+            Some(FileStatus::Untracked)
         );
     }
 
@@ -6516,16 +6574,20 @@ mod tests {
 
     #[test]
     fn file_status_ranks_and_markers() {
-        // 优先级全序：冲突 > 删除 > 修改 > 重命名 > 新增。
+        // 优先级全序：冲突 > 删除 > 修改 > 重命名 > 新增 > 未跟踪 > 忽略。
         assert!(FileStatus::Conflict.rank() > FileStatus::Deleted.rank());
         assert!(FileStatus::Deleted.rank() > FileStatus::Modified.rank());
         assert!(FileStatus::Modified.rank() > FileStatus::Renamed.rank());
         assert!(FileStatus::Renamed.rank() > FileStatus::Added.rank());
+        assert!(FileStatus::Added.rank() > FileStatus::Untracked.rank());
+        assert!(FileStatus::Untracked.rank() > FileStatus::Ignored.rank());
         // 图例文字存在（状态 → i18n key 映射完整）。
         assert!(!status_legend_text(Lang::Zh, FileStatus::Added).is_empty());
         assert!(!status_legend_text(Lang::En, FileStatus::Conflict).is_empty());
         assert!(!legend_key(FileStatus::Renamed).starts_with("legend-undef"));
         assert_eq!(legend_key(FileStatus::Deleted), "legend-deleted");
+        assert_eq!(legend_key(FileStatus::Untracked), "legend-untracked");
+        assert_eq!(legend_key(FileStatus::Ignored), "legend-ignored");
     }
 
     // -------------------------------------- injected -u push upstream restore
