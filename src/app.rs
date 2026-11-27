@@ -6629,6 +6629,33 @@ mod tests {
     }
 
     #[test]
+    fn status_for_entry_inherits_collapsed_svn_dirs() {
+        // svn status 同样折叠未版本控制/忽略目录且不列子项（本地 svnadmin
+        // 探针实测）：`?       unver`、`I       tracked\ignored-dir`，
+        // 且 Windows 下路径用反斜杠。子项应继承状态而不是显示无变更绿勾。
+        let map = parse_svn_status_map("M       a.c\n?       unver\nI       tracked\\ignored-dir\n");
+        assert_eq!(map.get("unver"), Some(&FileStatus::Untracked));
+        assert_eq!(map.get("tracked/ignored-dir"), Some(&FileStatus::Ignored));
+        assert_eq!(
+            status_for_entry(&map, "unver", true),
+            Some(FileStatus::Untracked)
+        );
+        assert_eq!(
+            status_for_entry(&map, "unver/sub/b.txt", false),
+            Some(FileStatus::Untracked)
+        );
+        assert_eq!(
+            status_for_entry(&map, "tracked/ignored-dir/x.bin", false),
+            Some(FileStatus::Ignored)
+        );
+        // 祖先只有普通修改状态时不向下折叠继承（继承仅限未跟踪/忽略）。
+        assert_eq!(
+            status_for_entry(&map, "a.c", false),
+            Some(FileStatus::Modified)
+        );
+    }
+
+    #[test]
     fn current_branch_from_porcelain_cases() {
         assert_eq!(
             current_branch_from_porcelain("## master...origin/master [ahead 1]\n M a\n"),
