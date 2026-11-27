@@ -113,6 +113,8 @@ pub fn log_recent(dir: &Path, skip: usize, limit: usize) -> Result<Vec<CommitInf
 }
 
 /// The repository URL of the working copy (`svn info` → `URL:` line).
+/// 预留：当前 UI 无消费者；避免 dead_code 告警，待 SVN 克隆功能实现时启用。
+#[allow(dead_code)]
 pub fn info_url(dir: &Path) -> Result<String, String> {
     let out = run(dir, &["info"]).map_err(|e| e.to_string())?;
     if !out.ok() {
@@ -121,12 +123,10 @@ pub fn info_url(dir: &Path) -> Result<String, String> {
     parse_info_url(&out.stdout).ok_or_else(|| "svn info: URL line not found".to_string())
 }
 
-/// Parse `svn status` output into `(code, path)` pairs.
-///
-/// Each line starts with one status column character followed by spaces and
-/// the path. Blank lines are skipped; a leading space (a blank code column,
-/// e.g. property-only rows) is kept as `(' ', path)`.
-fn parse_status_lines(stdout: &str) -> Vec<(char, String)> {
+/// Parse `svn status` output into `(code, path)` pairs. See
+/// `format_svn_status` (app.rs) for the display-oriented consumer.
+#[cfg(test)]
+pub(crate) fn parse_status_lines(stdout: &str) -> Vec<(char, String)> {
     let mut entries = Vec::new();
     for line in stdout.lines() {
         if line.trim().is_empty() {

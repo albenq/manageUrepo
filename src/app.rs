@@ -19,6 +19,7 @@ use crate::git;
 use crate::i18n::{self, Lang};
 use crate::loc;
 use crate::password::{self, GenOptions};
+use crate::svn;
 
 /// t() + 占位符替换：把文案中的 `{name}` 依次替换为 pairs 的值，用于带
 /// 动态参数的句子级文案；占位符名未提供时保留原文（便于发现缺漏）。
@@ -102,6 +103,8 @@ const LABEL_TAGS: &str = "git tag --list";
 
 /// Log label of `git rev-parse --abbrev-ref HEAD` (pull/push prerequisite).
 const LABEL_HEAD: &str = "git rev-parse --abbrev-ref HEAD";
+/// Output-log label of the read-only `svn status` query.
+const LABEL_SVN_STATUS: &str = "svn status";
 
 /// How often the UI thread wakes up to drain worker results while a git
 /// operation runs (keeps the animated progress bar and channel polling going).
@@ -336,6 +339,10 @@ enum ResultKind {
     BranchCheckout(String),
     /// `git tag [...] <name>`; payload = output-log label.
     Tag(String),
+    /// `svn status` (single-message read-only batch for SVN projects).
+    SvnStatus,
+    /// `svn update [...]`; payload = output-log label.
+    SvnUpdate(String),
 }
 
 /// One finished git call from a worker thread, routed back to the UI thread
@@ -621,6 +628,46 @@ fn format_worktree_status(lang: Lang, porcelain: &str) -> String {
     }
     if !has_entries {
         lines_out.push(i18n::t(lang, "worktree-clean").to_string());
+    }
+    lines_out.join("\n")
+}
+
+/// 把 `svn status` 原始输出格式化为人类可读文字：每个条目译为
+/// 「[状态标签] 路径」，零条目显示「工作区干净」。首列代码之外的列
+/// （属性/锁列）不参与判定；未识别的代码原样保留整行。
+fn format_svn_status(lang: Lang, raw: &str) -> String {
+    let mut lines_out: Vec<String> = Vec::new();
+    for line in raw.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut chars = line.chars();
+        let code = chars.next().unwrap_or(' ');
+        let path = chars.as_str().trim();
+        if path.is_empty() {
+            lines_out.push(line.to_string());
+            continue;
+        }
+        let label = match code {
+            'M' => i18n::t(lang, "svn-status-modified"),
+            'A' => i18n::t(lang, "svn-status-added"),
+            'D' => i18n::t(lang, "svn-status-deleted"),
+            'C' => i18n::t(lang, "svn-status-conflict"),
+            '?' => i18n::t(lang, "svn-status-untracked"),
+            'X' => i18n::t(lang, "svn-status-external"),
+            'I' => i18n::t(lang, "svn-status-ignored"),
+            '!' => i18n::t(lang, "svn-status-missing"),
+            'R' => i18n::t(lang, "svn-status-replaced"),
+            '~' => i18n::t(lang, "svn-status-obstructed"),
+            _ => {
+                lines_out.push(line.to_string());
+                continue;
+            }
+        };
+        lines_out.push(format!("[{}] {}", label, path));
+    }
+    if lines_out.is_empty() {
+        return i18n::t(lang, "worktree-clean").to_string();
     }
     lines_out.join("\n")
 }
@@ -2833,6 +2880,12 @@ impl GitPmApp {
             ResultKind::Status => self.apply_status_part(result, StatusPart::Status),
             ResultKind::BranchList => self.apply_status_part(result, StatusPart::Branches),
             ResultKind::TagList => self.apply_status_part(result, StatusPart::Tags),
+            ResultKind::SvnStatus => self.apply_svn_status(result),
+            ResultKind::SvnUpdate(label) => {
+                self.log_write_result(&label, &result.output);
+                self.clear_busy_if(project_id);
+                self.trigger_status_refresh(project_id);
+            }
             ResultKind::Head => match &result.output {
                 Ok(out) => {
                     self.log_git_output(LABEL_HEAD, out);
@@ -2960,14 +3013,78 @@ impl GitPmApp {
         }
     }
 
+    /// Apply the single-message SVN status batch: unlike the git batch, the
+    /// in-flight guard closes on this one message, the branches/tags sections
+    /// are reset to None (SVN has neither) and the status text is translated
+    /// through `format_svn_status`.
+    fn apply_svn_status(&mut self, result: GitResult) {
+        let project_id = result.project_id;
+        self.status_inflight.remove(&project_id);
+        let applies = should_apply(project_id, self.selected);
+        if applies {
+            match &result.output {
+                Ok(out) => self.log_git_output(LABEL_SVN_STATUS, out),
+                Err(e) => self.log_git_error(LABEL_SVN_STATUS, e),
+            }
+        }
+        if let Ok(out) = &result.output {
+            if out.ok() {
+                let entry = self
+                    .status_cache
+                    .entry(project_id)
+                    .or_insert_with(CachedStatus::empty);
+                entry.porcelain = format_svn_status(self.lang, &out.stdout);
+                entry.loaded_at = std::time::Instant::now();
+            }
+        }
+        if applies {
+            let section = match &result.output {
+                Ok(out) if out.ok() => Some(StatusSection {
+                    ok: true,
+                    text: format_svn_status(self.lang, &out.stdout),
+                }),
+                Ok(out) => Some(StatusSection {
+                    ok: false,
+                    text: git_output_text(self.lang, out),
+                }),
+                Err(e) => Some(StatusSection {
+                    ok: false,
+                    text: tf(self.lang, "err-git-run", &[("err", &e.to_string())]),
+                }),
+            };
+            let snapshot = self.status.get_or_insert_with(StatusSnapshot::default);
+            snapshot.status = section;
+            snapshot.branches = None;
+            snapshot.tags = None;
+            self.status_loaded_for = Some(project_id);
+        }
+    }
+
     /// Spawn one worker thread that runs all three read-only queries for a
     /// project and sends each result back tagged with the project id.
     fn spawn_status_refresh(&mut self, project_id: i64, path: PathBuf) {
         if !self.status_inflight.insert(project_id) {
             return; // a batch for this project is already running
         }
+        // The VCS kind is read on the UI thread before spawning: the thread
+        // dispatches between the git triple-query batch and svn's single
+        // `svn status` query.
+        let vcs = self
+            .projects
+            .iter()
+            .find(|p| p.id == project_id)
+            .map(|p| p.vcs.clone())
+            .unwrap_or_else(|| "git".to_string());
         let tx = self.result_tx.clone();
         std::thread::spawn(move || {
+            if vcs == "svn" {
+                let _ = tx.send(GitResult {
+                    project_id,
+                    kind: ResultKind::SvnStatus,
+                    output: svn::status(&path),
+                });
+                return;
+            }
             let send = |kind: ResultKind, output: std::io::Result<git::GitOutput>| {
                 let _ = tx.send(GitResult { project_id, kind, output });
             };
@@ -4509,6 +4626,31 @@ mod tests {
     fn detect_vcs_none_for_plain_directory() {
         let dir = tempdir().unwrap();
         assert_eq!(detect_vcs(dir.path()), None);
+    }
+
+    #[test]
+    fn format_svn_status_translates_entries() {
+        let raw = "M       src/a.rs\nA       new.txt\nD       old.txt\nC       conflict.txt\n?       unknown.txt\n";
+        let text = format_svn_status(Lang::Zh, raw);
+        assert!(text.contains("修改"), "{text}");
+        assert!(text.contains("src/a.rs"), "{text}");
+        assert!(text.contains("新增"), "{text}");
+        assert!(text.contains("new.txt"), "{text}");
+        assert!(text.contains("已删除"), "{text}");
+        assert!(text.contains("old.txt"), "{text}");
+        assert!(text.contains("冲突"), "{text}");
+        assert!(text.contains("未跟踪"), "{text}");
+        assert!(!text.contains("工作区"), "entries present, clean text must not appear: {text}");
+        // 未识别代码原样保留整行。
+        let text2 = format_svn_status(Lang::Zh, "Q       weird.txt\n");
+        assert!(text2.contains("Q"), "{text2}");
+        assert!(text2.contains("weird.txt"), "{text2}");
+    }
+
+    #[test]
+    fn format_svn_status_clean() {
+        assert_eq!(format_svn_status(Lang::Zh, ""), "（工作区干净，无变更）");
+        assert_eq!(format_svn_status(Lang::En, "   \n"), "(Working tree clean)");
     }
 
     #[test]
