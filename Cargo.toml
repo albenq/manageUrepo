@@ -19,4 +19,4 @@ winresource = "0.1"
 tempfile = "3"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Globalization"] }
+windows-sys = { version = "0.59", features = ["Win32_Globalization", "Win32_UI_WindowsAndMessaging", "Win32_Foundation"] }

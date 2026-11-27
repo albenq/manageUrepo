@@ -73,19 +73,82 @@ fn load_cjk_fonts(ctx: &egui::Context) {
     }
 }
 
+/// 诊断日志：追加一行到 exe 同目录的 `git-pm.log`（GUI 子系统下 panic
+/// 与启动错误无处可看，Win7 排障靠它）。写失败时静默放弃——诊断设施
+/// 决不能反过来让程序崩溃。
+pub fn log_line(msg: &str) {
+    use std::io::Write;
+    let Ok(exe) = std::env::current_exe() else { return };
+    let Some(dir) = exe.parent() else { return };
+    let path = dir.join("git-pm.log");
+    let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path)
+    else {
+        return;
+    };
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = writeln!(f, "[{ts}] {msg}");
+}
+
+/// 把 panic 信息写入日志（GUI 子系统看不到 stderr）。
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        log_line(&format!("PANIC: {info}"));
+    }));
+}
+
+/// 用 Win32 消息框显示致命启动错误（日志之外多一条用户可见的通道）。
+#[cfg(windows)]
+fn show_error_box(title: &str, msg: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONERROR, MB_SETFOREGROUND,
+    };
+    let to_wide = |s: &str| s.encode_utf16().chain([0]).collect::<Vec<u16>>();
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            to_wide(msg).as_ptr(),
+            to_wide(title).as_ptr(),
+            MB_ICONERROR | MB_SETFOREGROUND,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn show_error_box(_title: &str, _msg: &str) {}
+
 fn main() -> eframe::Result<()> {
+    install_panic_hook();
+    log_line("startup begin");
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1440.0, 900.0])
             .with_min_inner_size([1200.0, 800.0]),
         ..Default::default()
     };
-    eframe::run_native(
+    let result = eframe::run_native(
         "LocalRepoManager",
         options,
         Box::new(|cc| {
+            log_line("creator callback: loading fonts + app state");
             load_cjk_fonts(&cc.egui_ctx);
-            Ok(Box::new(app::GitPmApp::new()))
+            let app = app::GitPmApp::new();
+            log_line("app state ready");
+            Ok(Box::new(app))
         }),
-    )
+    );
+    match &result {
+        Ok(()) => log_line("run_native returned normally"),
+        Err(e) => {
+            log_line(&format!("run_native FAILED: {e}"));
+            show_error_box(
+                "LocalRepoManager",
+                &format!("启动失败 / Failed to start:\n{e}\n\n详见同目录 git-pm.log"),
+            );
+        }
+    }
+    result
 }
