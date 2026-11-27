@@ -1392,6 +1392,10 @@ pub struct GitPmApp {
     scan_rx: mpsc::Receiver<scan::ScanOutcome>,
     /// Root of the scan currently running, if any (duplicate guard + report).
     scan_inflight: Option<PathBuf>,
+    /// 打开中的分组对话框（新建/重命名），None = 关闭。
+    group_dialog: Option<GroupDialogAction>,
+    group_dialog_text: String,
+    group_dialog_error: Option<String>,
     commit_msg: String,
     new_branch: String,
     tag_name: String,
@@ -1504,6 +1508,9 @@ impl GitPmApp {
             scan_tx,
             scan_rx,
             scan_inflight: None,
+            group_dialog: None,
+            group_dialog_text: String::new(),
+            group_dialog_error: None,
             commit_msg: String::new(),
             new_branch: String::new(),
             tag_name: String::new(),
@@ -1807,6 +1814,7 @@ impl GitPmApp {
         });
         self.show_remove_confirm(ctx);
         self.show_clone_dialog(ctx);
+        self.show_group_dialog(ctx);
         self.show_cred_dialog(ctx);
         self.show_pw_change_dialog(ctx);
         self.show_push_dialog(ctx);
@@ -2021,11 +2029,20 @@ impl GitPmApp {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     // Clone the row data so the click handler can mutate state.
-                    // The 4th field marks SVN working copies (leaf tint).
-                    let rows: Vec<(i64, String, String, bool)> = self
+                    // The 4th field marks SVN working copies (leaf tint); the
+                    // 5th is the user-defined group ('' = ungrouped).
+                    let rows: Vec<ProjectRow> = self
                         .projects
                         .iter()
-                        .map(|p| (p.id, project_display_name(p), p.path.clone(), p.vcs == "svn"))
+                        .map(|p| {
+                            (
+                                p.id,
+                                project_display_name(p),
+                                p.path.clone(),
+                                p.vcs == "svn",
+                                p.group_name.clone(),
+                            )
+                        })
                         .collect();
                     if rows.is_empty() {
                         ui.label(i18n::t(lang, "empty-project-list"));
@@ -2035,16 +2052,29 @@ impl GitPmApp {
                     // 字体实测 'M' 宽），目录名与项目名按层左对齐；目录节点
                     // 缺省展开，折叠态在会话内按节点 key 记忆。「未分组」
                     // 节点的 label 是稳定 key，展示时经 t() 翻译。
-                    let paths: Vec<String> =
-                        rows.iter().map(|(_, _, path, _)| path.clone()).collect();
-                    let names: Vec<String> =
-                        rows.iter().map(|(_, name, _, _)| name.clone()).collect();
                     let searching = !self.tree_search.trim().is_empty();
+                    // 用户分组节点置顶；未分组项目仍按路径层级挂树。
+                    let group_names = collect_group_names(&rows);
+                    let group_nodes = build_group_nodes(&group_names, &rows);
+                    let ungrouped_rows: Vec<ProjectRow> = rows
+                        .iter()
+                        .filter(|(_, _, _, _, group)| group.is_empty())
+                        .cloned()
+                        .collect();
+                    let paths: Vec<String> =
+                        ungrouped_rows.iter().map(|(_, _, path, _, _)| path.clone()).collect();
+                    let names: Vec<String> =
+                        ungrouped_rows.iter().map(|(_, name, _, _, _)| name.clone()).collect();
                     let full_tree = build_project_tree(&paths, cfg!(windows));
                     let tree = if searching {
                         filter_project_tree(&full_tree, &names, &self.tree_search)
                     } else {
                         full_tree
+                    };
+                    let filtered_groups = if searching {
+                        filter_project_tree(&group_nodes, &names, &self.tree_search)
+                    } else {
+                        group_nodes
                     };
                     if searching {
                         let count = count_tree_projects(&tree).to_string();
@@ -2057,15 +2087,30 @@ impl GitPmApp {
                             .weak(),
                         );
                     }
-                    if tree.is_empty() {
+                    if tree.is_empty() && filtered_groups.is_empty() {
                         ui.label(i18n::t(lang, "tree-search-empty"));
                         return;
                     }
                     let char_w = ui.fonts(|fonts| {
                         fonts.glyph_width(&egui::TextStyle::Body.resolve(ui.style()), 'M')
                     });
+                    let ctx = TreeCtx {
+                        rows: &rows,
+                        group_names: &group_names,
+                        lang,
+                        char_w,
+                    };
+                    for node in &filtered_groups {
+                        self.show_tree_node(ui, node, 0, &ctx);
+                    }
                     for node in &tree {
-                        self.show_tree_node(ui, node, 0, &rows, lang, char_w);
+                        let ungrouped_ctx = TreeCtx {
+                            rows: &ungrouped_rows,
+                            group_names: &group_names,
+                            lang,
+                            char_w,
+                        };
+                        self.show_tree_node(ui, node, 0, &ungrouped_ctx);
                     }
                 });
         });
@@ -2074,15 +2119,8 @@ impl GitPmApp {
     /// 递归渲染项目树的一层：目录行（箭头 + 目录名）左对齐在当前层
     /// 缩进处，子目录与直属项目各缩进 2 个字符宽。目录节点缺省展开，
     /// 点击箭头或目录名切换折叠态（`collapsed_tree_dirs` 会话内记忆）。
-    fn show_tree_node(
-        &mut self,
-        ui: &mut egui::Ui,
-        node: &DirNode,
-        depth: usize,
-        rows: &[(i64, String, String, bool)],
-        lang: Lang,
-        char_w: f32,
-    ) {
+    fn show_tree_node(&mut self, ui: &mut egui::Ui, node: &DirNode, depth: usize, ctx: &TreeCtx) {
+        let TreeCtx { rows, group_names, lang, char_w } = *ctx;
         let indent = depth as f32 * 2.0 * char_w;
         // 搜索期间强制展开全部命中路径；折叠记忆保留，清空搜索后恢复。
         let searching = !self.tree_search.trim().is_empty();
@@ -2094,6 +2132,8 @@ impl GitPmApp {
         };
         let row_h = ui.spacing().interact_size.y;
         let mut toggle = false;
+        let mut rename_group = false;
+        let mut delete_group = false;
         ui.horizontal(|ui| {
             // 精确对齐：本行内去掉控件间距，目录名的 x 恒为 indent + 2 个字符
             // 宽（箭头槽），与子层项目名的起点一致。
@@ -2132,6 +2172,20 @@ impl GitPmApp {
                 resp = resp.on_hover_text(&node.key);
             }
             if !searching {
+                // 分组节点的右键菜单：重命名 / 删除分组（删除 = 成员全部
+                // 移回未分组，项目本身不动）。
+                if node.key.starts_with(GROUP_KEY_PREFIX) {
+                    resp.context_menu(|ui| {
+                        if ui.button(i18n::t(lang, "menu-rename-group")).clicked() {
+                            rename_group = true;
+                            ui.close_menu();
+                        }
+                        if ui.button(i18n::t(lang, "menu-remove-group")).clicked() {
+                            delete_group = true;
+                            ui.close_menu();
+                        }
+                    });
+                }
                 resp.on_hover_cursor(egui::CursorIcon::PointingHand);
             }
         });
@@ -2142,14 +2196,23 @@ impl GitPmApp {
                 self.collapsed_tree_dirs.insert(node.key.clone());
             }
         }
+        if rename_group {
+            self.open_group_rename_dialog(&node.label);
+        }
+        if delete_group {
+            self.delete_group(&node.label);
+        }
         if !open {
             return;
         }
         let child_indent = (depth + 1) as f32 * 2.0 * char_w;
         for &idx in &node.projects {
-            let (id, name, path, is_svn) = &rows[idx];
+            let (id, name, path, is_svn, group) = &rows[idx];
             let selected = self.selected == Some(*id);
             let name_color = project_tree_color(*is_svn);
+            // 右键菜单动作（在闭包内置位，闭包外执行，避免借用冲突）。
+            let mut move_to: Option<Option<String>> = None;
+            let mut open_create_dialog = false;
             let clicked = ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
                 ui.add_space(child_indent);
@@ -2186,9 +2249,45 @@ impl GitPmApp {
                 if !path.is_empty() {
                     resp = resp.on_hover_text(path.as_str());
                 }
+                // 右键菜单：在分组间移动（新建分组 / 移出分组）。
+                if !searching {
+                    let current_group = group.clone();
+                    let groups: Vec<String> = group_names
+                        .iter()
+                        .filter(|g| g.as_str() != current_group.as_str())
+                        .cloned()
+                        .collect();
+                    resp.context_menu(|ui| {
+                        ui.menu_button(i18n::t(lang, "menu-move-to-group"), |ui| {
+                            for g in &groups {
+                                if ui.button(g).clicked() {
+                                    move_to = Some(Some(g.clone()));
+                                    ui.close_menu();
+                                }
+                            }
+                            ui.separator();
+                            if ui.button(i18n::t(lang, "menu-new-group")).clicked() {
+                                open_create_dialog = true;
+                                ui.close_menu();
+                            }
+                        });
+                        if !current_group.is_empty()
+                            && ui.button(i18n::t(lang, "menu-remove-from-group")).clicked()
+                        {
+                            move_to = Some(None);
+                            ui.close_menu();
+                        }
+                    });
+                }
                 resp.clicked()
             });
             let clicked = clicked.inner;
+            if let Some(new_group) = move_to {
+                self.set_project_group(*id, new_group);
+            }
+            if open_create_dialog {
+                self.open_group_create_dialog(*id);
+            }
             if clicked && self.selected != Some(*id) {
                 // 选中项目变化：浏览器重置为新项目的根目录。
                 self.selected = Some(*id);
@@ -2196,7 +2295,7 @@ impl GitPmApp {
             }
         }
         for child in &node.dirs {
-            self.show_tree_node(ui, child, depth + 1, rows, lang, char_w);
+            self.show_tree_node(ui, child, depth + 1, ctx);
         }
     }
 
@@ -4109,6 +4208,135 @@ impl GitPmApp {
         }
     }
 
+    /// 把项目移入分组（None = 移出分组，回到路径层级树）。立即入库并
+    /// 刷新项目列表。
+    fn set_project_group(&mut self, project_id: i64, group: Option<String>) {
+        let Some(conn) = self.conn.as_ref() else {
+            self.error = Some(i18n::t(self.lang, "err-db-not-open").into());
+            return;
+        };
+        if let Err(e) = db::set_project_group(conn, project_id, group.as_deref().unwrap_or("")) {
+            self.error = Some(tf(self.lang, "err-group-save", &[("err", &e.to_string())]));
+            return;
+        }
+        self.reload_projects();
+    }
+
+    /// 删除分组：所有成员移回未分组，项目本身不受影响。
+    fn delete_group(&mut self, group: &str) {
+        let Some(conn) = self.conn.as_ref() else {
+            self.error = Some(i18n::t(self.lang, "err-db-not-open").into());
+            return;
+        };
+        let ids: Vec<i64> = self
+            .projects
+            .iter()
+            .filter(|p| p.group_name == group)
+            .map(|p| p.id)
+            .collect();
+        for id in ids {
+            if let Err(e) = db::set_project_group(conn, id, "") {
+                self.error = Some(tf(self.lang, "err-group-save", &[("err", &e.to_string())]));
+                return;
+            }
+        }
+        self.reload_projects();
+    }
+
+    /// 右键「新建分组…」：输入名称后把项目移入该分组。
+    fn open_group_create_dialog(&mut self, project_id: i64) {
+        self.group_dialog_text.clear();
+        self.group_dialog_error = None;
+        self.group_dialog = Some(GroupDialogAction::Create { project_id });
+    }
+
+    /// 右键分组节点「重命名分组…」：改名后全部成员随迁（改到既有名称
+    /// 即合并分组）。
+    fn open_group_rename_dialog(&mut self, old: &str) {
+        self.group_dialog_text = old.to_string();
+        self.group_dialog_error = None;
+        self.group_dialog = Some(GroupDialogAction::Rename { old: old.to_string() });
+    }
+
+    fn close_group_dialog(&mut self) {
+        self.group_dialog = None;
+        self.group_dialog_text.clear();
+        self.group_dialog_error = None;
+    }
+
+    fn show_group_dialog(&mut self, ctx: &egui::Context) {
+        let Some(action) = self.group_dialog.clone() else {
+            return;
+        };
+        let lang = self.lang;
+        let title = match &action {
+            GroupDialogAction::Create { .. } => i18n::t(lang, "group-dialog-create-title"),
+            GroupDialogAction::Rename { .. } => i18n::t(lang, "group-dialog-rename-title"),
+        };
+        let mut open = true;
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.add_sized(
+                    [DIALOG_FIELD_WIDTH, 22.0],
+                    egui::TextEdit::singleline(&mut self.group_dialog_text)
+                        .hint_text(i18n::t(lang, "hint-group-name")),
+                );
+                if let Some(err) = &self.group_dialog_error {
+                    ui.add_space(6.0);
+                    ui.colored_label(egui::Color32::RED, err);
+                }
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button(i18n::t(lang, "btn-cancel")).clicked() {
+                        self.close_group_dialog();
+                    }
+                    let ready = !self.group_dialog_text.trim().is_empty();
+                    if ui
+                        .add_enabled(ready, egui::Button::new(i18n::t(lang, "btn-ok")))
+                        .clicked()
+                    {
+                        self.commit_group_dialog();
+                    }
+                });
+            });
+        if !open {
+            self.close_group_dialog();
+        }
+    }
+
+    /// 分组对话框「确定」：空名校验后入库（新建 → 移入分组；重命名 →
+    /// 组内全部成员随迁），成功即关闭并刷新列表。
+    fn commit_group_dialog(&mut self) {
+        let Some(action) = self.group_dialog.clone() else {
+            return;
+        };
+        let name = self.group_dialog_text.trim().to_string();
+        if name.is_empty() {
+            self.group_dialog_error = Some(i18n::t(self.lang, "err-group-empty").into());
+            return;
+        }
+        let Some(conn) = self.conn.as_ref() else {
+            self.group_dialog_error = Some(i18n::t(self.lang, "err-db-not-open").into());
+            return;
+        };
+        let result = match &action {
+            GroupDialogAction::Create { project_id } => {
+                db::set_project_group(conn, *project_id, &name)
+            }
+            GroupDialogAction::Rename { old } => db::rename_group(conn, old, &name),
+        };
+        match result {
+            Ok(_) => self.close_group_dialog(),
+            Err(e) => self.group_dialog_error = Some(tf(self.lang, "err-group-save", &[("err", &e.to_string())])),
+        }
+        if self.group_dialog.is_none() {
+            self.reload_projects();
+        }
+    }
+
     fn pick_and_add_project(&mut self) {
         self.error = None;
         let Some(conn) = self.conn.as_ref() else {
@@ -4864,6 +5092,70 @@ fn project_tree_color(is_svn: bool) -> egui::Color32 {
     }
 }
 
+/// 项目树 rows 元组的分组字段：分组节点的 key 前缀（与目录节点区分）。
+const GROUP_KEY_PREFIX: &str = "group:";
+
+/// 分组对话框的两种动作：把项目移入新建分组，或重命名既有分组。
+#[derive(Clone, Debug)]
+enum GroupDialogAction {
+    Create { project_id: i64 },
+    Rename { old: String },
+}
+
+/// 一行项目在树渲染时的数据：(id, 显示名, 路径, 是否 svn, 分组名)。
+/// 分组名为空表示未分组（挂路径层级树）。
+type ProjectRow = (i64, String, String, bool, String);
+
+/// 项目树渲染期间的共享上下文（避免 show_tree_node 参数过多）。
+struct TreeCtx<'a> {
+    rows: &'a [ProjectRow],
+    group_names: &'a [String],
+    lang: Lang,
+    char_w: f32,
+}
+
+/// 树顶部的用户分组名：去空、去重、按名称排序（大小写不敏感，本地化
+/// 顺序由逐字符比较近似）。
+fn collect_group_names(rows: &[ProjectRow]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    for (_, _, _, _, group) in rows {
+        if group.is_empty() {
+            continue;
+        }
+        if !names
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(group))
+        {
+            names.push(group.clone());
+        }
+    }
+    names.sort_by_key(|n| n.to_lowercase());
+    names
+}
+
+/// 按分组名构建树顶部的分组节点：每个分组一个 DirNode（无子目录），
+/// `projects` 存该分组项目在 `rows` 里的全局下标（保持输入顺序）。
+/// 未分组项目不出现在任何分组节点。
+fn build_group_nodes(group_names: &[String], rows: &[ProjectRow]) -> Vec<DirNode> {
+    group_names
+        .iter()
+        .map(|name| {
+            let projects = rows
+                .iter()
+                .enumerate()
+                .filter(|(_, (_, _, _, _, group))| group == name)
+                .map(|(idx, _)| idx)
+                .collect();
+            DirNode {
+                label: name.clone(),
+                key: format!("{GROUP_KEY_PREFIX}{name}"),
+                dirs: Vec::new(),
+                projects,
+            }
+        })
+        .collect()
+}
+
 impl eframe::App for GitPmApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.apply_theme(ctx);
@@ -4910,6 +5202,49 @@ mod tests {
         assert_ne!(svn, git);
         assert_eq!(svn, egui::Color32::from_rgb(28, 78, 158));
         assert_eq!(git, egui::Color32::from_rgb(15, 110, 60));
+    }
+
+    fn row(id: i64, group: &str) -> (i64, String, String, bool, String) {
+        (
+            id,
+            format!("p{id}"),
+            format!("C:/p{id}"),
+            false,
+            group.to_string(),
+        )
+    }
+
+    #[test]
+    fn collect_group_names_sorted_unique_ignores_empty() {
+        let rows = vec![row(1, "work"), row(2, ""), row(3, "Archive"), row(4, "work")];
+        assert_eq!(collect_group_names(&rows), vec!["Archive", "work"]);
+        // 全部未分组 → 无分组名。
+        assert!(collect_group_names(&[row(1, "")]).is_empty());
+    }
+
+    #[test]
+    fn build_group_nodes_partition_by_group_name() {
+        // rows 元组：(id, display_name, path, is_svn, group_name)，下标即
+        // 树节点里存的全局下标。
+        let mk_row = |_i: usize, id: i64, group: &str| {
+            (
+                id,
+                format!("p{id}"),
+                format!("C:/p{id}"),
+                false,
+                group.to_string(),
+            )
+        };
+        let rows = vec![mk_row(0, 1, "work"), mk_row(1, 2, ""), mk_row(2, 3, "work")];
+        let names = collect_group_names(&rows);
+        assert_eq!(names, vec!["work"]);
+        let nodes = build_group_nodes(&names, &rows);
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].label, "work");
+        assert_eq!(nodes[0].key, "group:work");
+        assert_eq!(nodes[0].dirs.len(), 0);
+        // rows 下标：a=0, c=2；未分组项目（b）不在任何分组节点里。
+        assert_eq!(nodes[0].projects, vec![0, 2]);
     }
 
     #[test]
