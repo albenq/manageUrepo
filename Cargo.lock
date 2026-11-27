@@ -1596,6 +1596,7 @@ dependencies = [
  "rfd",
  "rusqlite",
  "tempfile",
+ "windows-sys 0.59.0",
  "winresource",
 ]
 

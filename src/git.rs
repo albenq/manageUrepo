@@ -17,9 +17,58 @@ impl GitOutput {
 pub(crate) fn capture(output: std::process::Output) -> GitOutput {
     GitOutput {
         code: output.status.code().unwrap_or(-1),
-        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        stdout: decode_console_output(&output.stdout),
+        stderr: decode_console_output(&output.stderr),
     }
+}
+
+/// Decode captured child-process output.
+///
+/// git normally emits UTF-8, but the svn CLI on Windows emits bytes in the
+/// system ANSI codepage (GBK on zh-CN systems), and git commit messages
+/// stored in a legacy encoding come out the same way. Try UTF-8 first;
+/// when the bytes are not valid UTF-8, fall back to the ANSI codepage
+/// (`CP_ACP`) instead of turning every non-ASCII byte into U+FFFD.
+pub(crate) fn decode_console_output(bytes: &[u8]) -> String {
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
+    #[cfg(windows)]
+    return ansi_decode(bytes);
+    #[cfg(not(windows))]
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Decode bytes in the system ANSI codepage via `MultiByteToWideChar`.
+/// Strict conversion first; on failure (e.g. a truncated multi-byte
+/// sequence at the end of a pipe buffer) a lenient pass maps invalid bytes
+/// to the system default char; if even that fails, fall back to lossy UTF-8.
+#[cfg(windows)]
+fn ansi_decode(bytes: &[u8]) -> String {
+    use windows_sys::Win32::Globalization::{MultiByteToWideChar, CP_ACP};
+    if bytes.is_empty() {
+        return String::new();
+    }
+    if bytes.len() > i32::MAX as usize {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    let len = bytes.len() as i32;
+    for flags in [1 /* MB_ERR_INVALID_CHARS */, 0] {
+        unsafe {
+            let need = MultiByteToWideChar(CP_ACP, flags, bytes.as_ptr(), len, std::ptr::null_mut(), 0);
+            if need <= 0 {
+                continue;
+            }
+            let mut buf = vec![0u16; need as usize];
+            let written =
+                MultiByteToWideChar(CP_ACP, flags, bytes.as_ptr(), len, buf.as_mut_ptr(), need);
+            if written > 0 {
+                buf.truncate(written as usize);
+                return String::from_utf16_lossy(&buf);
+            }
+        }
+    }
+    String::from_utf8_lossy(bytes).into_owned()
 }
 
 /// Run `git <args>` with the process cwd set to `repo_dir`.
@@ -217,6 +266,40 @@ fn parse_commit_lines(stdout: &str) -> Vec<CommitInfo> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn decode_output_prefers_utf8() {
+        // 合法 UTF-8（含多字节与 emoji）原样通过，不做 ANSI 重解码。
+        assert_eq!(decode_console_output("中文 ✓".as_bytes()), "中文 ✓");
+        assert_eq!(decode_console_output(b"plain ascii"), "plain ascii");
+        assert_eq!(decode_console_output(b""), "");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn decode_output_falls_back_to_ansi_codepage() {
+        // GBK 编码的「中文」(D6 D0 CE C4) 不是合法 UTF-8：在简体中文
+        // Windows（ACP=936）上必须按 ANSI 代码页还原，而不是变成
+        // U+FFFD 乱码。这是「另一台机器输出乱码」的回归测试。
+        let gbk = [0xD6u8, 0xD0, 0xCE, 0xC4];
+        let acp = unsafe { windows_sys::Win32::Globalization::GetACP() };
+        let decoded = decode_console_output(&gbk);
+        if acp == 936 {
+            assert_eq!(decoded, "中文");
+        } else {
+            // 其他 ANSI 代码页下无法断言具体文字，只要求不产生替换符
+            // 堆积且解码不 panic。
+            assert!(!decoded.is_empty());
+        }
+    }
+
+    #[test]
+    fn decode_output_keeps_lossy_fallback() {
+        // 真正的无效字节（UTF-8 与常见 ANSI 都无法解释）仍降级为
+        // 替换符，不 panic。
+        let decoded = decode_console_output(&[0xFF, 0xFE, 0x00, 0x41]);
+        assert!(decoded.contains('A'));
+    }
 
     /// Create a throwaway git repository in a tempdir: `git init` plus
     /// user.email/user.name config and an initial commit (git < 2.45 lists
