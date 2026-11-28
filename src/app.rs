@@ -775,6 +775,54 @@ fn show_section(
     }
 }
 
+// ------------------------------------------------------ about / version
+
+/// 版本显示：补丁位为 0 时只显示 major.minor（0.9.0 → "0.9"）。
+/// 版本号约定：Cargo.toml 的 semver 三段式（0.9.0），每次版本变更
+/// minor +1（即 +0.01）；补丁位非 0 时原样显示。
+fn display_version(pkg_version: &str) -> String {
+    let parts: Vec<&str> = pkg_version.split('.').collect();
+    if parts.len() == 3 && parts[2] == "0" {
+        format!("{}.{}", parts[0], parts[1])
+    } else {
+        pkg_version.to_string()
+    }
+}
+
+/// 天数（自 1970-01-01）→（年，月，日）。Howard Hinnant 的 civil 算法，
+/// 纯 std，无日期库依赖（build 阶段与运行时共用逻辑上的换算规则）。
+fn civil_from_days(days_since_epoch: i64) -> (i64, u32, u32) {
+    let z = days_since_epoch + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// 构建时间（unix 秒 → "YYYY-MM-DD HH:MM UTC"），纯 std 换算。
+fn format_build_time_utc(epoch_secs: i64) -> String {
+    let days = epoch_secs.div_euclid(86_400);
+    let secs_of_day = epoch_secs.rem_euclid(86_400);
+    let (y, m, d) = civil_from_days(days);
+    format!(
+        "{y:04}-{m:02}-{d:02} {:02}:{:02} UTC",
+        secs_of_day / 3600,
+        (secs_of_day % 3600) / 60
+    )
+}
+
+/// 运行时依赖库名清单（build.rs 从 Cargo.toml 注入，逗号分隔）。
+fn dependency_list() -> Vec<&'static str> {
+    const FALLBACK: &str = "eframe,egui_extras,rusqlite,argon2,aes-gcm,rand,rfd,windows-sys";
+    let raw = option_env!("GIT_PM_DEPENDENCIES").unwrap_or(FALLBACK);
+    raw.split(',').map(str::trim).filter(|s| !s.is_empty()).collect()
+}
+
 // ------------------------------------------------------ porcelain parsing
 //
 // `git status --porcelain=v1 -b` 解析纯函数（只依赖 std，不依赖 egui）：
@@ -1660,6 +1708,8 @@ pub struct GitPmApp {
     // standalone from the top-bar「工具」menu), sharing options and result.
     show_gen_dialog: bool,
     show_tool_gen_window: bool,
+    /// 顶栏「帮助 → 关于 LocalRepoManager…」打开的关于窗口。
+    show_about_window: bool,
     gen_opts: GenOptions,
     /// `false` = 明文显示生成结果（默认，可选中复制）；`true` = 用 `•` 遮蔽显示。
     gen_masked: bool,
@@ -1746,6 +1796,7 @@ impl GitPmApp {
             pw_error: None,
             show_gen_dialog: false,
             show_tool_gen_window: false,
+            show_about_window: false,
             gen_opts: GenOptions::default(),
             gen_masked: false,
             gen_result: String::new(),
@@ -2032,6 +2083,7 @@ impl GitPmApp {
         self.show_history_window(ctx);
         self.show_gen_dialog(ctx);
         self.show_tool_generator(ctx);
+        self.show_about_window(ctx);
         // While a git call runs on a worker thread, keep waking the UI to
         // animate the progress bar and poll the result channel. Any in-flight
         // status batch counts, not just the selected project's, and the check
@@ -2125,6 +2177,7 @@ impl GitPmApp {
         let mut open_generator = false;
         let mut open_pw_change = false;
         let mut open_editor_settings = false;
+        let mut open_about = false;
         egui::menu::bar(ui, |ui| {
             ui.menu_button(i18n::t(lang, "menu-theme"), |ui| {
                 if ui.button(i18n::t(lang, "theme-dark")).clicked() {
@@ -2160,6 +2213,11 @@ impl GitPmApp {
                     open_editor_settings = true;
                 }
             });
+            ui.menu_button(i18n::t(lang, "menu-help"), |ui| {
+                if ui.button(i18n::t(lang, "menu-about")).clicked() {
+                    open_about = true;
+                }
+            });
         });
         if let Some(theme) = chosen_theme {
             self.switch_theme(ui.ctx(), theme);
@@ -2175,6 +2233,9 @@ impl GitPmApp {
         }
         if open_editor_settings {
             self.open_editor_settings_dialog();
+        }
+        if open_about {
+            self.show_about_window = true;
         }
     }
 
@@ -5287,6 +5348,64 @@ impl GitPmApp {
         self.show_tool_gen_window = true;
     }
 
+    /// 「帮助 → 关于」窗口：版本号（Cargo.toml 的 package.version，补丁
+    /// 位为 0 时显示两位）、构建时间（build.rs 注入）、运行时依赖库清单
+    /// （build.rs 从 Cargo.toml 注入）与作者信息。
+    fn show_about_window(&mut self, ctx: &egui::Context) {
+        if !self.show_about_window {
+            return;
+        }
+        let lang = self.lang;
+        let mut open = self.show_about_window;
+        egui::Window::new(i18n::t(lang, "about-title"))
+            .id(egui::Id::new("about_window"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.add_space(2.0);
+                ui.heading(format!(
+                    "LocalRepoManager v{}",
+                    display_version(env!("CARGO_PKG_VERSION"))
+                ));
+                ui.add_space(8.0);
+                let build_epoch: i64 = option_env!("GIT_PM_BUILD_EPOCH")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0);
+                let rows = [
+                    (
+                        "about-version",
+                        display_version(env!("CARGO_PKG_VERSION")),
+                    ),
+                    ("about-build-time", format_build_time_utc(build_epoch)),
+                ];
+                for (key, value) in rows {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(i18n::t(lang, key)).strong());
+                        ui.label(value);
+                    });
+                }
+                ui.horizontal_top(|ui| {
+                    ui.label(
+                        egui::RichText::new(i18n::t(lang, "about-dependencies")).strong(),
+                    );
+                    ui.label(dependency_list().join(", "));
+                });
+                ui.horizontal_top(|ui| {
+                    ui.label(egui::RichText::new(i18n::t(lang, "about-authors")).strong());
+                    ui.label("Albert · Opencode · GLM-5.3 · DeepSeek4.1");
+                });
+                ui.add_space(8.0);
+                if ui.button(i18n::t(lang, "btn-close")).clicked() {
+                    self.show_about_window = false;
+                }
+            });
+        // Closed via the window's X button.
+        if !open {
+            self.show_about_window = false;
+        }
+    }
+
     /// 关闭指定生成器窗口并清空生成结果（「关闭」按钮与 X 按钮都走这里）。
     fn close_generator(&mut self, window: GenWindow) {
         match window {
@@ -6653,6 +6772,40 @@ mod tests {
             status_for_entry(&map, "a.c", false),
             Some(FileStatus::Modified)
         );
+    }
+
+    #[test]
+    fn display_version_trims_zero_patch() {
+        // 版本约定：两位有效（major.minor），补丁位为 0 时不显示。
+        // 0.9 → 0.9.0 → 0.91.0 → 0.92.0，每次版本变更 +0.01。
+        assert_eq!(display_version("0.9.0"), "0.9");
+        assert_eq!(display_version("0.91.0"), "0.91");
+        assert_eq!(display_version("0.9.1"), "0.9.1");
+        assert_eq!(display_version("1.0.0"), "1.0");
+        // 容错：残缺输入原样返回。
+        assert_eq!(display_version(""), "");
+        assert_eq!(display_version("abc"), "abc");
+    }
+
+    #[test]
+    fn format_build_time_utc_cases() {
+        // 纯 std 的 civil 日期换算：纪元起点、闰日、整点分钟。
+        assert_eq!(format_build_time_utc(0), "1970-01-01 00:00 UTC");
+        assert_eq!(format_build_time_utc(951782400), "2000-02-29 00:00 UTC");
+        assert_eq!(format_build_time_utc(1735689600), "2025-01-01 00:00 UTC");
+        assert_eq!(format_build_time_utc(1764318600), "2025-11-28 08:30 UTC");
+    }
+
+    #[test]
+    fn dependency_list_is_synced_from_manifest() {
+        // build.rs 从 Cargo.toml 注入运行时依赖名清单。
+        let deps = dependency_list();
+        assert!(!deps.is_empty(), "dependency list must not be empty");
+        assert!(deps.contains(&"eframe"), "eframe missing: {deps:?}");
+        assert!(deps.contains(&"rusqlite"), "rusqlite missing: {deps:?}");
+        // target 段（cfg(windows).dependencies）的名字也被收集。
+        #[cfg(windows)]
+        assert!(deps.contains(&"windows-sys"), "windows-sys missing: {deps:?}");
     }
 
     #[test]

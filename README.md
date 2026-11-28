@@ -51,6 +51,8 @@ cargo run --release
 - **加密凭据**：按项目保存凭据（标签默认为 `origin`），AES-256-GCM 加密落盘；push/pull 到 https 的 `origin` 远端时自动注入，用完即弃。注入凭据的 git 输出会先做脱敏再显示，URL、密码（含转义形式）都不会出现在界面或日志中。
 - **密码生成器**：凭据对话框内一键生成强密码，长度 8–64 可调，大小写字母与数字固定包含，特殊字符可选；结果仅保存在内存中，可复制或直接填入密码框。
 - **独立密码生成器**：菜单「工具 → 密码生成器」打开独立窗口，生成规则与凭据对话框内的生成器一致；结果仅保存在内存中，可复制，关闭窗口即丢弃。
+
+- **关于窗口**：菜单「帮助 → 关于 LocalRepoManager…」显示版本号（当前 0.9，此后每次版本变更 +0.01）、构建时间（UTC，编译时由 build.rs 注入）、运行时依赖库清单（build.rs 从 Cargo.toml 自动提取）与作者信息（Albert · Opencode · GLM-5.3 · DeepSeek4.1）。
 - **主题切换**：菜单栏「主题」可在暗黑 / 明亮之间切换，立即生效；偏好写入本地数据库，重启后保持上次选择。
 - **中央文件浏览器**：选中项目后，中央面板以多列列表展示工作区文件（名称 / 类型 / 大小 / 修改时间，列宽可拖拽调整）；目录整行可点击进入，「上一级」返回上级目录；`.git` 等隐藏项整行置灰但仍可进入；文件仅只读展示，不会修改任何内容。
 - **git 操作后台执行**：提交、拉取、推送、新建分支、打标签等操作均在后台线程执行（克隆除外，为同步执行），操作期间相关按钮禁用并显示动态进度条，窗口不再冻结；选中项目刷新状态时同样显示「加载中…」进度条。
@@ -142,6 +144,8 @@ The `-L native` path works around `windows_x86_64_msvc`'s build script not recog
 - **Encrypted credentials**: store credentials per project (label defaults to `origin`), encrypted at rest with AES-256-GCM; they are injected automatically for push/pull against an https `origin` remote and discarded after use. Git output from credential-injected commands is redacted before display — the URL and the password (including escaped forms) never appear in the UI or logs.
 - **Password generator**: one-click strong password generation inside the credentials dialog; length 8–64, upper/lowercase letters and digits always included, special characters optional. The result lives only in memory and can be copied or inserted into the password field.
 - **Standalone password generator**: menu "Tools → Password Generator" opens a standalone window with the same rules; the result lives only in memory, can be copied, and is discarded when the window closes.
+
+- **About window**: menu "Help → About LocalRepoManager…" shows the version (currently 0.9, +0.01 on every future version change), the build time (UTC, injected by build.rs at compile time), the runtime dependency list (extracted from Cargo.toml by build.rs), and the authors (Albert · Opencode · GLM-5.3 · DeepSeek4.1).
 - **Theme switcher**: the "Theme" menu toggles dark / light instantly; the preference is persisted in the local database and restored on restart.
 - **Central file browser**: with a project selected, the central panel lists working-tree files in columns (name / type / size / modified time, with draggable column widths); click a directory row to enter it, "Up" goes back; hidden entries such as `.git` are grayed out but still clickable; files are read-only and never modified.
 - **Background git operations**: commit, pull, push, branch creation, and tagging all run on background threads (cloning is the exception and runs synchronously). Relevant buttons are disabled with an animated progress bar while an operation runs, so the window never freezes; refreshing a project's status shows a "Loading…" progress bar too.
