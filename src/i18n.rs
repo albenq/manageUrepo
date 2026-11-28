@@ -236,6 +236,7 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("hint-push-branch", "分支名（如 main）", "Branch name (e.g. main)"),
     ("push-set-upstream", "设置上游（-u）", "Set upstream (-u)"),
     ("btn-cancel", "取消", "Cancel"),
+    ("btn-ok", "确认", "OK"),
     ("btn-push-go", "推送", "Push"),
     ("err-no-project", "未选择项目", "No project selected"),
     ("err-select-remote", "请选择远程仓库", "Select a remote"),
@@ -371,6 +372,18 @@ mod tests {
     fn t_miss_returns_key_itself() {
         assert_eq!(t(Lang::Zh, "no-such-key"), "no-such-key");
         assert_eq!(t(Lang::En, "no-such-key"), "no-such-key");
+    }
+
+    /// 对话框通用按钮的回归：文本编辑器设置等对话框曾把未定义的
+    /// `btn-ok` 原样显示成 key。通用确认/取消按钮必须有词条。
+    #[test]
+    fn dialog_button_keys_are_translated() {
+        assert_eq!(t(Lang::Zh, "btn-ok"), "确认");
+        assert_eq!(t(Lang::En, "btn-ok"), "OK");
+        assert_eq!(t(Lang::Zh, "btn-cancel"), "取消");
+        assert_eq!(t(Lang::En, "btn-cancel"), "Cancel");
+        assert_ne!(t(Lang::Zh, "btn-ok"), "btn-ok");
+        assert_ne!(t(Lang::En, "btn-ok"), "btn-ok");
     }
 
     /// meta 值解析：b"en" → En；其余 / None → Zh；to_meta 可逆。
